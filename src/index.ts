@@ -50,9 +50,8 @@ const plugin: Plugin = async (input: PluginInput) => {
         config.command = commands;
       }
 
-      // Fetch models.dev index for fallback enrichment (non-blocking)
       const configRecord = config as unknown as Record<string, unknown>;
-      const modelsDevIndex = await fetchModelsDevIndex(client).catch(() => []);
+      const modelsDevIndex = await fetchModelsDevIndex();
 
       // Run discovery with 5-second timeout
       const discoveryPromise = discoverModels(configRecord, modelsDevIndex);

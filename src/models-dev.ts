@@ -1,4 +1,6 @@
-import type { PluginInput } from "@opencode-ai/plugin";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+import os from "node:os";
 import { LOG_PREFIX } from "./constants";
 
 /**
@@ -17,6 +19,25 @@ export interface ModelsDevMeta {
     input: string[];
     output: string[];
   };
+}
+
+/** Shape of a single model in the models.dev api.json cache. */
+interface ModelsDevModel {
+  id: string;
+  family?: string;
+  tool_call: boolean;
+  reasoning: boolean;
+  attachment: boolean;
+  temperature: boolean;
+  modalities?: {
+    input: string[];
+    output: string[];
+  };
+}
+
+/** Shape of a provider in the models.dev api.json cache. */
+interface ModelsDevProvider {
+  models: Record<string, ModelsDevModel>;
 }
 
 /** Flattened model entry from the provider list response. */
@@ -68,36 +89,53 @@ function extractSize(id: string): string | undefined {
 }
 
 /**
- * Fetch models.dev data via the opencode SDK client and build
- * a flattened lookup index.
+ * Resolve the path to opencode's cached models.dev api.json file.
+ * Honors OPENCODE_MODELS_PATH if set (same as opencode internally),
+ * otherwise follows the XDG convention:
+ * $XDG_CACHE_HOME/opencode/models.json (defaults to ~/.cache/opencode/models.json)
  */
-export async function fetchModelsDevIndex(
-  client: PluginInput["client"],
-): Promise<FlatModel[]> {
+function modelsJsonPath(): string {
+  if (process.env.OPENCODE_MODELS_PATH) return process.env.OPENCODE_MODELS_PATH;
+  const cacheDir =
+    process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache");
+  return path.join(cacheDir, "opencode", "models.json");
+}
+
+/**
+ * Read opencode's cached models.dev data and build a flattened lookup index.
+ * Reads directly from the XDG cache file to avoid deadlocking the SDK client
+ * during the config hook (client.provider.list() routes through InstanceState
+ * which hasn't finished initializing when the config hook runs).
+ * On failure, caches the empty result to avoid re-reading a broken file.
+ */
+export async function fetchModelsDevIndex(): Promise<FlatModel[]> {
   if (cache) return cache;
 
   try {
-    const response = await client.provider.list();
-    if (!response.data) return [];
+    const raw = await readFile(modelsJsonPath(), "utf-8");
+    const data: unknown = JSON.parse(raw);
+
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      cache = [];
+      return [];
+    }
 
     const flat: FlatModel[] = [];
+    const providers = data as Record<string, ModelsDevProvider>;
 
-    for (const provider of response.data.all) {
-      for (const [, model] of Object.entries(provider.models)) {
-        // Access the runtime object which includes family even though
-        // the SDK type doesn't declare it
-        const m = model as typeof model & { family?: string };
-
+    for (const provider of Object.values(providers)) {
+      if (!provider.models) continue;
+      for (const model of Object.values(provider.models)) {
         flat.push({
           id: model.id,
           normalized: normalize(model.id),
-          family: m.family,
+          family: model.family,
           meta: {
             toolCall: model.tool_call,
             reasoning: model.reasoning,
             attachment: model.attachment,
             temperature: model.temperature,
-            family: m.family,
+            family: model.family,
             modalities: model.modalities,
           },
         });
@@ -107,7 +145,8 @@ export async function fetchModelsDevIndex(
     cache = flat;
     return flat;
   } catch (error) {
-    console.warn(`${LOG_PREFIX} Failed to fetch models.dev index:`, error);
+    console.warn(`${LOG_PREFIX} Failed to read models.dev cache:`, error);
+    cache = [];
     return [];
   }
 }
