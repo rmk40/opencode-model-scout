@@ -103,7 +103,6 @@ const LLM_KEYWORDS = [
   "instruct",
   "wizard",
   "falcon",
-  "yi",
   "internlm",
   "glm",
   "command",
@@ -117,6 +116,12 @@ const LLM_KEYWORDS = [
 ];
 
 /**
+ * Short keywords that need word-boundary matching to avoid false positives
+ * (e.g., "yi" inside "binaryai"). Matched with regex \bKEYWORD\b.
+ */
+const LLM_KEYWORDS_BOUNDARY = [/\byi\b/i];
+
+/**
  * Categorize a model by its ID using keyword matching.
  * Returns "embedding", "chat", or "unknown".
  */
@@ -128,6 +133,9 @@ function categorizeModel(id: string): "embedding" | "chat" | "unknown" {
   for (const keyword of LLM_KEYWORDS) {
     if (lower.includes(keyword)) return "chat";
   }
+  for (const pattern of LLM_KEYWORDS_BOUNDARY) {
+    if (pattern.test(id)) return "chat";
+  }
   return "unknown";
 }
 
@@ -138,15 +146,16 @@ function applyProbeMeta(
   model: Record<string, unknown>,
   meta: ProbeModelMeta,
 ): void {
-  // Limits — only set if not already present
+  // Limits — only set if not already present. Omit unknown fields
+  // rather than defaulting to 0 (which would mean "no output allowed").
   if (
     !model.limit &&
     (meta.context !== undefined || meta.maxTokens !== undefined)
   ) {
-    model.limit = {
-      context: meta.context ?? 0,
-      output: meta.maxTokens ?? 0,
-    };
+    const limit: Record<string, number> = {};
+    if (meta.context !== undefined) limit.context = meta.context;
+    if (meta.maxTokens !== undefined) limit.output = meta.maxTokens;
+    model.limit = limit;
   }
 
   // Modalities — probe is more accurate than keyword guess, always override for discovered models
@@ -259,6 +268,8 @@ export async function discoverModels(
         const discoveredModels: Record<string, Record<string, unknown>> = {};
 
         for (const model of openaiModels) {
+          // Skip entries with missing or non-string id
+          if (!model.id || typeof model.id !== "string") continue;
           // Skip models already configured
           if (existingModels[model.id] !== undefined) continue;
 

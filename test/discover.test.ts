@@ -415,7 +415,7 @@ describe("discoverModels", () => {
     >;
     const model = models["meta-llama/Llama-3-8B"];
     expect(model).toBeDefined();
-    expect(model.limit).toEqual({ context: 8192, output: 0 });
+    expect(model.limit).toEqual({ context: 8192 });
   });
 
   it("should skip probing when auto-detection returns undefined", async () => {
