@@ -26,6 +26,34 @@ export interface ProbeModelMeta {
   quantization?: string;
 }
 
+/**
+ * Raw model entry from the OpenAI /v1/models response.
+ * Extended with optional non-standard fields that some servers add.
+ */
+export interface OpenAIModelEntry {
+  id: string;
+  object: string;
+  created: number;
+  owned_by?: string;
+  /** vLLM and SGLang add this non-standard field */
+  max_model_len?: number;
+  /** vLLM adds the model path */
+  root?: string;
+  /** llama.cpp adds these non-standard fields */
+  aliases?: string[];
+  tags?: string[];
+  status?: Record<string, unknown>;
+}
+
+/**
+ * Context passed to probes from the discovery layer.
+ * Extensible — add fields here rather than new positional parameters.
+ */
+export interface ProbeContext {
+  /** Pre-fetched /v1/models entries, for probes that need them */
+  modelsResponse?: OpenAIModelEntry[];
+}
+
 /** Result returned by a provider probe. Keys are model IDs. */
 export interface ProbeResult {
   models: Record<string, ProbeModelMeta>;
@@ -44,4 +72,5 @@ export interface ProbeResult {
 export type ProviderProbe = (
   baseURL: string,
   apiKey?: string,
+  context?: ProbeContext,
 ) => Promise<ProbeResult>;

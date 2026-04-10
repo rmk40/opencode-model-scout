@@ -50,7 +50,11 @@ export function formatModelsTable(
 
   for (const snap of snapshots) {
     const count = Object.keys(snap.models).length;
-    const probeLabel = snap.probeType ? `probe: ${snap.probeType}` : "no probe";
+    const probeLabel = snap.detectedServer
+      ? `auto \u2192 ${snap.detectedServer}`
+      : snap.probeType
+        ? `probe: ${snap.probeType}`
+        : "no probe";
     const header = `\n${snap.provider} (${probeLabel}) — ${count} model${count !== 1 ? "s" : ""}`;
     const separator = "\u2500".repeat(50);
 

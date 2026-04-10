@@ -122,6 +122,9 @@ Add `"probe"` to the provider's `options` to enable provider-specific metadata
 extraction. The probe field **must** be inside `options`, not at the provider
 top level, because opencode's provider schema rejects unknown top-level fields.
 
+You can specify an explicit probe name or use `"auto"` to let the plugin
+detect the server type automatically:
+
 ```json
 {
   "provider": {
@@ -139,10 +142,22 @@ top level, because opencode's provider schema rejects unknown top-level fields.
         "baseURL": "http://localhost:11434/v1",
         "probe": "ollama"
       }
+    },
+    "local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://localhost:5000/v1",
+        "probe": "auto"
+      }
     }
   }
 }
 ```
+
+When `"probe": "auto"` is set, the plugin fingerprints the server using a
+tiered detection strategy (see [Supported Servers](#supported-servers)) and
+selects the appropriate probe automatically. If detection fails, the provider
+still gets discovery + models.dev fallback enrichment.
 
 ### Multiple Providers
 
@@ -178,62 +193,28 @@ probed and unprobed providers freely:
 ```
 
 In this example, oMLX and Ollama get full probe enrichment. LM Studio gets
-discovery + models.dev fallback (no probe exists for it yet — see
-[CONTRIBUTING.md](CONTRIBUTING.md) for how to build one).
+discovery + models.dev fallback. You could also use `"probe": "auto"` on any
+of these to let the plugin detect the server type automatically.
 
-## Supported Probes
+## Supported Servers
 
-### oMLX
+| Server        | Probe       | Status   | What It Extracts                                                        |
+| ------------- | ----------- | -------- | ----------------------------------------------------------------------- |
+| **oMLX**      | `omlx`      | Tested   | Context, output limit, model type, load state, size                     |
+| **Ollama**    | `ollama`    | Tested   | Context, tools, vision, thinking, family, quantization                  |
+| **llama.cpp** | `ollama`    | Expected | Partial Ollama metadata (API compat unverified against live instance)   |
+| **LocalAI**   | `ollama`    | Expected | Partial Ollama metadata (API compat unverified against live instance)   |
+| **LM Studio** | `lmstudio`  | Untested | Context, vision, tool use, architecture, quantization, size, load state |
+| **TGI**       | `tgi`       | Untested | Context, output limit                                                   |
+| **SGLang**    | `sglang`    | Untested | Context, model type, vision                                             |
+| **vLLM**      | `vllm`      | Untested | Context                                                                 |
+| **KoboldCpp** | `koboldcpp` | Untested | Context, vision                                                         |
 
-|              |                                                    |
-| ------------ | -------------------------------------------------- |
-| **Endpoint** | `GET /v1/models/status`                            |
-| **Auth**     | API key required (sent as `Authorization: Bearer`) |
-| **Timeout**  | 2 seconds                                          |
+### Support Tiers
 
-The oMLX probe calls a single endpoint that returns all model metadata at once.
-It extracts:
-
-| Field          | Source                 | Example        |
-| -------------- | ---------------------- | -------------- |
-| Context window | `max_context_window`   | 262,144        |
-| Output limit   | `max_tokens`           | 32,768         |
-| Model type     | `model_type`           | "llm" or "vlm" |
-| Vision support | `model_type === "vlm"` | true           |
-| Load state     | `loaded`               | true/false     |
-| Disk size      | `estimated_size`       | 47 GB          |
-| Temperature    | Always set             | true           |
-
-The oMLX probe does **not** set `tool_call` — oMLX does not report this
-capability in its API.
-
-### Ollama
-
-|               |                                                |
-| ------------- | ---------------------------------------------- |
-| **Endpoints** | `GET /api/tags` + `POST /api/show` (per model) |
-| **Auth**      | Optional API key                               |
-| **Timeout**   | 2 seconds per request                          |
-
-The Ollama probe is a two-step process. First it lists all models via
-`/api/tags`, then queries `/api/show` for each model in parallel to get
-detailed capabilities. It extracts:
-
-| Field          | Source                        | Example  |
-| -------------- | ----------------------------- | -------- |
-| Context length | `model_info.*.context_length` | 40,960   |
-| Tool calling   | `capabilities: ["tools"]`     | true     |
-| Vision         | `capabilities: ["vision"]`    | true     |
-| Reasoning      | `capabilities: ["thinking"]`  | true     |
-| Family         | `details.family`              | "qwen3"  |
-| Parameter size | `details.parameter_size`      | "0.6B"   |
-| Quantization   | `details.quantization_level`  | "Q4_K_M" |
-| Disk size      | `size` (from tags)            | 504 MB   |
-| Temperature    | Always set                    | true     |
-
-If `/api/show` fails for individual models, they still get partial metadata
-from the tags response. The probe never fails entirely — worst case, you get
-model IDs with basic metadata.
+- **Tested** -- verified against a live instance
+- **Expected** -- API-compatible based on server source code review; not yet tested against a live instance
+- **Untested** -- probe implemented based on API documentation; needs community verification
 
 ### models.dev Fallback
 
@@ -284,6 +265,11 @@ ollama (probe: ollama) — 3 models
 
   nomic-embed-text
     Temp | Family: nomic | Params: 137M
+
+local (auto → vllm) — 2 models
+──────────────────────────────────────────────────
+  Qwen/Qwen3-8B
+    Context: 32,768 | Type: llm | Temp
 ```
 
 ## Timeouts and Resilience

@@ -3,7 +3,7 @@
 ## Architecture Overview
 
 The plugin is structured as a pipeline that runs during opencode's config hook
-at startup. There are 10 source files organized into four concerns:
+at startup. The source files are organized into four concerns:
 
 ```
 src/
@@ -14,10 +14,16 @@ src/
 ├── command.ts            # /modelscout slash command handler
 ├── format.ts             # Model name formatting utilities
 └── probes/
-    ├── types.ts           # ProbeModelMeta, ProbeResult, ProviderProbe
-    ├── index.ts           # Probe registry (getProbe)
+    ├── types.ts           # ProbeModelMeta, ProbeResult, ProviderProbe, ProbeContext
+    ├── index.ts           # Probe registry + resolveProbe (supports "auto")
+    ├── fingerprint.ts     # Server auto-detection (tiered fingerprinting)
     ├── omlx.ts            # oMLX probe implementation
-    └── ollama.ts          # Ollama probe implementation
+    ├── ollama.ts          # Ollama probe implementation
+    ├── vllm.ts            # vLLM probe implementation
+    ├── tgi.ts             # TGI probe implementation
+    ├── sglang.ts          # SGLang probe implementation
+    ├── lmstudio.ts        # LM Studio probe implementation
+    └── koboldcpp.ts       # KoboldCpp probe implementation
 ```
 
 ### Plugin Lifecycle
@@ -27,6 +33,7 @@ sequenceDiagram
     participant OC as opencode
     participant PI as Plugin Init
     participant DM as discoverModels
+    participant FP as Fingerprint
     participant PR as Probe
     participant MD as models.dev
 
@@ -40,11 +47,19 @@ sequenceDiagram
     loop Each OpenAI-compatible provider
         DM->>DM: fetchModels(baseURL)
         DM->>DM: Categorize by keyword
-        alt Probe configured
-            DM->>PR: probe(baseURL, apiKey)
+        alt probe = explicit name
+            DM->>PR: probe(baseURL, apiKey, context)
             PR-->>DM: ProbeResult
-            DM->>DM: applyProbeMeta per model
+        else probe = "auto"
+            DM->>FP: fingerprint(baseURL, apiKey, modelsResponse)
+            FP-->>DM: DetectedServer or undefined
+            opt Server detected
+                DM->>DM: PROBE_MAP lookup
+                DM->>PR: probe(baseURL, apiKey, context)
+                PR-->>DM: ProbeResult
+            end
         end
+        DM->>DM: applyProbeMeta per model
         DM->>DM: applyModelsDevMeta per model
         DM->>DM: Merge into config
     end
@@ -68,8 +83,12 @@ ones, and manually configured models are skipped entirely.
 flowchart TD
     A["GET /v1/models"] --> B["Keyword Categorization"]
     B --> C{Probe configured?}
-    C -->|Yes| D["Provider Probe"]
+    C -->|Explicit name| D["Provider Probe"]
+    C -->|"auto"| G["Fingerprint Server"]
     C -->|No| E["models.dev Fallback"]
+    G -->|Detected| H["PROBE_MAP lookup"]
+    G -->|Not detected| E
+    H --> D
     D --> E
     E --> F["Enriched Model Config"]
 
@@ -77,6 +96,7 @@ flowchart TD
     style D fill:#d4edda
     style E fill:#fff3cd
     style F fill:#f0f0f0
+    style G fill:#e8daef
 ```
 
 **Layer 1 — Keyword categorization** sets basic model type:
@@ -92,6 +112,10 @@ provider-specific APIs for authoritative metadata:
 - Model type (LLM/VLM/embedding)
 - Capability flags (tools, vision, reasoning)
 - Physical metadata (parameter size, quantization, disk size)
+
+When `"probe": "auto"` is set, the plugin fingerprints the server first
+(see [Server Auto-Detection](#server-auto-detection)) and maps the detected
+server to its probe via `PROBE_MAP`.
 
 **Layer 3 — models.dev fallback** matches model IDs against opencode's built-in
 database of ~4,000 cloud models to infer capabilities:
@@ -158,6 +182,63 @@ Key rules:
 - Capability flags are only ever set to `true`, never `false` — unknown is
   better than wrong
 
+### Server Auto-Detection
+
+When `"probe": "auto"` is configured, the `fingerprint()` function in
+`src/probes/fingerprint.ts` identifies the server using a tiered strategy:
+
+```mermaid
+flowchart TD
+    A["Start fingerprinting"] --> B["Tier 1: Inspect modelsResponse"]
+    B --> B1{"Single owned_by<br/>in OWNED_BY_MAP?"}
+    B1 -->|Yes| R2["Matched server"]
+    B1 -->|No| B2{"Non-standard fields?<br/>aliases, tags, status"}
+    B2 -->|Yes| R1["llamacpp"]
+    B2 -->|No| C["Tier 2: Endpoint probes"]
+    C --> C1{"GET /info<br/>has router field?"}
+    C1 -->|Yes| R3["tgi"]
+    C1 -->|No| C2{"GET /api/v1/models<br/>has key + type fields?"}
+    C2 -->|Yes| R4["lmstudio"]
+    C2 -->|No| D["Tier 3: Low confidence"]
+    D --> D1{"GET / or /api/tags<br/>looks like Ollama?"}
+    D1 -->|Yes| R5["Log suggestion,<br/>return undefined"]
+    D1 -->|No| R6["return undefined"]
+
+    style B fill:#d4edda
+    style C fill:#fff3cd
+    style D fill:#f8d7da
+```
+
+**Tier 1 -- modelsResponse inspection** (free, no HTTP):
+
+- Checks `owned_by` against `OWNED_BY_MAP` (omlx, vllm, sglang, llamacpp, koboldcpp, library→ollama)
+- If `owned_by` is unknown or mixed, checks for non-standard fields (`aliases`, `tags`, `status`) that indicate llama.cpp
+
+**Tier 2 -- endpoint probes** (sequential HTTP, 2s global timeout):
+
+- `GET /info` with a `router` field → TGI
+- `GET /api/v1/models` with `key` + `type` fields → LM Studio
+
+**Tier 3 -- low confidence** (suggestion only):
+
+- `GET /` containing "Ollama is running" or `/api/tags` responding with model list → logs a suggestion to set `"probe": "ollama"` explicitly, returns `undefined`
+
+Once detected, `PROBE_MAP` maps the server to its probe implementation:
+
+| Detected Server | Probe Used |
+| --------------- | ---------- |
+| ollama          | ollama     |
+| llamacpp        | ollama     |
+| omlx            | omlx       |
+| lmstudio        | lmstudio   |
+| tgi             | tgi        |
+| sglang          | sglang     |
+| vllm            | vllm       |
+| koboldcpp       | koboldcpp  |
+
+Note that llama.cpp maps to the `ollama` probe because llama.cpp's HTTP server
+implements an Ollama-compatible API.
+
 ## Building a New Probe
 
 Probes are the most impactful way to contribute. If you run a local inference
@@ -171,14 +252,26 @@ Every probe must implement the `ProviderProbe` type signature:
 type ProviderProbe = (
   baseURL: string, // Normalized, no trailing /v1
   apiKey?: string, // From provider options
+  context?: ProbeContext, // Pre-fetched data from the discovery layer
 ) => Promise<ProbeResult>;
+
+interface ProbeContext {
+  /** Pre-fetched /v1/models entries, for probes that need them */
+  modelsResponse?: OpenAIModelEntry[];
+}
 
 interface ProbeResult {
   models: Record<string, ProbeModelMeta>;
 }
 ```
 
-And follow these rules:
+The `context` parameter provides data already fetched by the discovery layer.
+Probes can read `context.modelsResponse` to access the `/v1/models` entries
+without making a redundant HTTP call. This is especially useful for probes like
+vLLM and SGLang where the models response already contains non-standard fields
+(e.g., `max_model_len`) with useful metadata.
+
+Probes must follow these rules:
 
 1. **Use `AbortSignal.timeout(2000)`** on every fetch call — probes must
    complete fast enough to fit within the 5-second config hook budget
@@ -192,12 +285,18 @@ And follow these rules:
 1. Create `src/probes/yourprovider.ts`:
 
 ```typescript
-import type { ProbeModelMeta, ProbeResult, ProviderProbe } from "./types";
+import type {
+  ProbeModelMeta,
+  ProbeResult,
+  ProbeContext,
+  ProviderProbe,
+} from "./types";
 import { LOG_PREFIX } from "../constants";
 
 export const probeYourProvider: ProviderProbe = async (
   baseURL: string,
   apiKey?: string,
+  context?: ProbeContext,
 ): Promise<ProbeResult> => {
   try {
     const headers: Record<string, string> = {};
@@ -205,7 +304,22 @@ export const probeYourProvider: ProviderProbe = async (
       headers["Authorization"] = `Bearer ${apiKey}`;
     }
 
-    // Call your provider's metadata API
+    // Option A: Use context.modelsResponse if the /v1/models response
+    // already contains the metadata you need (e.g., max_model_len)
+    if (context?.modelsResponse) {
+      const models: Record<string, ProbeModelMeta> = {};
+      for (const entry of context.modelsResponse) {
+        models[entry.id] = {
+          context: (entry as Record<string, unknown>).context_window as
+            | number
+            | undefined,
+          temperature: true,
+        };
+      }
+      return { models };
+    }
+
+    // Option B: Call a provider-specific metadata API
     const res = await fetch(`${baseURL}/your/metadata/endpoint`, {
       headers,
       signal: AbortSignal.timeout(2000),
@@ -285,6 +399,72 @@ All fields are optional. Set what your provider can report:
   enriched. If one model's metadata call fails, the others should still work.
 - **Accurate** — only report what the provider API confirms. Don't guess
   capabilities that aren't explicitly reported.
+
+## Adding New Server Fingerprints
+
+If you're adding support for a new server type that should be auto-detected
+via `"probe": "auto"`, you need to update three things in
+`src/probes/fingerprint.ts`:
+
+### 1. Add to `OWNED_BY_MAP` (Tier 1)
+
+If the server sets a distinctive `owned_by` value in its `/v1/models` response,
+add it to the map for free detection with no HTTP overhead:
+
+```typescript
+const OWNED_BY_MAP: Record<string, DetectedServer> = {
+  omlx: "omlx",
+  vllm: "vllm",
+  // ...
+  yourserver: "yourserver", // Add this line
+};
+```
+
+### 2. Add a Tier 2 endpoint probe (if needed)
+
+If the server cannot be identified by `owned_by` alone, add a Tier 2 check
+that probes a server-specific endpoint. Add it to the sequential probe chain
+in the `fingerprint()` function, before the Tier 3 section:
+
+```typescript
+// Step N: GET /your/unique/endpoint → YourServer
+try {
+  const res = await fetch(`${baseURL}/your/unique/endpoint`, {
+    headers,
+    signal: AbortSignal.any([
+      globalController.signal,
+      AbortSignal.timeout(1000),
+    ]),
+  });
+  if (res.ok) {
+    const data = (await res.json()) as Record<string, unknown>;
+    if (/* response shape is unique to this server */) {
+      return "yourserver";
+    }
+  }
+} catch {
+  // Individual probe failure — continue
+}
+```
+
+### 3. Update `PROBE_MAP`
+
+Map the detected server to the probe implementation that should handle it:
+
+```typescript
+export const PROBE_MAP: Record<DetectedServer, ProbeKey> = {
+  // ...
+  yourserver: "yourserver", // Maps to the probe registered in PROBES
+};
+```
+
+If the new server is API-compatible with an existing probe (like llama.cpp
+using the ollama probe), map it to the existing probe key instead.
+
+### 4. Update types
+
+Add the new server name to both the `DetectedServer` and `ProbeKey` union
+types (if it uses its own probe) at the top of `fingerprint.ts`.
 
 ## models.dev Matching
 
@@ -403,18 +583,30 @@ opencode-model-scout/
 │   ├── command.ts          # /modelscout output formatting
 │   ├── format.ts           # Model name prettification
 │   └── probes/
-│       ├── types.ts         # Shared types
-│       ├── index.ts         # Registry
-│       ├── omlx.ts          # 77 lines
-│       └── ollama.ts        # 175 lines
+│       ├── types.ts         # Shared types (ProbeModelMeta, ProbeContext)
+│       ├── index.ts         # Registry + resolveProbe (supports "auto")
+│       ├── fingerprint.ts   # Server auto-detection (tiered)
+│       ├── omlx.ts          # oMLX probe
+│       ├── ollama.ts        # Ollama probe
+│       ├── vllm.ts          # vLLM probe
+│       ├── tgi.ts           # TGI probe
+│       ├── sglang.ts        # SGLang probe
+│       ├── lmstudio.ts      # LM Studio probe
+│       └── koboldcpp.ts     # KoboldCpp probe
 ├── test/
 │   ├── probes/
-│   │   ├── omlx.test.ts     # 9 tests
-│   │   └── ollama.test.ts   # 9 tests
-│   ├── discover.test.ts     # 7 tests
-│   ├── command.test.ts      # 8 tests
-│   ├── format.test.ts       # 6 tests
-│   └── models-dev.test.ts   # 9 tests
+│   │   ├── omlx.test.ts
+│   │   ├── ollama.test.ts
+│   │   ├── fingerprint.test.ts
+│   │   ├── vllm.test.ts
+│   │   ├── tgi.test.ts
+│   │   ├── sglang.test.ts
+│   │   ├── lmstudio.test.ts
+│   │   └── koboldcpp.test.ts
+│   ├── discover.test.ts
+│   ├── command.test.ts
+│   ├── format.test.ts
+│   └── models-dev.test.ts
 ├── package.json
 ├── tsconfig.json
 ├── vitest.config.ts

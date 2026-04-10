@@ -1,5 +1,7 @@
 import type { ProbeModelMeta } from "./probes/types";
-import { getProbe } from "./probes/index";
+import type { OpenAIModelEntry } from "./probes/types";
+import { resolveProbe } from "./probes/index";
+import type { ProbeContext, DetectedServer } from "./probes/index";
 import { extractModelOwner, formatModelName } from "./format";
 import { LOG_PREFIX } from "./constants";
 import { findMatch, type ModelsDevMeta } from "./models-dev";
@@ -13,20 +15,13 @@ export interface DiscoverySnapshot {
   probeType: string | undefined;
   baseURL: string;
   models: Record<string, Record<string, unknown>>;
-}
-
-/** Shape of a single model from the OpenAI /v1/models response. */
-interface OpenAIModel {
-  id: string;
-  object: string;
-  created: number;
-  owned_by: string;
+  detectedServer?: DetectedServer;
 }
 
 /** Shape of the OpenAI /v1/models response body. */
 interface OpenAIModelsResponse {
   object: string;
-  data: OpenAIModel[];
+  data: OpenAIModelEntry[];
 }
 
 /** Module-level store of discovery results, reset on each run. */
@@ -56,7 +51,7 @@ function normalizeBaseURL(url: string): string {
 async function fetchModels(
   baseURL: string,
   apiKey?: string,
-): Promise<OpenAIModel[]> {
+): Promise<OpenAIModelEntry[]> {
   try {
     const headers: Record<string, string> = {};
     if (apiKey) {
@@ -68,7 +63,7 @@ async function fetchModels(
     });
     if (!res.ok) return [];
     const data = (await res.json()) as OpenAIModelsResponse;
-    return data.data ?? [];
+    return Array.isArray(data.data) ? data.data : [];
   } catch {
     return [];
   }
@@ -160,8 +155,15 @@ function applyProbeMeta(
     model.attachment = true;
   } else if (meta.modelType === "llm") {
     model.modalities = { input: ["text"], output: ["text"] };
+  } else if (meta.modelType === "embedding") {
+    // Probe confirms this is an embedding model — clear any chat modalities
+    // that keyword categorization may have set (output:["embedding"] is invalid
+    // in opencode, so we remove modalities entirely)
+    delete model.modalities;
+    delete model.attachment;
+    // Mark as probe-confirmed embedding so fallback enrichment skips modalities
+    model._probeEmbedding = true;
   }
-  // embedding: no modality override (output:["embedding"] is invalid in opencode)
 
   // Capability flags — only set if not already present on model
   if (meta.toolCall !== undefined && model.tool_call === undefined)
@@ -181,14 +183,18 @@ function applyProbeMeta(
 /**
  * Apply models.dev metadata as a fallback enrichment source.
  * Only sets fields that are not already present on the model.
+ * Respects probe authority: if a probe confirmed the model as embedding,
+ * modalities and attachment are not re-added.
  */
 function applyModelsDevMeta(
   model: Record<string, unknown>,
   meta: ModelsDevMeta,
 ): void {
+  const isProbeEmbedding = model._probeEmbedding === true;
+
   if (meta.toolCall && model.tool_call === undefined) model.tool_call = true;
   if (meta.reasoning && model.reasoning === undefined) model.reasoning = true;
-  if (meta.attachment && model.attachment === undefined) {
+  if (!isProbeEmbedding && meta.attachment && model.attachment === undefined) {
     model.attachment = true;
     // Also set vision modalities if not already set
     if (!model.modalities) {
@@ -198,7 +204,8 @@ function applyModelsDevMeta(
   if (meta.temperature && model.temperature === undefined)
     model.temperature = true;
   if (meta.family && !model.family) model.family = meta.family;
-  if (meta.modalities && !model.modalities) model.modalities = meta.modalities;
+  if (!isProbeEmbedding && meta.modalities && !model.modalities)
+    model.modalities = meta.modalities;
 }
 
 /** Flattened models.dev index for matching. */
@@ -277,13 +284,19 @@ export async function discoverModels(
         discoveredModels[model.id] = entry;
       }
 
-      // Run probe if configured
+      // Resolve probe (supports explicit names, "auto", or undefined)
       const probeType = options?.probe as string | undefined;
-      const probe = getProbe(probeType);
+      const context: ProbeContext = { modelsResponse: openaiModels };
+      const { probe, detectedServer } = await resolveProbe(
+        probeType,
+        baseURL,
+        apiKey,
+        context,
+      );
 
       if (probe) {
         try {
-          const probeResult = await probe(baseURL, apiKey);
+          const probeResult = await probe(baseURL, apiKey, context);
           for (const [modelId, meta] of Object.entries(probeResult.models)) {
             const discovered = discoveredModels[modelId];
             if (discovered) {
@@ -308,6 +321,11 @@ export async function discoverModels(
         }
       }
 
+      // Clean up internal sentinel before merging into opencode config
+      for (const model of Object.values(discoveredModels)) {
+        delete model._probeEmbedding;
+      }
+
       // Merge discovered models into provider config
       if (Object.keys(discoveredModels).length > 0) {
         providerConfig.models = { ...existingModels, ...discoveredModels };
@@ -316,6 +334,7 @@ export async function discoverModels(
           probeType,
           baseURL,
           models: discoveredModels,
+          detectedServer,
         });
       }
     }

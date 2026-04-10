@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
 import { discoverModels, getDiscoveryStore } from "../src/discover";
+import { formatModelsTable } from "../src/command";
+import type { DiscoverySnapshot } from "../src/discover";
 
 const mockFetch = vi.fn();
 global.fetch = mockFetch;
@@ -8,6 +10,13 @@ if (!global.AbortSignal.timeout) {
   global.AbortSignal.timeout = vi.fn(() => {
     const controller = new AbortController();
     setTimeout(() => controller.abort(), 3000);
+    return controller.signal;
+  });
+}
+
+if (!global.AbortSignal.any) {
+  global.AbortSignal.any = vi.fn(() => {
+    const controller = new AbortController();
     return controller.signal;
   });
 }
@@ -361,5 +370,220 @@ describe("discoverModels", () => {
 
     const store = getDiscoveryStore();
     expect(store).toHaveLength(0);
+  });
+
+  it('should auto-detect and run probe when probe is "auto"', async () => {
+    setupFetchRouter({
+      "/v1/models": {
+        ok: true,
+        body: {
+          object: "list",
+          data: [
+            {
+              id: "meta-llama/Llama-3-8B",
+              object: "model",
+              created: 1700000000,
+              owned_by: "vllm",
+              max_model_len: 8192,
+            },
+          ],
+        },
+      },
+    });
+
+    const config: Record<string, unknown> = {
+      provider: {
+        "vllm-provider": {
+          npm: "@ai-sdk/openai-compatible",
+          options: {
+            baseURL: "http://localhost:8000/v1",
+            probe: "auto",
+          },
+        },
+      },
+    };
+
+    await discoverModels(config);
+
+    const providers = config.provider as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const models = providers["vllm-provider"].models as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const model = models["meta-llama/Llama-3-8B"];
+    expect(model).toBeDefined();
+    expect(model.limit).toEqual({ context: 8192, output: 0 });
+  });
+
+  it("should skip probing when auto-detection returns undefined", async () => {
+    mockFetch.mockImplementation(async (url: string) => {
+      if (url.includes("/v1/models")) {
+        return {
+          ok: true,
+          json: async () => ({
+            object: "list",
+            data: [
+              {
+                id: "some-model",
+                object: "model",
+                created: 1700000000,
+                owned_by: "unknown-provider",
+              },
+            ],
+          }),
+        };
+      }
+      // All fingerprint endpoints return 404
+      return { ok: false, status: 404 };
+    });
+
+    const config: Record<string, unknown> = {
+      provider: {
+        "mystery-provider": {
+          npm: "@ai-sdk/openai-compatible",
+          options: {
+            baseURL: "http://localhost:8000/v1",
+            probe: "auto",
+          },
+        },
+      },
+    };
+
+    await discoverModels(config);
+
+    const providers = config.provider as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const models = providers["mystery-provider"].models as Record<
+      string,
+      Record<string, unknown>
+    >;
+    // Model discovered but no probe enrichment (no limit set)
+    expect(models["some-model"]).toBeDefined();
+    expect(
+      (models["some-model"] as Record<string, unknown>).limit,
+    ).toBeUndefined();
+  });
+
+  it("should include detectedServer in discovery snapshot", async () => {
+    setupFetchRouter({
+      "/v1/models": {
+        ok: true,
+        body: {
+          object: "list",
+          data: [
+            {
+              id: "meta-llama/Llama-3-8B",
+              object: "model",
+              created: 1700000000,
+              owned_by: "vllm",
+              max_model_len: 8192,
+            },
+          ],
+        },
+      },
+    });
+
+    const config: Record<string, unknown> = {
+      provider: {
+        "auto-vllm": {
+          npm: "@ai-sdk/openai-compatible",
+          options: {
+            baseURL: "http://localhost:8000/v1",
+            probe: "auto",
+          },
+        },
+      },
+    };
+
+    await discoverModels(config);
+
+    const store = getDiscoveryStore();
+    expect(store).toHaveLength(1);
+    expect(store[0].detectedServer).toBe("vllm");
+  });
+
+  it("should still work with explicit probe names", async () => {
+    setupFetchRouter({
+      "/v1/models/status": {
+        ok: true,
+        body: {
+          models: [
+            {
+              id: "qwen3-30b-a3b",
+              loaded: true,
+              model_type: "llm",
+              max_context_window: 131072,
+              max_tokens: 32768,
+            },
+          ],
+        },
+      },
+      "/v1/models": {
+        ok: true,
+        body: {
+          object: "list",
+          data: [
+            {
+              id: "qwen3-30b-a3b",
+              object: "model",
+              created: 1700000000,
+              owned_by: "local",
+            },
+          ],
+        },
+      },
+    });
+
+    const config: Record<string, unknown> = {
+      provider: {
+        "explicit-omlx": {
+          npm: "@ai-sdk/openai-compatible",
+          options: {
+            baseURL: "http://localhost:8000/v1",
+            probe: "omlx",
+          },
+        },
+      },
+    };
+
+    await discoverModels(config);
+
+    const providers = config.provider as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const models = providers["explicit-omlx"].models as Record<
+      string,
+      Record<string, unknown>
+    >;
+    const model = models["qwen3-30b-a3b"];
+    expect(model).toBeDefined();
+    expect(model.limit).toEqual({ context: 131072, output: 32768 });
+  });
+
+  it("should show auto-detected server in formatModelsTable", () => {
+    const snapshots: DiscoverySnapshot[] = [
+      {
+        provider: "my-vllm",
+        probeType: "auto",
+        baseURL: "http://localhost:8000",
+        models: {
+          "meta-llama/Llama-3-8B": {
+            id: "meta-llama/Llama-3-8B",
+            name: "Llama 3 8B",
+            limit: { context: 8192, output: 0 },
+          },
+        },
+        detectedServer: "vllm",
+      },
+    ];
+
+    const output = formatModelsTable(snapshots);
+    expect(output).toContain("auto \u2192 vllm");
   });
 });
