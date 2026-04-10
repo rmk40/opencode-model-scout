@@ -4,6 +4,7 @@ import type {
   ProviderProbe,
   ProbeContext,
 } from "./types";
+import { EMPTY_RESULT } from "./util";
 
 export const probeVllm: ProviderProbe = async (
   _baseURL: string,
@@ -11,7 +12,7 @@ export const probeVllm: ProviderProbe = async (
   context?: ProbeContext,
 ): Promise<ProbeResult> => {
   const entries = context?.modelsResponse;
-  if (!entries?.length) return { models: {} };
+  if (!entries?.length) return EMPTY_RESULT;
 
   const models: Record<string, ProbeModelMeta> = {};
   for (const entry of entries) {

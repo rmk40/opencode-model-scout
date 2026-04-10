@@ -1,5 +1,6 @@
 import { LOG_PREFIX } from "../constants";
 import type { OpenAIModelEntry } from "./types";
+import { buildHeaders, probeFetch } from "./util";
 
 export type DetectedServer =
   | "ollama"
@@ -42,17 +43,6 @@ const OWNED_BY_MAP: Record<string, DetectedServer> = {
 };
 
 /**
- * Build request headers, adding Authorization if apiKey is provided.
- */
-function buildHeaders(apiKey?: string): Record<string, string> {
-  const headers: Record<string, string> = {};
-  if (apiKey) {
-    headers["Authorization"] = `Bearer ${apiKey}`;
-  }
-  return headers;
-}
-
-/**
  * Auto-detect the server behind an OpenAI-compatible endpoint.
  *
  * Uses a tiered approach:
@@ -66,6 +56,7 @@ export async function fingerprint(
   baseURL: string,
   apiKey?: string,
   modelsResponse?: OpenAIModelEntry[],
+  signal?: AbortSignal,
 ): Promise<DetectedServer | undefined> {
   try {
     // ── Tier 1 — owned_by check (free, no HTTP) ──────────────────────
@@ -100,42 +91,46 @@ export async function fingerprint(
       }
     }
 
+    // Check abort after Tier 1
+    if (signal?.aborted) return undefined;
+
     // ── Tier 2 — endpoint probes (sequential, global 2s timeout) ─────
 
     const headers = buildHeaders(apiKey);
     const globalController = new AbortController();
     const globalTimeout = setTimeout(() => globalController.abort(), 2000);
 
+    const combinedSignal = signal
+      ? AbortSignal.any([signal, globalController.signal])
+      : globalController.signal;
+
     try {
       // Step 1: GET /info → TGI
       try {
-        const res = await fetch(`${baseURL}/info`, {
+        const res = await probeFetch(`${baseURL}/info`, {
           headers,
-          signal: AbortSignal.any([
-            globalController.signal,
-            AbortSignal.timeout(1000),
-          ]),
+          signal: combinedSignal,
+          timeoutMs: 1000,
         });
-        if (res.ok) {
+        if (res?.ok) {
           const data = (await res.json()) as Record<string, unknown>;
           if (typeof data.router === "string") {
             return "tgi";
           }
         }
       } catch {
-        // Individual probe failure — continue
+        // json parse failure — continue
       }
 
       // Step 2: GET /api/v1/models → LM Studio
+      if (combinedSignal.aborted) return undefined;
       try {
-        const res = await fetch(`${baseURL}/api/v1/models`, {
+        const res = await probeFetch(`${baseURL}/api/v1/models`, {
           headers,
-          signal: AbortSignal.any([
-            globalController.signal,
-            AbortSignal.timeout(1000),
-          ]),
+          signal: combinedSignal,
+          timeoutMs: 1000,
         });
-        if (res.ok) {
+        if (res?.ok) {
           const data = (await res.json()) as unknown;
           if (
             Array.isArray(data) &&
@@ -147,21 +142,20 @@ export async function fingerprint(
           }
         }
       } catch {
-        // Individual probe failure — continue
+        // json parse failure — continue
       }
 
       // ── Tier 3 — low confidence (suggest only, return undefined) ───
+      if (combinedSignal.aborted) return undefined;
 
       // Step 3: GET / → Ollama banner
       try {
-        const res = await fetch(`${baseURL}/`, {
+        const res = await probeFetch(`${baseURL}/`, {
           headers,
-          signal: AbortSignal.any([
-            globalController.signal,
-            AbortSignal.timeout(1000),
-          ]),
+          signal: combinedSignal,
+          timeoutMs: 1000,
         });
-        if (res.ok) {
+        if (res?.ok) {
           const body = await res.text();
           if (body.includes("Ollama is running")) {
             console.warn(
@@ -171,19 +165,18 @@ export async function fingerprint(
           }
         }
       } catch {
-        // Individual probe failure — continue
+        // json/text parse failure — continue
       }
 
       // Step 4: GET /api/tags → Ollama tags endpoint
+      if (combinedSignal.aborted) return undefined;
       try {
-        const res = await fetch(`${baseURL}/api/tags`, {
+        const res = await probeFetch(`${baseURL}/api/tags`, {
           headers,
-          signal: AbortSignal.any([
-            globalController.signal,
-            AbortSignal.timeout(1000),
-          ]),
+          signal: combinedSignal,
+          timeoutMs: 1000,
         });
-        if (res.ok) {
+        if (res?.ok) {
           const data = (await res.json()) as Record<string, unknown>;
           if (
             Array.isArray(data.models) &&
@@ -197,7 +190,7 @@ export async function fingerprint(
           }
         }
       } catch {
-        // Individual probe failure — continue
+        // json parse failure — continue
       }
     } finally {
       clearTimeout(globalTimeout);

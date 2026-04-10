@@ -1,5 +1,6 @@
 import type { ProbeModelMeta, ProbeResult, ProviderProbe } from "./types";
 import { LOG_PREFIX } from "../constants";
+import { buildHeaders, probeFetch, EMPTY_RESULT } from "./util";
 
 /** A single model entry from Ollama's GET /api/tags response. */
 interface OllamaTagModel {
@@ -45,19 +46,6 @@ function extractContextLength(
 }
 
 /**
- * Build request headers for Ollama API calls.
- */
-function buildHeaders(apiKey?: string): Record<string, string> {
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (apiKey) {
-    headers["Authorization"] = `Bearer ${apiKey}`;
-  }
-  return headers;
-}
-
-/**
  * Probe Ollama for model metadata via /api/tags + /api/show per model.
  */
 export const probeOllama: ProviderProbe = async (
@@ -67,17 +55,16 @@ export const probeOllama: ProviderProbe = async (
   try {
     const headers = buildHeaders(apiKey);
 
-    // Step 1: List all models
-    const tagsRes = await fetch(`${baseURL}/api/tags`, {
-      headers,
-      signal: AbortSignal.timeout(2000),
-    });
+    // Step 1: List all models (GET — no Content-Type needed)
+    const tagsRes = await probeFetch(`${baseURL}/api/tags`, { headers });
+
+    if (!tagsRes) return EMPTY_RESULT;
 
     if (!tagsRes.ok) {
       console.warn(
         `${LOG_PREFIX} Ollama probe: /api/tags HTTP ${tagsRes.status}`,
       );
-      return { models: {} };
+      return EMPTY_RESULT;
     }
 
     const tagsData = (await tagsRes.json()) as OllamaTagsResponse;
@@ -102,15 +89,16 @@ export const probeOllama: ProviderProbe = async (
       models[tag.name] = meta;
     }
 
-    // Step 2: Get detailed info per model in parallel
+    // Step 2: Get detailed info per model in parallel (POST — needs Content-Type)
+    const postHeaders = { ...headers, "Content-Type": "application/json" };
     const showResults = await Promise.allSettled(
       tagModels.map(async (tag) => {
-        const res = await fetch(`${baseURL}/api/show`, {
+        const res = await probeFetch(`${baseURL}/api/show`, {
           method: "POST",
-          headers,
+          headers: postHeaders,
           body: JSON.stringify({ model: tag.name }),
-          signal: AbortSignal.timeout(2000),
         });
+        if (!res) return null;
         if (!res.ok) return null;
         const data = (await res.json()) as OllamaShowResponse;
         return { name: tag.name, data };
@@ -170,6 +158,6 @@ export const probeOllama: ProviderProbe = async (
     return { models };
   } catch (error) {
     console.warn(`${LOG_PREFIX} Ollama probe failed:`, error);
-    return { models: {} };
+    return EMPTY_RESULT;
   }
 };

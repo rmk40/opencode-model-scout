@@ -65,8 +65,8 @@ export interface ProbeResult {
  * models the provider knows about.
  *
  * Probes MUST:
- * - Use AbortSignal.timeout(2000) on every fetch call
- * - Never throw — return { models: {} } on any error
+ * - Use probeFetch() from ./util for all HTTP calls (handles timeout + abort)
+ * - Never throw — return EMPTY_RESULT from ./util on any error
  * - Log warnings on failure via console.warn with LOG_PREFIX from constants
  */
 export type ProviderProbe = (

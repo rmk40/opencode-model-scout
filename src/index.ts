@@ -8,7 +8,6 @@ import {
   COMMAND_DESCRIPTION,
   COMMAND_SENTINEL,
   PLUGIN_NAME,
-  LOG_PREFIX,
 } from "./constants";
 
 /** Extended hooks type that includes command.execute.before (runtime-supported). */
@@ -53,15 +52,17 @@ const plugin: Plugin = async (input: PluginInput) => {
       const configRecord = config as unknown as Record<string, unknown>;
       const modelsDevIndex = await fetchModelsDevIndex();
 
-      // Run discovery with 5-second timeout
-      const discoveryPromise = discoverModels(configRecord, modelsDevIndex);
+      // Run discovery with 5-second timeout.
+      // AbortSignal.timeout handles both unblocking the caller and
+      // cancelling in-flight HTTP work (via probeFetch signal composition).
       try {
-        await Promise.race([
-          discoveryPromise,
-          new Promise<void>((resolve) => setTimeout(resolve, 5000)),
-        ]);
-      } catch (error) {
-        console.warn(`${LOG_PREFIX} Config enhancement failed:`, error);
+        await discoverModels(
+          configRecord,
+          modelsDevIndex,
+          AbortSignal.timeout(5000),
+        );
+      } catch {
+        // timeout or error — opencode starts normally
       }
     },
 

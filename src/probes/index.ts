@@ -68,6 +68,7 @@ export async function resolveProbe(
   baseURL: string,
   apiKey?: string,
   context?: ProbeContext,
+  signal?: AbortSignal,
 ): Promise<ResolvedProbe> {
   if (!type) return { probe: undefined };
   if (type === "auto") {
@@ -75,6 +76,7 @@ export async function resolveProbe(
       baseURL,
       apiKey,
       context?.modelsResponse,
+      signal,
     );
     if (!detected) return { probe: undefined };
     const probeKey = PROBE_MAP[detected];

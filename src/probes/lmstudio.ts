@@ -5,6 +5,7 @@ import type {
   ProbeContext,
 } from "./types";
 import { LOG_PREFIX } from "../constants";
+import { buildHeaders, probeFetch, EMPTY_RESULT } from "./util";
 
 interface LmStudioModel {
   key: string;
@@ -27,21 +28,19 @@ export const probeLmstudio: ProviderProbe = async (
   _context?: ProbeContext,
 ): Promise<ProbeResult> => {
   try {
-    const headers: Record<string, string> = {};
-    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+    const headers = buildHeaders(apiKey);
 
-    const res = await fetch(`${baseURL}/api/v1/models`, {
-      headers,
-      signal: AbortSignal.timeout(2000),
-    });
+    const res = await probeFetch(`${baseURL}/api/v1/models`, { headers });
+
+    if (!res) return EMPTY_RESULT;
 
     if (!res.ok) {
       console.warn(`${LOG_PREFIX} LM Studio probe: HTTP ${res.status}`);
-      return { models: {} };
+      return EMPTY_RESULT;
     }
 
     const data = (await res.json()) as LmStudioModel[];
-    if (!Array.isArray(data)) return { models: {} };
+    if (!Array.isArray(data)) return EMPTY_RESULT;
 
     const models: Record<string, ProbeModelMeta> = {};
 
@@ -85,6 +84,6 @@ export const probeLmstudio: ProviderProbe = async (
     return { models };
   } catch (error) {
     console.warn(`${LOG_PREFIX} LM Studio probe failed:`, error);
-    return { models: {} };
+    return EMPTY_RESULT;
   }
 };

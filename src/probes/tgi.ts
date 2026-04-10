@@ -5,6 +5,7 @@ import type {
   ProbeContext,
 } from "./types";
 import { LOG_PREFIX } from "../constants";
+import { buildHeaders, probeFetch, EMPTY_RESULT } from "./util";
 
 interface TgiInfoResponse {
   model_id?: string;
@@ -21,17 +22,15 @@ export const probeTgi: ProviderProbe = async (
   context?: ProbeContext,
 ): Promise<ProbeResult> => {
   try {
-    const headers: Record<string, string> = {};
-    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+    const headers = buildHeaders(apiKey);
 
-    const res = await fetch(`${baseURL}/info`, {
-      headers,
-      signal: AbortSignal.timeout(2000),
-    });
+    const res = await probeFetch(`${baseURL}/info`, { headers });
+
+    if (!res) return EMPTY_RESULT;
 
     if (!res.ok) {
       console.warn(`${LOG_PREFIX} TGI probe: HTTP ${res.status}`);
-      return { models: {} };
+      return EMPTY_RESULT;
     }
 
     const info = (await res.json()) as TgiInfoResponse;
@@ -39,7 +38,7 @@ export const probeTgi: ProviderProbe = async (
     // Use discovered model ID (matches what discoverModels uses as key).
     // Fall back to /info model_id for single-model servers without /v1/models.
     const modelId = context?.modelsResponse?.[0]?.id ?? info.model_id;
-    if (!modelId) return { models: {} };
+    if (!modelId) return EMPTY_RESULT;
 
     const meta: ProbeModelMeta = { temperature: true };
 
@@ -68,6 +67,6 @@ export const probeTgi: ProviderProbe = async (
     return { models: { [modelId]: meta } };
   } catch (error) {
     console.warn(`${LOG_PREFIX} TGI probe failed:`, error);
-    return { models: {} };
+    return EMPTY_RESULT;
   }
 };

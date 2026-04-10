@@ -346,6 +346,22 @@ describe("fingerprint", () => {
     expect(result).toBeUndefined();
   });
 
+  it("should return undefined when signal is aborted (unknown owned_by)", async () => {
+    const controller = new AbortController();
+    controller.abort();
+
+    const models = [makeModel({ owned_by: "unknown-corp" })];
+    const result = await fingerprint(
+      "http://localhost:8000",
+      undefined,
+      models,
+      controller.signal,
+    );
+    expect(result).toBeUndefined();
+    // Abort check happens after Tier 1, before Tier 2 HTTP probes — no fetch calls
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
   it("should map detected server to correct probe", () => {
     expect(PROBE_MAP["llamacpp"]).toBe("ollama");
     expect(PROBE_MAP["ollama"]).toBe("ollama");

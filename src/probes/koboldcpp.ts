@@ -5,6 +5,7 @@ import type {
   ProbeContext,
 } from "./types";
 import { LOG_PREFIX } from "../constants";
+import { buildHeaders, probeFetch, EMPTY_RESULT } from "./util";
 
 interface KoboldVersionResponse {
   result?: string;
@@ -27,32 +28,30 @@ export const probeKoboldcpp: ProviderProbe = async (
 ): Promise<ProbeResult> => {
   try {
     const modelId = context?.modelsResponse?.[0]?.id;
-    if (!modelId) return { models: {} };
+    if (!modelId) return EMPTY_RESULT;
 
-    const headers: Record<string, string> = {};
-    if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+    const headers = buildHeaders(apiKey);
 
     const meta: ProbeModelMeta = { temperature: true };
 
     // Fetch version/capabilities — don't let failure block context fetch
     try {
-      const res = await fetch(`${baseURL}/api/extra/version`, {
-        headers,
-        signal: AbortSignal.timeout(2000),
-      });
-      if (res.ok) {
-        const data = (await res.json()) as KoboldVersionResponse;
-        if (data.vision) {
-          meta.vision = true;
-          meta.modelType = "vlm";
+      const res = await probeFetch(`${baseURL}/api/extra/version`, { headers });
+      if (res) {
+        if (res.ok) {
+          const data = (await res.json()) as KoboldVersionResponse;
+          if (data.vision) {
+            meta.vision = true;
+            meta.modelType = "vlm";
+          } else {
+            meta.modelType = "llm";
+          }
+          // NOTE: Do NOT infer toolCall from jinja: true
         } else {
-          meta.modelType = "llm";
+          console.warn(
+            `${LOG_PREFIX} KoboldCpp version probe: HTTP ${res.status}`,
+          );
         }
-        // NOTE: Do NOT infer toolCall from jinja: true
-      } else {
-        console.warn(
-          `${LOG_PREFIX} KoboldCpp version probe: HTTP ${res.status}`,
-        );
       }
     } catch (error) {
       console.warn(`${LOG_PREFIX} KoboldCpp version probe failed:`, error);
@@ -60,19 +59,21 @@ export const probeKoboldcpp: ProviderProbe = async (
 
     // Fetch context length
     try {
-      const res = await fetch(`${baseURL}/api/v1/config/max_context_length`, {
-        headers,
-        signal: AbortSignal.timeout(2000),
-      });
-      if (res.ok) {
-        const data = (await res.json()) as KoboldContextResponse;
-        if (data.value !== undefined) {
-          meta.context = data.value;
+      const res = await probeFetch(
+        `${baseURL}/api/v1/config/max_context_length`,
+        { headers },
+      );
+      if (res) {
+        if (res.ok) {
+          const data = (await res.json()) as KoboldContextResponse;
+          if (data.value !== undefined) {
+            meta.context = data.value;
+          }
+        } else {
+          console.warn(
+            `${LOG_PREFIX} KoboldCpp context probe: HTTP ${res.status}`,
+          );
         }
-      } else {
-        console.warn(
-          `${LOG_PREFIX} KoboldCpp context probe: HTTP ${res.status}`,
-        );
       }
     } catch (error) {
       console.warn(`${LOG_PREFIX} KoboldCpp context probe failed:`, error);
@@ -81,6 +82,6 @@ export const probeKoboldcpp: ProviderProbe = async (
     return { models: { [modelId]: meta } };
   } catch (error) {
     console.warn(`${LOG_PREFIX} KoboldCpp probe failed:`, error);
-    return { models: {} };
+    return EMPTY_RESULT;
   }
 };

@@ -566,6 +566,119 @@ describe("discoverModels", () => {
     expect(model.limit).toEqual({ context: 131072, output: 32768 });
   });
 
+  it("should abort discovery when signal is already aborted", async () => {
+    setupFetchRouter({
+      "/v1/models": {
+        ok: true,
+        body: {
+          object: "list",
+          data: [
+            {
+              id: "some-model",
+              object: "model",
+              created: 1700000000,
+              owned_by: "local",
+            },
+          ],
+        },
+      },
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const config: Record<string, unknown> = {
+      provider: {
+        "my-provider": {
+          npm: "@ai-sdk/openai-compatible",
+          options: {
+            baseURL: "http://localhost:8000/v1",
+          },
+        },
+      },
+    };
+
+    await discoverModels(config, undefined, controller.signal);
+
+    // No fetch calls should have been made — abort checked before any work
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it("should continue discovery when one provider throws", async () => {
+    mockFetch.mockImplementation(async (url: string) => {
+      // Provider A: model list succeeds, but fingerprint probe endpoint throws
+      if (url.includes("localhost:8001") && url.includes("/v1/models")) {
+        return {
+          ok: true,
+          json: async () => ({
+            object: "list",
+            data: [
+              {
+                id: "model-a",
+                object: "model",
+                created: 1700000000,
+                owned_by: "unknown-corp",
+              },
+            ],
+          }),
+        };
+      }
+      // Provider A: any other endpoint throws (simulates network error during probe)
+      if (url.includes("localhost:8001")) {
+        throw new TypeError("ECONNREFUSED");
+      }
+
+      // Provider B: everything works
+      if (url.includes("localhost:8002") && url.includes("/v1/models")) {
+        return {
+          ok: true,
+          json: async () => ({
+            object: "list",
+            data: [
+              {
+                id: "model-b",
+                object: "model",
+                created: 1700000000,
+                owned_by: "local",
+              },
+            ],
+          }),
+        };
+      }
+
+      return { ok: false, status: 404 };
+    });
+
+    const config: Record<string, unknown> = {
+      provider: {
+        "provider-a": {
+          npm: "@ai-sdk/openai-compatible",
+          options: {
+            baseURL: "http://localhost:8001/v1",
+            probe: "auto",
+          },
+        },
+        "provider-b": {
+          npm: "@ai-sdk/openai-compatible",
+          options: {
+            baseURL: "http://localhost:8002/v1",
+          },
+        },
+      },
+    };
+
+    await discoverModels(config);
+
+    const providers = config.provider as Record<
+      string,
+      Record<string, unknown>
+    >;
+
+    // Provider B's model should still be discovered
+    const modelsB = providers["provider-b"].models as Record<string, unknown>;
+    expect(modelsB["model-b"]).toBeDefined();
+  });
+
   it("should show auto-detected server in formatModelsTable", () => {
     const snapshots: DiscoverySnapshot[] = [
       {
