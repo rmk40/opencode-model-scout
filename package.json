@@ -1,8 +1,8 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-  "name": "opencode-lmstudio",
-  "version": "0.3.0",
-  "description": "OpenCode plugin for enhanced LM Studio support with auto-detection and dynamic model discovery",
+  "name": "opencode-model-scout",
+  "version": "0.1.0",
+  "description": "opencode plugin: auto-discover models from OpenAI-compatible providers, enrich with provider-specific metadata via probes",
   "type": "module",
   "main": "./src/index.ts",
   "exports": {
@@ -16,28 +16,22 @@
     "test": "vitest",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "test:watch": "vitest watch",
     "lint": "eslint src --ext .ts",
-    "lint:fix": "eslint src --ext .ts --fix",
-    "build": "npm run typecheck && npm run test:run",
-    "validate": "npm run lint && npm run typecheck && npm run test:run",
-    "validate:config": "bun scripts/validate-config.ts",
-    "release": "bun scripts/release.ts",
-    "prepublishOnly": "npm run build"
+    "build": "npm run typecheck && npm run test:run"
   },
   "keywords": [
     "opencode",
-    "lmstudio",
-    "lm-studio",
-    "plugin",
-    "local-llm",
-    "openai-compatible"
+    "opencode-plugin",
+    "model-discovery",
+    "openai-compatible",
+    "ollama",
+    "omlx"
   ],
   "author": "",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/agustif/opencode-lmstudio.git"
+    "url": "git+https://github.com/rmk40/opencode-model-scout.git"
   },
   "dependencies": {
     "@opencode-ai/plugin": "^1.0.166"
