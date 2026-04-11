@@ -16,8 +16,6 @@ jobs:
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:
@@ -25,7 +23,7 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run build
+      - run: npm run check
 
       - name: Delete previous latest release
         run: |

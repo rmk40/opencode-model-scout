@@ -12,12 +12,27 @@
     "src"
   ],
   "scripts": {
+    "prepare": "husky",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier . --write",
+    "format:check": "prettier . --check",
     "test": "vitest",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",
-    "lint": "eslint src --ext .ts",
-    "build": "npm run typecheck && npm run test:run"
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run test:run",
+    "fix": "npm run lint:fix && npm run format",
+    "build": "npm run check"
+  },
+  "lint-staged": {
+    "*.ts": [
+      "eslint --fix --max-warnings=0 --no-warn-ignored",
+      "prettier --write"
+    ],
+    "*.{json,md,yml,yaml}": [
+      "prettier --write"
+    ]
   },
   "keywords": [
     "opencode",
@@ -37,10 +52,16 @@
     "@opencode-ai/plugin": "^1.0.166"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.4",
     "@types/node": "^25.0.3",
     "@vitest/coverage-v8": "^4.0.16",
     "eslint": "^9.39.2",
+    "eslint-config-prettier": "^10.1.8",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "prettier": "^3.8.2",
     "typescript": "^5.9.3",
+    "typescript-eslint": "^8.58.1",
     "vitest": "^4.0.16"
   }
 }

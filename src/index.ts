@@ -19,6 +19,7 @@ interface PluginHooks extends Hooks {
   }) => Promise<void>;
 }
 
+// eslint-disable-next-line @typescript-eslint/require-await
 const plugin: Plugin = async (input: PluginInput) => {
   const { client } = input;
 

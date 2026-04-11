@@ -317,12 +317,11 @@ describe("discoverModels", () => {
 
     // Manually configured model should NOT be overwritten
     expect(models["manually-configured"]).toBe(existingModelConfig);
-    expect(
-      (models["manually-configured"] as Record<string, unknown>).name,
-    ).toBe("My Custom Config");
-    expect(
-      (models["manually-configured"] as Record<string, unknown>).limit,
-    ).toEqual({ context: 4096, output: 1024 });
+    expect(models["manually-configured"].name).toBe("My Custom Config");
+    expect(models["manually-configured"].limit).toEqual({
+      context: 4096,
+      output: 1024,
+    });
 
     // But the new model should be discovered
     expect(models["discovered-model"]).toBeDefined();
@@ -464,9 +463,7 @@ describe("discoverModels", () => {
     >;
     // Model discovered but no probe enrichment (no limit set)
     expect(models["some-model"]).toBeDefined();
-    expect(
-      (models["some-model"] as Record<string, unknown>).limit,
-    ).toBeUndefined();
+    expect(models["some-model"].limit).toBeUndefined();
   });
 
   it("should include detectedServer in discovery snapshot", async () => {

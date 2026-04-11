@@ -6,13 +6,19 @@ import type {
 } from "./types";
 import { EMPTY_RESULT } from "./util";
 
-export const probeVllm: ProviderProbe = async (
+/**
+ * Probe vLLM for model metadata from the /v1/models response.
+ * vLLM includes max_model_len in its model entries, so no HTTP calls needed.
+ * Non-async because it only reads from context — ProviderProbe accepts
+ * sync functions that return Promise<ProbeResult>.
+ */
+export const probeVllm: ProviderProbe = (
   _baseURL: string,
   _apiKey?: string,
   context?: ProbeContext,
 ): Promise<ProbeResult> => {
   const entries = context?.modelsResponse;
-  if (!entries?.length) return EMPTY_RESULT;
+  if (!entries?.length) return Promise.resolve(EMPTY_RESULT);
 
   const models: Record<string, ProbeModelMeta> = {};
   for (const entry of entries) {
@@ -22,5 +28,5 @@ export const probeVllm: ProviderProbe = async (
     }
     models[entry.id] = meta;
   }
-  return { models };
+  return Promise.resolve({ models });
 };

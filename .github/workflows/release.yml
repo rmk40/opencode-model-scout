@@ -22,7 +22,7 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run build
+      - run: npm run check
 
       - name: Create GitHub Release
         run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag --latest=true

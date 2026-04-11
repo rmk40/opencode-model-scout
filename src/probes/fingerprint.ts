@@ -131,7 +131,7 @@ export async function fingerprint(
           timeoutMs: 1000,
         });
         if (res?.ok) {
-          const data = (await res.json()) as unknown;
+          const data = await res.json();
           if (
             Array.isArray(data) &&
             data.length > 0 &&

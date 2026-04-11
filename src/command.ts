@@ -96,10 +96,12 @@ export function formatModelsTable(
       if (model.temperature) flags.push("Temp");
       if (flags.length > 0) parts.push(flags.join(", "));
 
-      // Family and probe details
-      if (model.family) parts.push(`Family: ${model.family}`);
-      if (model.parameterSize) parts.push(`Params: ${model.parameterSize}`);
-      if (model.quantization) parts.push(`Quant: ${model.quantization}`);
+      // Family and probe details (values are strings from probe metadata)
+      if (model.family) parts.push(`Family: ${model.family as string}`);
+      if (model.parameterSize)
+        parts.push(`Params: ${model.parameterSize as string}`);
+      if (model.quantization)
+        parts.push(`Quant: ${model.quantization as string}`);
       if (model.sizeBytes)
         parts.push(`Size: ${formatBytes(model.sizeBytes as number)}`);
 

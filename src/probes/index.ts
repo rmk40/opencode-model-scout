@@ -7,7 +7,7 @@ import { probeSglang } from "./sglang";
 import { probeLmstudio } from "./lmstudio";
 import { probeKoboldcpp } from "./koboldcpp";
 import { fingerprint, PROBE_MAP } from "./fingerprint";
-import type { DetectedServer, ProbeKey } from "./fingerprint";
+import type { DetectedServer } from "./fingerprint";
 
 /**
  * Registry of provider-specific metadata probes.
@@ -92,4 +92,5 @@ export type {
   ProbeContext,
   OpenAIModelEntry,
 } from "./types";
-export type { DetectedServer, ProbeKey } from "./fingerprint";
+export type { DetectedServer } from "./fingerprint";
+export type { ProbeKey } from "./fingerprint";
