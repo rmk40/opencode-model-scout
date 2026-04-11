@@ -5,7 +5,7 @@ import type {
   ProbeContext,
 } from "./types";
 import { LOG_PREFIX } from "../constants";
-import { buildHeaders, probeFetch, EMPTY_RESULT } from "./util";
+import { buildHeaders, probeFetchJson, EMPTY_RESULT } from "./util";
 
 interface LmStudioModel {
   key: string;
@@ -30,22 +30,17 @@ export const probeLmstudio: ProviderProbe = async (
   try {
     const headers = buildHeaders(apiKey);
 
-    const res = await probeFetch(`${baseURL}/api/v1/models`, { headers });
-
-    if (!res) return EMPTY_RESULT;
-
-    if (!res.ok) {
-      console.warn(`${LOG_PREFIX} LM Studio probe: HTTP ${res.status}`);
-      return EMPTY_RESULT;
-    }
-
-    const data = (await res.json()) as LmStudioModel[];
+    const data = await probeFetchJson<LmStudioModel[]>(
+      `${baseURL}/api/v1/models`,
+      "LM Studio probe",
+      { headers },
+    );
     if (!Array.isArray(data)) return EMPTY_RESULT;
 
     const models: Record<string, ProbeModelMeta> = {};
 
     for (const entry of data) {
-      const meta: ProbeModelMeta = { temperature: true };
+      const meta: ProbeModelMeta = {};
 
       if (entry.max_context_length !== undefined) {
         meta.context = entry.max_context_length;

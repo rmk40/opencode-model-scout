@@ -1,24 +1,6 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { fingerprint, PROBE_MAP } from "../../src/probes/fingerprint";
 import type { OpenAIModelEntry } from "../../src/probes/types";
-
-const mockFetch = vi.fn();
-global.fetch = mockFetch;
-
-if (!global.AbortSignal.timeout) {
-  global.AbortSignal.timeout = vi.fn(() => {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 3000);
-    return controller.signal;
-  });
-}
-
-if (!global.AbortSignal.any) {
-  global.AbortSignal.any = vi.fn(() => {
-    const controller = new AbortController();
-    return controller.signal;
-  });
-}
 
 /** Helper: create a minimal OpenAI model entry. */
 function makeModel(
@@ -69,15 +51,6 @@ function setupFetchRouter(
 }
 
 describe("fingerprint", () => {
-  beforeEach(() => {
-    mockFetch.mockReset();
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   // ── Tier 1 — owned_by detection ──────────────────────────────────
 
   it("should detect omlx from owned_by", async () => {

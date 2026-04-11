@@ -5,7 +5,7 @@ import type {
   ProbeContext,
 } from "./types";
 import { LOG_PREFIX } from "../constants";
-import { buildHeaders, probeFetch, EMPTY_RESULT } from "./util";
+import { buildHeaders, probeFetchJson, EMPTY_RESULT } from "./util";
 
 interface TgiInfoResponse {
   model_id?: string;
@@ -24,23 +24,19 @@ export const probeTgi: ProviderProbe = async (
   try {
     const headers = buildHeaders(apiKey);
 
-    const res = await probeFetch(`${baseURL}/info`, { headers });
-
-    if (!res) return EMPTY_RESULT;
-
-    if (!res.ok) {
-      console.warn(`${LOG_PREFIX} TGI probe: HTTP ${res.status}`);
-      return EMPTY_RESULT;
-    }
-
-    const info = (await res.json()) as TgiInfoResponse;
+    const info = await probeFetchJson<TgiInfoResponse>(
+      `${baseURL}/info`,
+      "TGI probe",
+      { headers },
+    );
+    if (!info) return EMPTY_RESULT;
 
     // Use discovered model ID (matches what discoverModels uses as key).
     // Fall back to /info model_id for single-model servers without /v1/models.
     const modelId = context?.modelsResponse?.[0]?.id ?? info.model_id;
     if (!modelId) return EMPTY_RESULT;
 
-    const meta: ProbeModelMeta = { temperature: true };
+    const meta: ProbeModelMeta = {};
 
     if (info.max_total_tokens !== undefined) {
       meta.context = info.max_total_tokens;

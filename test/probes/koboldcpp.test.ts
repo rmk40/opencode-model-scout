@@ -1,16 +1,5 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { probeKoboldcpp } from "../../src/probes/koboldcpp";
-
-const mockFetch = vi.fn();
-global.fetch = mockFetch;
-
-if (!global.AbortSignal.timeout) {
-  global.AbortSignal.timeout = vi.fn(() => {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 3000);
-    return controller.signal;
-  });
-}
 
 /** Helper: route fetch calls based on URL patterns. */
 function setupKoboldMocks(
@@ -43,15 +32,6 @@ function setupKoboldMocks(
 }
 
 describe("probeKoboldcpp", () => {
-  beforeEach(() => {
-    mockFetch.mockReset();
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   it("should extract capabilities from /api/extra/version", async () => {
     setupKoboldMocks(
       { ok: true, body: { vision: true, jinja: true, version: "1.88" } },
@@ -77,7 +57,6 @@ describe("probeKoboldcpp", () => {
     expect(model.context).toBe(8192);
     // jinja does NOT mean toolCall
     expect(model.toolCall).toBeUndefined();
-    expect(model.temperature).toBe(true);
   });
 
   it("should extract context from /api/v1/config/max_context_length", async () => {

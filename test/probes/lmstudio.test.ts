@@ -1,27 +1,7 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { probeLmstudio } from "../../src/probes/lmstudio";
 
-const mockFetch = vi.fn();
-global.fetch = mockFetch;
-
-if (!global.AbortSignal.timeout) {
-  global.AbortSignal.timeout = vi.fn(() => {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 3000);
-    return controller.signal;
-  });
-}
-
 describe("probeLmstudio", () => {
-  beforeEach(() => {
-    mockFetch.mockReset();
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   it("should extract full metadata from /api/v1/models", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -52,7 +32,6 @@ describe("probeLmstudio", () => {
     expect(model.quantization).toBe("Q4_K_M");
     expect(model.sizeBytes).toBe(20285680936);
     expect(model.modelType).toBe("llm");
-    expect(model.temperature).toBe(true);
   });
 
   it("should detect vision and tool_call from capabilities", async () => {

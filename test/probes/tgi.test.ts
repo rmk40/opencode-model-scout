@@ -1,27 +1,7 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { probeTgi } from "../../src/probes/tgi";
 
-const mockFetch = vi.fn();
-global.fetch = mockFetch;
-
-if (!global.AbortSignal.timeout) {
-  global.AbortSignal.timeout = vi.fn(() => {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 3000);
-    return controller.signal;
-  });
-}
-
 describe("probeTgi", () => {
-  beforeEach(() => {
-    mockFetch.mockReset();
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   it("should extract metadata from /info response", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -43,7 +23,6 @@ describe("probeTgi", () => {
     expect(model.context).toBe(8192);
     expect(model.maxTokens).toBe(1024); // 8192 - 7168
     expect(model.modelType).toBe("llm");
-    expect(model.temperature).toBe(true);
   });
 
   it("should handle network error gracefully", async () => {

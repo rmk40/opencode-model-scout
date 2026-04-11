@@ -1,4 +1,5 @@
 import type { ProbeResult } from "./types";
+import { LOG_PREFIX } from "../constants";
 
 /**
  * Build request headers, adding Authorization if apiKey is provided.
@@ -43,6 +44,32 @@ export async function probeFetch(
       signal: signals.length === 1 ? signals[0] : AbortSignal.any(signals),
     });
   } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Fetch + parse JSON in one call. Returns undefined on any failure:
+ * network error, timeout, non-OK status, or malformed JSON.
+ * Logs a warning on non-OK responses and JSON parse failures.
+ */
+export async function probeFetchJson<T>(
+  url: string,
+  label: string,
+  options?: ProbeFetchOptions,
+): Promise<T | undefined> {
+  const res = await probeFetch(url, options);
+  if (!res) return undefined;
+
+  if (!res.ok) {
+    console.warn(`${LOG_PREFIX} ${label}: HTTP ${res.status}`);
+    return undefined;
+  }
+
+  try {
+    return (await res.json()) as T;
+  } catch (error) {
+    console.warn(`${LOG_PREFIX} ${label}: JSON parse failed:`, error);
     return undefined;
   }
 }

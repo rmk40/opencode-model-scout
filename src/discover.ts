@@ -6,9 +6,6 @@ import { LOG_PREFIX } from "./constants";
 import { findMatch, type ModelsDevMeta } from "./models-dev";
 import { buildHeaders, probeFetch } from "./probes/util";
 
-/** Flattened model entry from the provider list response (re-export for callers). */
-export type { ModelsDevMeta } from "./models-dev";
-
 /** Snapshot of what was discovered for a single provider. */
 export interface DiscoverySnapshot {
   provider: string;
@@ -179,8 +176,10 @@ function applyProbeMeta(
     model.tool_call = meta.toolCall;
   if (meta.reasoning !== undefined && model.reasoning === undefined)
     model.reasoning = meta.reasoning;
-  if (meta.temperature !== undefined && model.temperature === undefined)
-    model.temperature = meta.temperature;
+  // temperature: all probed models support temperature — set as default,
+  // allow probe override if it explicitly provides a different value
+  if (model.temperature === undefined) model.temperature = true;
+  if (meta.temperature !== undefined) model.temperature = meta.temperature;
   if (meta.family && !model.family) model.family = meta.family;
 
   // Probe-specific metadata (for display in /modelscout)

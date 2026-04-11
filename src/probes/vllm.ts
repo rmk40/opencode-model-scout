@@ -22,7 +22,7 @@ export const probeVllm: ProviderProbe = (
 
   const models: Record<string, ProbeModelMeta> = {};
   for (const entry of entries) {
-    const meta: ProbeModelMeta = { temperature: true };
+    const meta: ProbeModelMeta = {};
     if (entry.max_model_len !== undefined) {
       meta.context = entry.max_model_len;
     }

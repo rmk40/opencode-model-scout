@@ -1,6 +1,6 @@
 import type { ProbeModelMeta, ProbeResult, ProviderProbe } from "./types";
 import { LOG_PREFIX } from "../constants";
-import { buildHeaders, probeFetch, EMPTY_RESULT } from "./util";
+import { buildHeaders, probeFetch, probeFetchJson, EMPTY_RESULT } from "./util";
 
 /** A single model entry from Ollama's GET /api/tags response. */
 interface OllamaTagModel {
@@ -56,25 +56,18 @@ export const probeOllama: ProviderProbe = async (
     const headers = buildHeaders(apiKey);
 
     // Step 1: List all models (GET — no Content-Type needed)
-    const tagsRes = await probeFetch(`${baseURL}/api/tags`, { headers });
-
-    if (!tagsRes) return EMPTY_RESULT;
-
-    if (!tagsRes.ok) {
-      console.warn(
-        `${LOG_PREFIX} Ollama probe: /api/tags HTTP ${tagsRes.status}`,
-      );
-      return EMPTY_RESULT;
-    }
-
-    const tagsData = (await tagsRes.json()) as OllamaTagsResponse;
+    const tagsData = await probeFetchJson<OllamaTagsResponse>(
+      `${baseURL}/api/tags`,
+      "Ollama probe: /api/tags",
+      { headers },
+    );
+    if (!tagsData) return EMPTY_RESULT;
     const models: Record<string, ProbeModelMeta> = {};
 
     // Build partial metadata from tags
     const tagModels = tagsData.models ?? [];
     for (const tag of tagModels) {
       const meta: ProbeModelMeta = {
-        temperature: true,
         sizeBytes: tag.size,
       };
       if (tag.details?.parameter_size) {

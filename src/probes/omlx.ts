@@ -1,6 +1,6 @@
 import type { ProbeModelMeta, ProbeResult, ProviderProbe } from "./types";
 import { LOG_PREFIX } from "../constants";
-import { buildHeaders, probeFetch, EMPTY_RESULT } from "./util";
+import { buildHeaders, probeFetchJson, EMPTY_RESULT } from "./util";
 
 /** Status entry for a single model in the oMLX /v1/models/status response. */
 interface OmlxModelStatus {
@@ -27,21 +27,16 @@ export const probeOmlx: ProviderProbe = async (
   try {
     const headers = buildHeaders(apiKey);
 
-    const res = await probeFetch(`${baseURL}/v1/models/status`, { headers });
-
-    if (!res) return EMPTY_RESULT;
-
-    if (!res.ok) {
-      console.warn(`${LOG_PREFIX} oMLX probe: HTTP ${res.status}`);
-      return EMPTY_RESULT;
-    }
-
-    const data = (await res.json()) as OmlxStatusResponse;
+    const data = await probeFetchJson<OmlxStatusResponse>(
+      `${baseURL}/v1/models/status`,
+      "oMLX probe",
+      { headers },
+    );
+    if (!data) return EMPTY_RESULT;
     const models: Record<string, ProbeModelMeta> = {};
 
     for (const entry of data.models ?? []) {
       const meta: ProbeModelMeta = {
-        temperature: true,
         loaded: entry.loaded,
       };
 

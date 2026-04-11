@@ -1,19 +1,11 @@
 import { LOG_PREFIX } from "../constants";
 import type { OpenAIModelEntry } from "./types";
+import type { ProbeKey } from "./index";
 import { buildHeaders, probeFetch } from "./util";
 
 export type DetectedServer =
   | "ollama"
   | "llamacpp"
-  | "omlx"
-  | "lmstudio"
-  | "tgi"
-  | "sglang"
-  | "vllm"
-  | "koboldcpp";
-
-export type ProbeKey =
-  | "ollama"
   | "omlx"
   | "lmstudio"
   | "tgi"

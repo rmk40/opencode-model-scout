@@ -1,34 +1,12 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
-import { probeFetch, buildHeaders, EMPTY_RESULT } from "../../src/probes/util";
-
-const mockFetch = vi.fn();
-global.fetch = mockFetch;
-
-if (!global.AbortSignal.timeout) {
-  global.AbortSignal.timeout = vi.fn(() => {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 3000);
-    return controller.signal;
-  });
-}
-
-if (!global.AbortSignal.any) {
-  global.AbortSignal.any = vi.fn(() => {
-    const controller = new AbortController();
-    return controller.signal;
-  });
-}
+import { describe, it, expect, vi } from "vitest";
+import {
+  probeFetch,
+  probeFetchJson,
+  buildHeaders,
+  EMPTY_RESULT,
+} from "../../src/probes/util";
 
 describe("probeFetch", () => {
-  beforeEach(() => {
-    mockFetch.mockReset();
-    vi.restoreAllMocks();
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   it("should return Response on success", async () => {
     const fakeResponse = { ok: true, status: 200 };
     mockFetch.mockResolvedValue(fakeResponse);
@@ -112,6 +90,92 @@ describe("probeFetch", () => {
 
     await probeFetch("http://localhost:8000/v1/models", { timeoutMs: 5000 });
     expect(timeoutSpy).toHaveBeenCalledWith(5000);
+  });
+});
+
+describe("probeFetchJson", () => {
+  it("should return parsed JSON on success", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ foo: "bar" }),
+    });
+
+    const result = await probeFetchJson<{ foo: string }>(
+      "http://localhost:8000/info",
+      "test probe",
+    );
+    expect(result).toEqual({ foo: "bar" });
+  });
+
+  it("should return undefined on network error", async () => {
+    mockFetch.mockRejectedValue(new TypeError("fetch failed"));
+
+    const result = await probeFetchJson(
+      "http://localhost:8000/info",
+      "test probe",
+    );
+    expect(result).toBeUndefined();
+  });
+
+  it("should return undefined and warn on non-OK response", async () => {
+    const warnSpy = vi.mocked(console.warn);
+    mockFetch.mockResolvedValue({
+      ok: false,
+      status: 503,
+      json: () => Promise.resolve({}),
+    });
+
+    const result = await probeFetchJson(
+      "http://localhost:8000/info",
+      "test probe",
+    );
+    expect(result).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("test probe: HTTP 503"),
+    );
+  });
+
+  it("should return undefined and warn on JSON parse failure", async () => {
+    const warnSpy = vi.mocked(console.warn);
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.reject(new SyntaxError("Unexpected token")),
+    });
+
+    const result = await probeFetchJson(
+      "http://localhost:8000/info",
+      "test probe",
+    );
+    expect(result).toBeUndefined();
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining("test probe: JSON parse failed:"),
+      expect.any(SyntaxError),
+    );
+  });
+
+  it("should pass custom options through to probeFetch", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: () => Promise.resolve({ data: 1 }),
+    });
+
+    await probeFetchJson("http://localhost:8000/api", "test probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: '{"model":"test"}',
+    });
+
+    expect(mockFetch).toHaveBeenCalledWith(
+      "http://localhost:8000/api",
+      expect.objectContaining({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: '{"model":"test"}',
+      }),
+    );
   });
 });
 

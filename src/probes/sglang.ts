@@ -5,7 +5,7 @@ import type {
   ProbeContext,
 } from "./types";
 import { LOG_PREFIX } from "../constants";
-import { buildHeaders, probeFetch, EMPTY_RESULT } from "./util";
+import { buildHeaders, probeFetchJson, EMPTY_RESULT } from "./util";
 
 interface SglangModelInfoResponse {
   model_path?: string;
@@ -24,16 +24,12 @@ export const probeSglang: ProviderProbe = async (
   try {
     const headers = buildHeaders(apiKey);
 
-    const res = await probeFetch(`${baseURL}/model_info`, { headers });
-
-    if (!res) return EMPTY_RESULT;
-
-    if (!res.ok) {
-      console.warn(`${LOG_PREFIX} SGLang probe: HTTP ${res.status}`);
-      return EMPTY_RESULT;
-    }
-
-    const info = (await res.json()) as SglangModelInfoResponse;
+    const info = await probeFetchJson<SglangModelInfoResponse>(
+      `${baseURL}/model_info`,
+      "SGLang probe",
+      { headers },
+    );
+    if (!info) return EMPTY_RESULT;
     const entries = context?.modelsResponse;
 
     // Use discovered model ID (matches what discoverModels uses as key).
@@ -41,7 +37,7 @@ export const probeSglang: ProviderProbe = async (
     const modelId = entries?.[0]?.id ?? info.model_path;
     if (!modelId) return EMPTY_RESULT;
 
-    const meta: ProbeModelMeta = { temperature: true };
+    const meta: ProbeModelMeta = {};
 
     // Get context from modelsResponse max_model_len
     const entry = entries?.find((e) => e.id === modelId) ?? entries?.[0];

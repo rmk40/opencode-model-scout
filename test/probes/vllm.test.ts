@@ -1,27 +1,7 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { probeVllm } from "../../src/probes/vllm";
 
-const mockFetch = vi.fn();
-global.fetch = mockFetch;
-
-if (!global.AbortSignal.timeout) {
-  global.AbortSignal.timeout = vi.fn(() => {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 3000);
-    return controller.signal;
-  });
-}
-
 describe("probeVllm", () => {
-  beforeEach(() => {
-    mockFetch.mockReset();
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   it("should extract max_model_len from modelsResponse", async () => {
     const result = await probeVllm("http://localhost:8000", undefined, {
       modelsResponse: [
@@ -39,7 +19,6 @@ describe("probeVllm", () => {
     const model = result.models["model-1"];
     expect(model).toBeDefined();
     expect(model.context).toBe(8192);
-    expect(model.temperature).toBe(true);
   });
 
   it("should handle missing max_model_len gracefully", async () => {
@@ -57,7 +36,6 @@ describe("probeVllm", () => {
     expect(Object.keys(result.models)).toHaveLength(1);
     const model = result.models["model-1"];
     expect(model).toBeDefined();
-    expect(model.temperature).toBe(true);
     expect(model.context).toBeUndefined();
   });
 

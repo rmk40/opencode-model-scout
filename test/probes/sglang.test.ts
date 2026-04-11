@@ -1,27 +1,7 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { probeSglang } from "../../src/probes/sglang";
 
-const mockFetch = vi.fn();
-global.fetch = mockFetch;
-
-if (!global.AbortSignal.timeout) {
-  global.AbortSignal.timeout = vi.fn(() => {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 3000);
-    return controller.signal;
-  });
-}
-
 describe("probeSglang", () => {
-  beforeEach(() => {
-    mockFetch.mockReset();
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   it("should extract capabilities from /model_info", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -39,7 +19,6 @@ describe("probeSglang", () => {
     expect(model).toBeDefined();
     expect(model.family).toBe("LlamaForCausalLM");
     expect(model.modelType).toBe("llm");
-    expect(model.temperature).toBe(true);
   });
 
   it("should detect vision from has_image_understanding", async () => {

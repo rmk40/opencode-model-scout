@@ -1,16 +1,5 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { probeOllama } from "../../src/probes/ollama";
-
-const mockFetch = vi.fn();
-global.fetch = mockFetch;
-
-if (!global.AbortSignal.timeout) {
-  global.AbortSignal.timeout = vi.fn(() => {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 3000);
-    return controller.signal;
-  });
-}
 
 /**
  * Helper: create a mock fetch that routes to different handlers based on URL.
@@ -52,15 +41,6 @@ function setupOllamaMocks(
 }
 
 describe("probeOllama", () => {
-  beforeEach(() => {
-    mockFetch.mockReset();
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   it("should extract metadata from Ollama tags and show responses", async () => {
     setupOllamaMocks(
       {
@@ -135,7 +115,6 @@ describe("probeOllama", () => {
     expect(qwen.parameterSize).toBe("30.5B");
     expect(qwen.family).toBe("qwen3");
     expect(qwen.quantization).toBe("Q4_K_M");
-    expect(qwen.temperature).toBe(true);
 
     const gemma = result.models["gemma3:12b"];
     expect(gemma).toBeDefined();

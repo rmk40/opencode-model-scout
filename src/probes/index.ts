@@ -32,7 +32,7 @@ import type { DetectedServer } from "./fingerprint";
  * opencode's `Config.Provider` schema uses `.strict()` and rejects unknown
  * top-level fields, while `options` uses `.catchall(z.any())`.
  */
-const PROBES: Record<string, ProviderProbe> = {
+const PROBES = {
   omlx: probeOmlx,
   ollama: probeOllama,
   vllm: probeVllm,
@@ -40,16 +40,10 @@ const PROBES: Record<string, ProviderProbe> = {
   sglang: probeSglang,
   lmstudio: probeLmstudio,
   koboldcpp: probeKoboldcpp,
-};
+} as const satisfies Record<string, ProviderProbe>;
 
-/**
- * Get the probe function for a provider type.
- * Returns undefined if the type is not recognized.
- */
-export function getProbe(type: string | undefined): ProviderProbe | undefined {
-  if (!type) return undefined;
-  return PROBES[type];
-}
+/** Probe key derived from the registry — stays in sync automatically. */
+export type ProbeKey = keyof typeof PROBES;
 
 /** Result of resolving a probe, including optional auto-detection info. */
 export interface ResolvedProbe {
@@ -82,7 +76,10 @@ export async function resolveProbe(
     const probeKey = PROBE_MAP[detected];
     return { probe: PROBES[probeKey], detectedServer: detected };
   }
-  return { probe: PROBES[type] };
+  if (Object.hasOwn(PROBES, type)) {
+    return { probe: PROBES[type as ProbeKey] };
+  }
+  return { probe: undefined };
 }
 
 export type {
@@ -93,4 +90,3 @@ export type {
   OpenAIModelEntry,
 } from "./types";
 export type { DetectedServer } from "./fingerprint";
-export type { ProbeKey } from "./fingerprint";

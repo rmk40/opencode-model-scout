@@ -1,25 +1,7 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { discoverModels, getDiscoveryStore } from "../src/discover";
 import { formatModelsTable } from "../src/command";
 import type { DiscoverySnapshot } from "../src/discover";
-
-const mockFetch = vi.fn();
-global.fetch = mockFetch;
-
-if (!global.AbortSignal.timeout) {
-  global.AbortSignal.timeout = vi.fn(() => {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 3000);
-    return controller.signal;
-  });
-}
-
-if (!global.AbortSignal.any) {
-  global.AbortSignal.any = vi.fn(() => {
-    const controller = new AbortController();
-    return controller.signal;
-  });
-}
 
 /**
  * Helper: route fetch calls to handlers based on URL pattern.
@@ -50,15 +32,6 @@ function setupFetchRouter(
 }
 
 describe("discoverModels", () => {
-  beforeEach(() => {
-    mockFetch.mockReset();
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   it("should discover models from OpenAI-compatible provider", async () => {
     setupFetchRouter({
       "/v1/models": {
@@ -160,6 +133,8 @@ describe("discoverModels", () => {
     expect(model).toBeDefined();
     expect(model.limit).toEqual({ context: 131072, output: 32768 });
     expect(model.modalities).toEqual({ input: ["text"], output: ["text"] });
+    // temperature is set as default by the orchestrator, not individual probes
+    expect(model.temperature).toBe(true);
   });
 
   it("should not run probe when options.probe is not set", async () => {

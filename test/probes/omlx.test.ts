@@ -1,27 +1,7 @@
-import { describe, it, expect, beforeEach, vi, afterEach } from "vitest";
+import { describe, it, expect } from "vitest";
 import { probeOmlx } from "../../src/probes/omlx";
 
-const mockFetch = vi.fn();
-global.fetch = mockFetch;
-
-if (!global.AbortSignal.timeout) {
-  global.AbortSignal.timeout = vi.fn(() => {
-    const controller = new AbortController();
-    setTimeout(() => controller.abort(), 3000);
-    return controller.signal;
-  });
-}
-
 describe("probeOmlx", () => {
-  beforeEach(() => {
-    mockFetch.mockReset();
-    vi.spyOn(console, "warn").mockImplementation(() => {});
-  });
-
-  afterEach(() => {
-    vi.restoreAllMocks();
-  });
-
   it("should extract metadata from oMLX status response", async () => {
     mockFetch.mockResolvedValueOnce({
       ok: true,
@@ -59,7 +39,6 @@ describe("probeOmlx", () => {
     expect(llm.vision).toBeUndefined();
     expect(llm.loaded).toBe(true);
     expect(llm.sizeBytes).toBe(20285680936);
-    expect(llm.temperature).toBe(true);
 
     const vlm = result.models["gemma3-12b-it"];
     expect(vlm).toBeDefined();
@@ -69,7 +48,6 @@ describe("probeOmlx", () => {
     expect(vlm.vision).toBe(true);
     expect(vlm.loaded).toBe(false);
     expect(vlm.sizeBytes).toBe(8100000000);
-    expect(vlm.temperature).toBe(true);
   });
 
   it("should handle network error gracefully", async () => {
@@ -181,7 +159,6 @@ describe("probeOmlx", () => {
     expect(model).toBeDefined();
     expect(model.modelType).toBeUndefined();
     expect(model.vision).toBeUndefined();
-    expect(model.temperature).toBe(true);
     expect(model.context).toBe(4096);
   });
 });
