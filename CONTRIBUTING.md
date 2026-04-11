@@ -15,6 +15,7 @@ src/
 ├── format.ts             # Model name formatting utilities
 └── probes/
     ├── types.ts           # ProbeModelMeta, ProbeResult, ProviderProbe, ProbeContext
+    ├── util.ts            # Shared utilities: buildHeaders, probeFetch, EMPTY_RESULT
     ├── index.ts           # Probe registry + resolveProbe (supports "auto")
     ├── fingerprint.ts     # Server auto-detection (tiered fingerprinting)
     ├── omlx.ts            # oMLX probe implementation
@@ -273,9 +274,10 @@ vLLM and SGLang where the models response already contains non-standard fields
 
 Probes must follow these rules:
 
-1. **Use `AbortSignal.timeout(2000)`** on every fetch call — probes must
-   complete fast enough to fit within the 5-second config hook budget
-2. **Never throw** — catch all errors and return `{ models: {} }` on failure
+1. **Use `probeFetch()`** from `./util` for all HTTP calls — it handles
+   timeout (2s default) and abort signal composition automatically
+2. **Never throw** — catch all errors and return `EMPTY_RESULT` from `./util`
+   on failure
 3. **Log warnings** using `LOG_PREFIX` from constants when things go wrong
 4. **Only set capability flags to `true`** — don't set `false` for unknown
    capabilities (leave them undefined)
@@ -292,6 +294,7 @@ import type {
   ProviderProbe,
 } from "./types";
 import { LOG_PREFIX } from "../constants";
+import { buildHeaders, probeFetch, EMPTY_RESULT } from "./util";
 
 export const probeYourProvider: ProviderProbe = async (
   baseURL: string,
@@ -299,11 +302,6 @@ export const probeYourProvider: ProviderProbe = async (
   context?: ProbeContext,
 ): Promise<ProbeResult> => {
   try {
-    const headers: Record<string, string> = {};
-    if (apiKey) {
-      headers["Authorization"] = `Bearer ${apiKey}`;
-    }
-
     // Option A: Use context.modelsResponse if the /v1/models response
     // already contains the metadata you need (e.g., max_model_len)
     if (context?.modelsResponse) {
@@ -320,14 +318,15 @@ export const probeYourProvider: ProviderProbe = async (
     }
 
     // Option B: Call a provider-specific metadata API
-    const res = await fetch(`${baseURL}/your/metadata/endpoint`, {
+    const headers = buildHeaders(apiKey);
+    const res = await probeFetch(`${baseURL}/your/metadata/endpoint`, {
       headers,
-      signal: AbortSignal.timeout(2000),
     });
 
+    if (!res) return EMPTY_RESULT;
     if (!res.ok) {
       console.warn(`${LOG_PREFIX} YourProvider probe: HTTP ${res.status}`);
-      return { models: {} };
+      return EMPTY_RESULT;
     }
 
     const data = await res.json();
@@ -348,7 +347,7 @@ export const probeYourProvider: ProviderProbe = async (
     return { models };
   } catch (error) {
     console.warn(`${LOG_PREFIX} YourProvider probe failed:`, error);
-    return { models: {} };
+    return EMPTY_RESULT;
   }
 };
 ```
@@ -429,21 +428,19 @@ in the `fingerprint()` function, before the Tier 3 section:
 ```typescript
 // Step N: GET /your/unique/endpoint → YourServer
 try {
-  const res = await fetch(`${baseURL}/your/unique/endpoint`, {
+  const res = await probeFetch(`${baseURL}/your/unique/endpoint`, {
     headers,
-    signal: AbortSignal.any([
-      globalController.signal,
-      AbortSignal.timeout(1000),
-    ]),
+    signal: combinedSignal,
+    timeoutMs: 1000,
   });
-  if (res.ok) {
+  if (res?.ok) {
     const data = (await res.json()) as Record<string, unknown>;
     if (/* response shape is unique to this server */) {
       return "yourserver";
     }
   }
 } catch {
-  // Individual probe failure — continue
+  // JSON parse failure — continue
 }
 ```
 
@@ -584,6 +581,7 @@ opencode-model-scout/
 │   ├── format.ts           # Model name prettification
 │   └── probes/
 │       ├── types.ts         # Shared types (ProbeModelMeta, ProbeContext)
+│       ├── util.ts          # Shared probe utilities
 │       ├── index.ts         # Registry + resolveProbe (supports "auto")
 │       ├── fingerprint.ts   # Server auto-detection (tiered)
 │       ├── omlx.ts          # oMLX probe
@@ -602,7 +600,8 @@ opencode-model-scout/
 │   │   ├── tgi.test.ts
 │   │   ├── sglang.test.ts
 │   │   ├── lmstudio.test.ts
-│   │   └── koboldcpp.test.ts
+│   │   ├── koboldcpp.test.ts
+│   │   └── util.test.ts
 │   ├── discover.test.ts
 │   ├── command.test.ts
 │   ├── format.test.ts

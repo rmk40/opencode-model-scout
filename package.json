@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-model-scout",
-  "version": "0.1.0",
+  "version": "1.1.0",
   "description": "opencode plugin: auto-discover models from OpenAI-compatible providers, enrich with provider-specific metadata via probes",
   "type": "module",
   "main": "./src/index.ts",

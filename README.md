@@ -277,9 +277,12 @@ local (auto → vllm) — 2 models
 The plugin is designed to never block opencode startup:
 
 - **Individual fetch calls** use a 3-second timeout (model list) or 2-second
-  timeout (probes)
-- **The entire config hook** has a 5-second timeout — if discovery takes
-  longer, opencode starts with whatever was discovered so far
+  timeout (probes), all via the shared `probeFetch()` wrapper
+- **The entire config hook** has a 5-second abort timeout — if discovery takes
+  longer, in-flight HTTP requests are cancelled via abort signal propagation
+  and opencode starts normally
+- **Per-provider isolation** — each provider is wrapped in its own try-catch,
+  so a failing provider never prevents discovery for other providers
 - **All errors are caught and logged** — a failing probe, an offline provider,
   or a malformed response never crashes the plugin or prevents opencode from
   starting
