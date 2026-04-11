@@ -61,6 +61,10 @@
     "localai",
     "local-ai",
     "llm",
+    "local-llm",
+    "plugin",
+    "auto-discovery",
+    "context-window",
     "model-server",
     "inference-server"
   ],
