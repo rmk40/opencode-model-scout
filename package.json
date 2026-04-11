@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-model-scout",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "opencode plugin that auto-discovers models from OpenAI-compatible providers and enriches them with context window sizes, capability flags, and model metadata. Supports Ollama, oMLX, vLLM, TGI, SGLang, LM Studio, KoboldCpp, llama.cpp, and LocalAI.",
   "type": "module",
   "main": "./dist/index.js",
