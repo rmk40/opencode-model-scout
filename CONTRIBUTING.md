@@ -517,7 +517,7 @@ so they can only come from probes.
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 22+
 - npm
 
 ### Setup
@@ -531,11 +531,25 @@ npm install
 ### Commands
 
 ```bash
+npm run check        # typecheck + lint + format:check + test (CI gate)
+npm run fix          # eslint --fix + prettier --write (auto-fix everything)
+npm run lint         # ESLint only
+npm run lint:fix     # ESLint with auto-fix
+npm run format       # Prettier write
+npm run format:check # Prettier check only
 npm run typecheck    # TypeScript type checking only
 npm run test:run     # Run tests once
 npm run test         # Run tests in watch mode
-npm run build        # typecheck + test (must pass before committing)
+npm run compile      # Build dist/ via tsup
+npm run build        # check + compile (full validation + build)
 ```
+
+### Git Hooks
+
+Husky hooks run automatically:
+
+- **pre-commit** — `lint-staged` runs ESLint --fix and Prettier on staged files
+- **pre-push** — `npm run check` (full validation gate)
 
 ### Testing
 
@@ -609,6 +623,15 @@ opencode-model-scout/
 ├── package.json
 ├── tsconfig.json
 ├── vitest.config.ts
+├── eslint.config.js
+├── .prettierignore
+├── .husky/
+│   ├── pre-commit
+│   └── pre-push
+├── .github/workflows/
+│   ├── release.yml          # Tag → check + compile + npm publish + GitHub Release
+│   └── latest.yml           # Main push → check + rolling snapshot release
+├── AGENTS.md
 ├── README.md
 ├── CONTRIBUTING.md
 └── LICENSE

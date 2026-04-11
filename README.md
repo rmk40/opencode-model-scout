@@ -1,16 +1,50 @@
 # opencode-model-scout
 
-An [opencode](https://github.com/opencode-ai/opencode) plugin that solves a
-fundamental problem with local AI providers: **they expose models through a
-generic OpenAI-compatible API that reports almost nothing about what each model
-can actually do.**
+[![npm version](https://img.shields.io/npm/v/opencode-model-scout)](https://www.npmjs.com/package/opencode-model-scout)
+[![CI](https://github.com/rmk40/opencode-model-scout/actions/workflows/release.yml/badge.svg)](https://github.com/rmk40/opencode-model-scout/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-When you run Ollama, oMLX, LM Studio, or any other local inference server,
-opencode discovers model IDs like `qwen3:30b-a3b` or `gemma3-12b-it` — but has
-no idea whether they support tool calling, vision input, extended thinking, or
-what their actual context window is. Without this metadata, opencode can't make
-informed decisions about which model to use, what features to enable, or how
-much context it can send.
+An [opencode](https://github.com/opencode-ai/opencode) plugin that
+auto-discovers models from OpenAI-compatible providers and enriches them with
+context window sizes, capability flags, and model metadata. Supports Ollama,
+oMLX, vLLM, TGI, SGLang, LM Studio, KoboldCpp, llama.cpp, and LocalAI.
+
+## Quick Start
+
+```bash
+opencode plugin opencode-model-scout
+```
+
+Then add `"probe": "auto"` to any provider in your `opencode.json`:
+
+```json
+{
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://localhost:11434/v1",
+        "probe": "auto"
+      }
+    }
+  }
+}
+```
+
+Restart opencode. Every model on that provider now has accurate context window
+sizes, output limits, and capability flags (tool calling, vision, reasoning)
+discovered automatically.
+
+## The Problem
+
+Local AI providers expose models through a generic OpenAI-compatible API that
+reports almost nothing about what each model can actually do. When you run
+Ollama, oMLX, LM Studio, or any other inference server, opencode discovers
+model IDs like `qwen3:30b-a3b` or `gemma3-12b-it` — but has no idea whether
+they support tool calling, vision input, extended thinking, or what their
+actual context window is. Without this metadata, opencode can't make informed
+decisions about which model to use, what features to enable, or how much
+context it can send.
 
 **opencode-model-scout** fixes this by building a 3-layer metadata enrichment
 pipeline that runs at startup. It discovers every available model, probes
@@ -45,20 +79,23 @@ priority over models.dev guesses.
 
 ## Installation
 
-### From GitHub
+### From npm
 
-The quickest way to install. This uses opencode's built-in plugin command,
-which downloads the package from GitHub and patches your `opencode.json`
-automatically:
+```bash
+opencode plugin opencode-model-scout
+```
+
+This installs the package from npm and patches your `opencode.json`
+automatically. After installation, add provider configuration with the
+`probe` field — see [Configuration](#configuration) below.
+
+### From GitHub
 
 ```bash
 opencode plugin github:rmk40/opencode-model-scout
 ```
 
-After installation, you still need to add provider configuration with the
-`probe` field — see [Configuration](#configuration) below.
-
-If you prefer to edit `opencode.json` manually instead of using the CLI:
+Or add to `opencode.json` manually:
 
 ```json
 {
@@ -66,11 +103,9 @@ If you prefer to edit `opencode.json` manually instead of using the CLI:
 }
 ```
 
-opencode will install the package on next startup.
-
 ### From Source
 
-Clone the repo and install dependencies:
+For development or modification:
 
 ```bash
 git clone https://github.com/rmk40/opencode-model-scout.git
@@ -84,16 +119,6 @@ Then reference the local path in your `opencode.json`:
 {
   "plugin": ["file:///absolute/path/to/opencode-model-scout"]
 }
-```
-
-This is useful for development or if you want to modify the plugin.
-
-### From npm (coming soon)
-
-Once published to npm, installation will be:
-
-```bash
-opencode plugin opencode-model-scout
 ```
 
 ## Configuration
