@@ -81,13 +81,27 @@ priority over models.dev guesses.
 
 ### From npm
 
+Using the opencode CLI (installs and patches `opencode.json` automatically):
+
 ```bash
 opencode plugin opencode-model-scout
 ```
 
-This installs the package from npm and patches your `opencode.json`
-automatically. After installation, add provider configuration with the
-`probe` field — see [Configuration](#configuration) below.
+Or install with npm directly and add the plugin to your `opencode.json`
+manually:
+
+```bash
+npm install opencode-model-scout
+```
+
+```json
+{
+  "plugin": ["opencode-model-scout"]
+}
+```
+
+After installation, add provider configuration with the `probe` field — see
+[Configuration](#configuration) below.
 
 ### From GitHub
 
@@ -95,7 +109,7 @@ automatically. After installation, add provider configuration with the
 opencode plugin github:rmk40/opencode-model-scout
 ```
 
-Or add to `opencode.json` manually:
+Or in `opencode.json`:
 
 ```json
 {
@@ -113,7 +127,7 @@ cd opencode-model-scout
 npm install
 ```
 
-Then reference the local path in your `opencode.json`:
+Then in `opencode.json`:
 
 ```json
 {
