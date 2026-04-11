@@ -49,13 +49,18 @@ export function formatModelsTable(
   const sections: string[] = ["Models Discovery"];
 
   for (const snap of snapshots) {
-    const count = Object.keys(snap.models).length;
+    const discovered = Object.keys(snap.models).length;
+    const total = discovered + snap.skipped.length;
     const probeLabel = snap.detectedServer
       ? `auto \u2192 ${snap.detectedServer}`
       : snap.probeType
         ? `probe: ${snap.probeType}`
         : "no probe";
-    const header = `\n${snap.provider} (${probeLabel}) — ${count} model${count !== 1 ? "s" : ""}`;
+    const countLabel =
+      snap.skipped.length > 0
+        ? `${total} model${total !== 1 ? "s" : ""} (${discovered} new)`
+        : `${discovered} model${discovered !== 1 ? "s" : ""}`;
+    const header = `\n${snap.provider} (${probeLabel}) — ${countLabel}`;
     const separator = "\u2500".repeat(50);
 
     sections.push(header);
@@ -108,6 +113,12 @@ export function formatModelsTable(
       if (parts.length > 0) {
         sections.push(`    ${parts.join(" | ")}`);
       }
+    }
+
+    if (snap.skipped.length > 0) {
+      sections.push(
+        `\n  Already configured (${snap.skipped.length}): ${snap.skipped.join(", ")}`,
+      );
     }
   }
 

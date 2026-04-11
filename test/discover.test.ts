@@ -300,6 +300,10 @@ describe("discoverModels", () => {
 
     // But the new model should be discovered
     expect(models["discovered-model"]).toBeDefined();
+
+    // Discovery store should track the skipped model
+    const store = getDiscoveryStore();
+    expect(store[0].skipped).toEqual(["manually-configured"]);
   });
 
   it("should skip non-OpenAI-compatible providers", async () => {
@@ -664,6 +668,7 @@ describe("discoverModels", () => {
             limit: { context: 8192, output: 0 },
           },
         },
+        skipped: [],
         detectedServer: "vllm",
       },
     ];

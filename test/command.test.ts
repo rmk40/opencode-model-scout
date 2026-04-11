@@ -20,6 +20,7 @@ describe("formatModelsTable", () => {
             name: "Qwen3 30B",
           },
         },
+        skipped: [],
       },
     ];
 
@@ -43,6 +44,7 @@ describe("formatModelsTable", () => {
             modalities: { input: ["text"], output: ["text"] },
           },
         },
+        skipped: [],
       },
     ];
 
@@ -68,6 +70,7 @@ describe("formatModelsTable", () => {
             attachment: true,
           },
         },
+        skipped: [],
       },
     ];
 
@@ -93,6 +96,7 @@ describe("formatModelsTable", () => {
             modalities: { input: ["text"], output: ["text"] },
           },
         },
+        skipped: [],
       },
     ];
 
@@ -112,6 +116,7 @@ describe("formatModelsTable", () => {
         models: {
           "model-a": { id: "model-a", name: "Model A" },
         },
+        skipped: [],
       },
       {
         provider: "provider-b",
@@ -120,6 +125,7 @@ describe("formatModelsTable", () => {
         models: {
           "model-b": { id: "model-b", name: "Model B" },
         },
+        skipped: [],
       },
     ];
 
@@ -131,6 +137,44 @@ describe("formatModelsTable", () => {
     // Each provider gets a separator
     const separatorCount = (result.match(/\u2500{50}/g) || []).length;
     expect(separatorCount).toBe(2);
+  });
+
+  it("should show skipped models", () => {
+    const snapshots: DiscoverySnapshot[] = [
+      {
+        provider: "omlx-local",
+        probeType: "omlx",
+        baseURL: "http://localhost:8000",
+        models: {
+          "new-model": { id: "new-model", name: "New Model" },
+        },
+        skipped: ["existing-a", "existing-b"],
+      },
+    ];
+
+    const result = formatModelsTable(snapshots);
+    // Header shows total (3) and new count (1)
+    expect(result).toContain("3 models (1 new)");
+    // Skipped section lists the pre-configured models
+    expect(result).toContain("Already configured (2)");
+    expect(result).toContain("existing-a");
+    expect(result).toContain("existing-b");
+  });
+
+  it("should show provider with only skipped models", () => {
+    const snapshots: DiscoverySnapshot[] = [
+      {
+        provider: "omlx-local",
+        probeType: "omlx",
+        baseURL: "http://localhost:8000",
+        models: {},
+        skipped: ["model-a", "model-b", "model-c"],
+      },
+    ];
+
+    const result = formatModelsTable(snapshots);
+    expect(result).toContain("3 models (0 new)");
+    expect(result).toContain("Already configured (3)");
   });
 });
 

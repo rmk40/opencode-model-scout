@@ -12,6 +12,8 @@ export interface DiscoverySnapshot {
   probeType: string | undefined;
   baseURL: string;
   models: Record<string, Record<string, unknown>>;
+  /** Model IDs found on the server but already configured in opencode.json. */
+  skipped: string[];
   detectedServer?: DetectedServer;
 }
 
@@ -265,12 +267,16 @@ export async function discoverModels(
           unknown
         >;
         const discoveredModels: Record<string, Record<string, unknown>> = {};
+        const skippedIds: string[] = [];
 
         for (const model of openaiModels) {
           // Skip entries with missing or non-string id
           if (!model.id || typeof model.id !== "string") continue;
-          // Skip models already configured
-          if (existingModels[model.id] !== undefined) continue;
+          // Track models already configured but don't overwrite them
+          if (existingModels[model.id] !== undefined) {
+            skippedIds.push(model.id);
+            continue;
+          }
 
           const category = categorizeModel(model.id);
           const entry: Record<string, unknown> = {
@@ -343,11 +349,16 @@ export async function discoverModels(
         // Merge discovered models into provider config
         if (Object.keys(discoveredModels).length > 0) {
           providerConfig.models = { ...existingModels, ...discoveredModels };
+        }
+
+        // Record discovery results (including skipped models for /modelscout)
+        if (Object.keys(discoveredModels).length > 0 || skippedIds.length > 0) {
           discoveryStore.push({
             provider: providerName,
             probeType,
             baseURL,
             models: discoveredModels,
+            skipped: skippedIds,
             detectedServer,
           });
         }
