@@ -2,14 +2,21 @@
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-model-scout",
   "version": "1.1.0",
-  "description": "opencode plugin: auto-discover models from OpenAI-compatible providers, enrich with provider-specific metadata via probes",
+  "description": "opencode plugin that auto-discovers models from OpenAI-compatible providers and enriches them with metadata. Supports Ollama, oMLX, vLLM, TGI, SGLang, LM Studio, KoboldCpp, llama.cpp, and LocalAI.",
   "type": "module",
-  "main": "./src/index.ts",
+  "main": "./dist/index.js",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "files": [
-    "src"
+    "dist"
   ],
   "scripts": {
     "prepare": "husky",
@@ -23,7 +30,9 @@
     "test:coverage": "vitest run --coverage",
     "check": "npm run typecheck && npm run lint && npm run format:check && npm run test:run",
     "fix": "npm run lint:fix && npm run format",
-    "build": "npm run check"
+    "compile": "tsup src/index.ts --format esm --dts --out-dir dist --clean",
+    "build": "npm run check && npm run compile",
+    "prepack": "npm run compile"
   },
   "lint-staged": {
     "*.ts": [
@@ -40,9 +49,26 @@
     "model-discovery",
     "openai-compatible",
     "ollama",
-    "omlx"
+    "omlx",
+    "vllm",
+    "tgi",
+    "sglang",
+    "lmstudio",
+    "lm-studio",
+    "koboldcpp",
+    "llama-cpp",
+    "llamacpp",
+    "localai",
+    "local-ai",
+    "llm",
+    "model-server",
+    "inference-server"
   ],
-  "author": "",
+  "author": "maelos",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -60,6 +86,7 @@
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
     "prettier": "^3.8.2",
+    "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.58.1",
     "vitest": "^4.0.16"
