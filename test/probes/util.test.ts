@@ -6,6 +6,7 @@ import {
   readBody,
   readJson,
   EMPTY_RESULT,
+  setHeader,
 } from "../../src/probes/util";
 
 describe("probeFetch", () => {
@@ -199,6 +200,41 @@ describe("buildHeaders", () => {
   it("should return empty object when apiKey is undefined", () => {
     const headers = buildHeaders(undefined);
     expect(headers).toEqual({});
+  });
+
+  it("should add provider headers after the derived Authorization", () => {
+    expect(buildHeaders("sk-test", { "X-Gateway": "team-a" })).toEqual({
+      Authorization: "Bearer sk-test",
+      "X-Gateway": "team-a",
+    });
+    expect(buildHeaders(undefined, { "X-Gateway": "team-a" })).toEqual({
+      "X-Gateway": "team-a",
+    });
+  });
+
+  it.each(["Authorization", "authorization", "AUTHORIZATION"])(
+    "should let a provider %s header replace the derived one",
+    (name) => {
+      expect(buildHeaders("sk-test", { [name]: "Basic abc" })).toEqual({
+        [name]: "Basic abc",
+      });
+    },
+  );
+
+  it("should keep one entry when provider header names differ only in case", () => {
+    expect(
+      buildHeaders(undefined, { "X-Gateway": "first", "x-gateway": "second" }),
+    ).toEqual({ "x-gateway": "second" });
+  });
+});
+
+describe("setHeader", () => {
+  it("should replace an existing header whose name differs only in case", () => {
+    const headers = { "content-type": "text/plain", Accept: "*/*" };
+    expect(setHeader(headers, "Content-Type", "application/json")).toEqual({
+      Accept: "*/*",
+      "Content-Type": "application/json",
+    });
   });
 });
 

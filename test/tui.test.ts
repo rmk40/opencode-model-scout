@@ -1,28 +1,21 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-// Mock the opentui reconciler so element construction does not require a live
-// renderer context. The builder logic itself (createElement/setProp/insert) is
-// exercised; we only stub the native renderable creation.
-vi.mock("@opentui/solid", () => {
-  return {
-    createElement: (tag: string) => {
-      const node = {
-        tag,
-        props: {} as Record<string, unknown>,
-        children: [] as unknown[],
-        selectedIndex: 0,
-        setSelectedIndex(index: number) {
-          this.selectedIndex = index;
-        },
-        getSelectedIndex() {
-          return this.selectedIndex;
-        },
-      };
-      return node;
-    },
+// The reconciler needs a live renderer; the mock records the same
+// createElement/setProp/insert calls the plugin makes against OpenTUI.
+const { reconcilerMock } = vi.hoisted(() => ({
+  reconcilerMock: () => ({
+    createElement: (tag: string) => ({
+      tag,
+      props: {} as Record<string, unknown>,
+      children: [] as unknown[],
+      selectedIndex: 0,
+      setSelectedIndex(index: number) {
+        this.selectedIndex = index;
+      },
+      getSelectedIndex() {
+        return this.selectedIndex;
+      },
+    }),
     setProp: (
       node: { props: Record<string, unknown> },
       name: string,
@@ -35,59 +28,21 @@ vi.mock("@opentui/solid", () => {
       node.children.push(child);
       return child;
     },
-  };
-});
+  }),
+}));
+vi.mock("@opentui/solid", reconcilerMock);
 
-import type {
-  TuiPluginApi,
-  TuiPluginMeta,
-  TuiCommand,
-} from "@opencode-ai/plugin/tui";
-import tuiPlugin from "../src/tui";
-import { COMMAND_NAME, PLUGIN_NAME } from "../src/constants";
+import type { Plugin } from "@opencode/plugin/tui";
 import {
   CATALOG_SCHEMA_VERSION,
-  clearCatalogBridge,
-  createAttemptId,
-  createProviderFingerprint,
-  createRuntimeKey,
-  createServerKey,
-  createWorktreeKey,
   knownScalar,
-  persistCompleteSnapshot,
-  persistRunningSnapshot,
-  publishCompleteSnapshot,
-  publishRunningSnapshot,
   unknownCapability,
   unknownScalar,
-  type CompleteCatalogSnapshot,
-  type RunningCatalogSnapshot,
-} from "../src/catalog-snapshot";
-
-const tempDirectories: string[] = [];
-
-/** Invoke the plugin's tui entrypoint with a structurally-typed mock api. */
-function runTui(api: unknown): Promise<void> {
-  return tuiPlugin.tui(api as TuiPluginApi, undefined, {} as TuiPluginMeta);
-}
-
-/**
- * The command runners open the dialog asynchronously (they lazily import the
- * @opentui reconciler, which is mocked here). Poll until `predicate` holds so
- * the wait is timing-independent under parallel test load. Returns `true` once
- * satisfied, `false` if it never becomes true within the budget.
- */
-async function waitUntil(predicate: () => boolean): Promise<boolean> {
-  for (let i = 0; i < 100; i++) {
-    if (predicate()) return true;
-    await new Promise((resolve) => setTimeout(resolve, 1));
-  }
-  return predicate();
-}
-
-function rgba() {
-  return { r: 0, g: 0, b: 0, a: 1 };
-}
+  type CatalogPayload,
+} from "../src/catalog-evidence";
+import { COMMAND_NAME, PLUGIN_ID } from "../src/constants";
+import plugin from "../src/tui";
+import type { HostModel, HostProvider } from "../src/tui-models";
 
 type MockNode = {
   tag?: string;
@@ -95,43 +50,20 @@ type MockNode = {
   children?: unknown[];
 };
 
-/** opentui text-node tags that must be parented by a `<text>`, never a `<box>`. */
-const TEXT_NODE_TAGS = new Set([
-  "span",
-  "b",
-  "strong",
-  "i",
-  "em",
-  "u",
-  "a",
-  "br",
-]);
-
-/**
- * Find any opentui "orphan text" violation: a text-node element (span/b/i/…)
- * placed as a direct child of a non-text element. opentui throws at render time
- * for these ("Orphan text error: … must have a <text> as a parent"), so guard
- * against it structurally since the mock reconciler does not enforce it.
- */
-function findOrphanSpan(node: unknown, parentTag?: string): string | undefined {
-  if (!node || typeof node !== "object") return undefined;
-  const n = node as MockNode;
-  const tag = n.tag;
-  if (
-    tag &&
-    TEXT_NODE_TAGS.has(tag) &&
-    parentTag !== undefined &&
-    parentTag !== "text" &&
-    !TEXT_NODE_TAGS.has(parentTag)
-  ) {
-    return `<${tag}> under <${parentTag}>`;
-  }
-  for (const child of n.children ?? []) {
-    const found = findOrphanSpan(child, tag);
-    if (found) return found;
-  }
-  return undefined;
+interface Command {
+  id?: string;
+  title?: string;
+  palette?: true;
+  slash?: { name: string };
+  run: () => void | false | Promise<void>;
 }
+
+interface Layer {
+  mode?: string;
+  commands?: readonly Command[];
+}
+
+const PROJECT = { directory: "/work/project" };
 
 function findNodeById(node: unknown, id: string): MockNode | undefined {
   if (!node || typeof node !== "object") return undefined;
@@ -160,43 +92,136 @@ function findTextContaining(node: unknown, text: string): MockNode | undefined {
   return undefined;
 }
 
-/**
- * Open the first MODEL row's details. Row 0 in the unified grouped list is the
- * provider header, so the first model sits at index 1.
- */
-function openFirstDetail(root: unknown): MockNode | undefined {
-  const results = findNodeById(root, "modelscout-results");
-  const onSelect = results?.props?.onSelect;
-  if (typeof onSelect === "function") (onSelect as (index: number) => void)(1);
-  return findNodeById(root, "modelscout-detail-text");
+function color(name: string) {
+  return { name };
 }
 
-function collectTags(node: unknown, tags: string[] = []): string[] {
-  if (!node || typeof node !== "object") return tags;
-  const candidate = node as MockNode;
-  if (candidate.tag) tags.push(candidate.tag);
-  for (const child of candidate.children ?? []) collectTags(child, tags);
-  return tags;
-}
+const tokens = {
+  text: {
+    base: color("text.base"),
+    muted: color("text.muted"),
+    feedback: { error: { base: color("text.feedback.error.base") } },
+    action: { primary: { focused: color("text.action.primary.focused") } },
+  },
+  background: {
+    base: color("background.base"),
+    raised: { high: color("background.raised.high") },
+    action: {
+      primary: { focused: color("background.action.primary.focused") },
+    },
+  },
+  hue: { accent: { 200: color("hue.accent.200") } },
+};
 
-function createMockApi(
-  providers: unknown[] = [],
-  withCommand = true,
-  terminalWidth: number | undefined = 120,
-  terminalHeight: number | undefined = 40,
-) {
-  const dialog = {
-    replace: vi.fn(),
-    clear: vi.fn(),
-    setSize: vi.fn(),
-    size: "medium" as const,
-    depth: 0,
-    open: false,
+const atlasProvider: HostProvider = {
+  id: "atlas",
+  name: "Atlas",
+  package: "@opencode/ai/providers/openai-compatible",
+  settings: { baseURL: "https://atlas.test/openai/v1" },
+};
+
+function hostModel(id = "atlas-model", name = "Atlas Model"): HostModel {
+  return {
+    id,
+    providerID: "atlas",
+    name,
+    enabled: true,
+    capabilities: { tools: true, input: ["text"], output: ["text"] },
+    variants: [],
+    cost: [],
+    limit: { context: 8192, output: 32_000 },
   };
-  const registered: Array<() => TuiCommand[]> = [];
-  const dispose = vi.fn();
-  const onDispose = vi.fn();
-  const toast = vi.fn();
+}
+
+function payload(
+  status: CatalogPayload["status"] = "complete",
+): CatalogPayload {
+  return {
+    schemaVersion: CATALOG_SCHEMA_VERSION,
+    packageVersion: "2.0.0",
+    status,
+    ...(status === "complete"
+      ? { completedAt: "2026-10-11T08:00:00.000Z" }
+      : { startedAt: "2026-10-11T08:00:00.000Z" }),
+    providers: [
+      {
+        id: "atlas",
+        endpointOrigin: knownScalar(
+          "https://atlas.test",
+          "pre-existing",
+          "configured",
+        ),
+        configuredProbe: unknownScalar(),
+        resolvedProbe: knownScalar("actualyze", "provider-probe", "reported"),
+        lastGoodAt: "2026-10-11T08:00:00.000Z",
+        failure: null,
+        modelListAttempt: "ready",
+        probeAttempt: "complete",
+        skippedModelIds: [],
+        models: [
+          {
+            id: "atlas-model",
+            origin: "discovered",
+            enabled: true,
+            identity: knownScalar("atlas-model", "server-list", "reported"),
+            name: unknownScalar(),
+            modelType: unknownScalar(),
+            context: knownScalar(8192, "provider-probe", "authoritative"),
+            output: knownScalar(32_000, "host-default", "assumed"),
+            family: unknownScalar(),
+            organizationOwner: unknownScalar(),
+            parameterSize: unknownScalar(),
+            quantization: unknownScalar(),
+            sizeBytes: unknownScalar(),
+            probeIdentity: unknownScalar(),
+            capabilities: {
+              toolCall: unknownCapability(),
+              reasoning: unknownCapability(),
+              temperature: unknownCapability(),
+            },
+            inputModalities: {
+              text: unknownCapability(),
+              image: unknownCapability(),
+              pdf: unknownCapability(),
+              audio: unknownCapability(),
+              video: unknownCapability(),
+            },
+            cost: {
+              input: unknownScalar(),
+              output: unknownScalar(),
+              cacheRead: unknownScalar(),
+              cacheWrite: unknownScalar(),
+            },
+          },
+        ],
+      },
+    ],
+  };
+}
+
+interface HarnessOptions {
+  location?: { directory: string } | undefined;
+  terminalWidth?: number;
+  terminalHeight?: number;
+}
+
+function harness(options: HarnessOptions = {}) {
+  const layers: Array<() => Layer> = [];
+  let open: { render: () => unknown; onClose?: () => void } | undefined;
+  const dialog = {
+    show: vi.fn((render: () => unknown, onClose?: () => void) => {
+      // The host closes whatever it replaces before showing the new dialog.
+      open?.onClose?.();
+      open = { render, onClose };
+    }),
+    set: vi.fn(),
+    clear: vi.fn(() => {
+      const current = open;
+      open = undefined;
+      current?.onClose?.();
+    }),
+  };
+  const toast = { show: vi.fn() };
   const keyListeners = new Set<(key: unknown) => void>();
   const keyInput = {
     on: vi.fn((event: string, listener: (key: unknown) => void) => {
@@ -209,680 +234,592 @@ function createMockApi(
     }),
   };
 
-  const api = {
-    command: withCommand
-      ? {
-          register: vi.fn((cb: () => TuiCommand[]) => {
-            registered.push(cb);
-            return dispose;
-          }),
-          trigger: vi.fn(),
-          show: vi.fn(),
-        }
-      : undefined,
-    ui: {
-      Dialog: vi.fn((props: unknown) => ({ dialog: props })),
-      dialog,
-      toast,
-    },
-    theme: {
-      current: {
-        text: rgba(),
-        textMuted: rgba(),
-        error: rgba(),
-        primary: rgba(),
-        secondary: rgba(),
-        accent: rgba(),
-        info: rgba(),
-        warning: rgba(),
-        success: rgba(),
-        backgroundPanel: rgba(),
-        backgroundElement: rgba(),
-        selectedListItemText: rgba(),
-      },
+  let hostModels: HostModel[] = [hostModel()];
+  const modelList = vi.fn(
+    async (input: { location: { directory: string } }) => ({
+      location: input.location,
+      data: hostModels,
+    }),
+  );
+  const providerList = vi.fn(
+    async (input: { location: { directory: string } }) => ({
+      location: input.location,
+      data: [atlasProvider],
+    }),
+  );
+  const catalog = vi.fn(
+    async (_input: unknown, _options: unknown): Promise<unknown> => payload(),
+  );
+  const refresh = vi.fn(
+    async (_input: unknown, _options: unknown): Promise<unknown> => ({
+      accepted: true,
+    }),
+  );
+  const rpcHandlers = new Set<(event: unknown) => void>();
+  const stopRpc = vi.fn();
+  const on = vi.fn((_name: string, handler: (event: unknown) => void) => {
+    rpcHandlers.add(handler);
+    return () => {
+      stopRpc();
+      rpcHandlers.delete(handler);
+    };
+  });
+  const rpc = vi.fn(() => ({ catalog, refresh, events: { on } }));
+  const modelHandlers = new Set<(event: unknown) => void>();
+  const stopData = vi.fn();
+  const dataOn = vi.fn((_type: string, handler: (event: unknown) => void) => {
+    modelHandlers.add(handler);
+    return () => {
+      stopData();
+      modelHandlers.delete(handler);
+    };
+  });
+
+  const context = {
+    location: "location" in options ? options.location : PROJECT,
+    data: {
+      on: dataOn,
+      location: { default: () => ({ directory: "/default/project" }) },
     },
     client: {
-      client: {
-        getConfig: () => ({ baseUrl: "http://127.0.0.1:4096/" }),
-      },
+      rpc,
+      model: { list: modelList },
+      provider: { list: providerList },
     },
-    state: {
-      provider: providers,
-      path: { worktree: "atlas-worktree" },
+    ui: { dialog, toast },
+    keymap: { layer: (factory: () => Layer) => layers.push(factory) },
+    renderer: {
+      terminalWidth: options.terminalWidth ?? 140,
+      terminalHeight: options.terminalHeight ?? 40,
+      keyInput,
     },
-    renderer: { terminalWidth, terminalHeight, keyInput },
-    lifecycle: { onDispose },
+    theme: { surface: () => tokens },
   };
 
-  const commands = (): TuiCommand[] => registered[0]?.() ?? [];
-  const commandBySlash = (slash: string) =>
-    commands().find((c) => c.slash?.name === slash);
+  const cleanup = plugin.setup(context as unknown as Plugin.Context);
+  const command = (): Command => {
+    const found = layers[0]?.().commands?.[0];
+    if (!found) throw new Error("command not registered");
+    return found;
+  };
+  const run = async (): Promise<unknown> => {
+    await command().run();
+    return open?.render();
+  };
+  const press = (key: Record<string, unknown>) => {
+    const event = {
+      ctrl: false,
+      meta: false,
+      shift: false,
+      option: false,
+      super: false,
+      hyper: false,
+      sequence: "",
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn(),
+      ...key,
+    };
+    for (const listener of keyListeners) listener(event);
+  };
 
   return {
-    api,
+    context,
+    layers,
     dialog,
-    registered,
-    dispose,
-    onDispose,
     toast,
     keyInput,
     keyListeners,
-    commandBySlash,
-  };
-}
-
-function atlasExactSnapshot(startedAt = new Date().toISOString()): {
-  marker: RunningCatalogSnapshot;
-  snapshot: CompleteCatalogSnapshot;
-} {
-  const marker: RunningCatalogSnapshot = {
-    schemaVersion: CATALOG_SCHEMA_VERSION,
-    packageVersion: "1.6.0",
-    status: "running",
-    attemptId: createAttemptId(),
-    startedAt,
-    worktreeKey: createWorktreeKey("atlas-worktree"),
-    serverKey: createServerKey("http://127.0.0.1:4096")!,
-    runtimeKey: createRuntimeKey(),
-    providerFingerprint: createProviderFingerprint([
-      { id: "atlas", baseURL: "https://atlas.test/v1" },
-    ]),
-  };
-  return {
-    marker,
-    snapshot: {
-      ...marker,
-      status: "complete",
-      completedAt: startedAt,
-      providers: [
-        {
-          id: "atlas",
-          endpointOrigin: knownScalar(
-            "https://atlas.test",
-            "pre-existing",
-            "configured",
-          ),
-          configuredProbe: unknownScalar(),
-          resolvedProbe: unknownScalar(),
-          status: "ready",
-          modelListAttempt: "ready",
-          probeAttempt: "not-requested",
-          skippedModelIds: [],
-          models: [
-            {
-              id: "atlas-model",
-              origin: "discovered",
-              identity: knownScalar("atlas-model", "server-list", "reported"),
-              name: unknownScalar(),
-              modelType: unknownScalar(),
-              context: unknownScalar(),
-              output: unknownScalar(),
-              family: unknownScalar(),
-              organizationOwner: unknownScalar(),
-              parameterSize: unknownScalar(),
-              quantization: unknownScalar(),
-              sizeBytes: unknownScalar(),
-              probeIdentity: unknownScalar(),
-              capabilities: {
-                vision: unknownCapability(),
-                toolCall: unknownCapability(),
-                reasoning: unknownCapability(),
-                temperature: unknownCapability(),
-              },
-            },
-          ],
-        },
-      ],
+    modelList,
+    providerList,
+    catalog,
+    refresh,
+    stopRpc,
+    stopData,
+    cleanup: () => {
+      if (typeof cleanup === "function") void cleanup();
+    },
+    command,
+    run,
+    press,
+    current: () => open,
+    setHostModels: (models: HostModel[]) => {
+      hostModels = models;
+    },
+    emitRpc: (event: unknown) => {
+      for (const handler of rpcHandlers) handler(event);
+    },
+    emitModelUpdated: (event: unknown) => {
+      for (const handler of modelHandlers) handler(event);
     },
   };
 }
 
-describe("tui plugin module", () => {
-  it("exposes a namespaced id and a tui entrypoint", () => {
-    expect(tuiPlugin.id).toBe(`${PLUGIN_NAME}:tui`);
-    expect(typeof tuiPlugin.tui).toBe("function");
+function summary(root: unknown): string {
+  return findNodeById(root, "modelscout-summary")?.props?.content as string;
+}
+
+function openDetail(root: unknown, index: number): string {
+  const results = findNodeById(root, "modelscout-results");
+  (results?.props?.onSelect as (index: number) => void)(index);
+  return findNodeById(root, "modelscout-detail-text")?.props?.content as string;
+}
+
+function optionNames(root: unknown): string[] {
+  const options = findNodeById(root, "modelscout-results")?.props
+    ?.options as Array<{ name: string }>;
+  return options.map((option) => option.name);
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("plugin definition and command", () => {
+  it("shares the plugin ID with the server half", () => {
+    expect(plugin.id).toBe(PLUGIN_ID);
+  });
+
+  it("registers one global slash and palette command without any I/O", () => {
+    const h = harness();
+    expect(h.layers).toHaveLength(1);
+    const layer = h.layers[0]?.();
+    expect(layer?.mode).toBe("global");
+    expect(layer?.commands).toHaveLength(1);
+    expect(h.command()).toMatchObject({
+      id: `${COMMAND_NAME}.show`,
+      title: "Model Scout",
+      slash: { name: COMMAND_NAME },
+      palette: true,
+    });
+    expect(h.modelList).not.toHaveBeenCalled();
+    expect(h.catalog).not.toHaveBeenCalled();
   });
 });
 
-describe("tui command registration", () => {
-  let mock: ReturnType<typeof createMockApi>;
-
-  beforeEach(async () => {
-    clearCatalogBridge();
-    mock = createMockApi([
-      {
-        id: "atlas",
-        name: "Atlas",
-        options: { baseURL: "https://atlas.test/v1" },
-        models: {
-          "atlas-model": { id: "atlas-model", name: "Atlas Model" },
-        },
-      },
-    ]);
-    await runTui(mock.api);
-  });
-
-  afterEach(async () => {
-    clearCatalogBridge();
-    delete process.env.XDG_CACHE_HOME;
-    await Promise.all(
-      tempDirectories
-        .splice(0)
-        .map((directory) => rm(directory, { recursive: true, force: true })),
+describe("opening the dialog", () => {
+  it("reads host rows and evidence for the plugin's location", async () => {
+    const h = harness();
+    await h.run();
+    expect(h.modelList).toHaveBeenCalledWith(
+      { location: PROJECT },
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
-  });
-
-  it("registers via api.command.register", () => {
-    expect(mock.api.command?.register).toHaveBeenCalledTimes(1);
-  });
-
-  it("registers synchronously without waiting for provenance resolution", async () => {
-    const immediate = createMockApi([]);
-    const registration = runTui(immediate.api);
-    expect(immediate.api.command?.register).toHaveBeenCalledOnce();
-    await registration;
-  });
-
-  it("registers a single /modelscout slash command", () => {
-    const cmds = mock.registered[0]?.() ?? [];
-    expect(cmds).toHaveLength(1);
-    const show = mock.commandBySlash(COMMAND_NAME);
-    expect(show).toBeDefined();
-    expect(show?.title).toBe("Model Scout");
-    expect(show?.value).toBe(`${COMMAND_NAME}.show`);
-  });
-
-  it("wires the dispose into lifecycle.onDispose", () => {
-    expect(mock.onDispose).toHaveBeenCalledTimes(1);
-    expect(mock.onDispose).toHaveBeenCalledWith(mock.dispose);
-  });
-
-  it("opens the dialog (replace + xlarge) when /modelscout is selected", async () => {
-    void mock.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    expect(
-      await waitUntil(() => mock.dialog.replace.mock.calls.length > 0),
-    ).toBe(true);
-    expect(mock.dialog.replace).toHaveBeenCalledTimes(1);
-    expect(mock.dialog.setSize).toHaveBeenCalledWith("xlarge");
-  });
-
-  it("resolves the exact catalog snapshot when the command is selected", async () => {
-    const providers = [
-      {
-        id: "atlas",
-        name: "Atlas",
-        options: { baseURL: "https://atlas.test/v1" },
-        models: {
-          "atlas-model": { id: "atlas-model", name: "Atlas Model" },
-        },
-      },
-    ];
-    const late = createMockApi(providers);
-    await runTui(late.api);
-
-    const startedAt = new Date().toISOString();
-    const marker: RunningCatalogSnapshot = {
-      schemaVersion: CATALOG_SCHEMA_VERSION,
-      packageVersion: "1.6.0",
-      status: "running",
-      attemptId: createAttemptId(),
-      startedAt,
-      worktreeKey: createWorktreeKey("atlas-worktree"),
-      serverKey: createServerKey("http://127.0.0.1:4096")!,
-      runtimeKey: createRuntimeKey(),
-      providerFingerprint: createProviderFingerprint([
-        { id: "atlas", baseURL: "https://atlas.test/v1" },
-      ]),
-    };
-    const snapshot: CompleteCatalogSnapshot = {
-      ...marker,
-      status: "complete",
-      completedAt: startedAt,
-      providers: [
-        {
-          id: "atlas",
-          endpointOrigin: knownScalar(
-            "https://atlas.test",
-            "pre-existing",
-            "configured",
-          ),
-          configuredProbe: unknownScalar(),
-          resolvedProbe: unknownScalar(),
-          status: "ready",
-          modelListAttempt: "ready",
-          probeAttempt: "not-requested",
-          skippedModelIds: [],
-          models: [
-            {
-              id: "atlas-model",
-              origin: "discovered",
-              identity: knownScalar("atlas-model", "server-list", "reported"),
-              name: unknownScalar(),
-              modelType: unknownScalar(),
-              context: unknownScalar(),
-              output: unknownScalar(),
-              family: unknownScalar(),
-              organizationOwner: unknownScalar(),
-              parameterSize: unknownScalar(),
-              quantization: unknownScalar(),
-              sizeBytes: unknownScalar(),
-              probeIdentity: unknownScalar(),
-              capabilities: {
-                vision: unknownCapability(),
-                toolCall: unknownCapability(),
-                reasoning: unknownCapability(),
-                temperature: unknownCapability(),
-              },
-            },
-          ],
-        },
-      ],
-    };
-    publishRunningSnapshot(marker);
-    expect(publishCompleteSnapshot(snapshot)).toBe(true);
-
-    const select = late.commandBySlash(COMMAND_NAME)?.onSelect as
-      | (() => Promise<void>)
-      | undefined;
-    await select?.();
-    const render = late.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-    const detail = openFirstDetail(render());
-    expect(detail?.props?.content).toContain("discovered");
-    expect(detail?.props?.content).toContain("Model ID: atlas-model [server]");
-  });
-
-  it("resolves the exact server/worktree snapshot on separate-realm command open", async () => {
-    const cache = await mkdtemp(path.join(os.tmpdir(), "model-scout-tui-"));
-    tempDirectories.push(cache);
-    process.env.XDG_CACHE_HOME = cache;
-    const providers = [
-      {
-        id: "atlas",
-        name: "Atlas",
-        options: { baseURL: "https://atlas.test/v1" },
-        models: {
-          "atlas-model": { id: "atlas-model", name: "Atlas Model" },
-        },
-      },
-    ];
-    const separateRealm = createMockApi(providers);
-    await runTui(separateRealm.api);
-    const { marker, snapshot } = atlasExactSnapshot();
-    expect(await persistRunningSnapshot(marker, cache)).toBe(true);
-    expect(await persistCompleteSnapshot(snapshot, cache)).toBe(true);
-    clearCatalogBridge();
-
-    const select = separateRealm.commandBySlash(COMMAND_NAME)?.onSelect as
-      | (() => Promise<void>)
-      | undefined;
-    await select?.();
-    const render = separateRealm.dialog.replace.mock
-      .calls[0]?.[0] as () => unknown;
-    const detail = openFirstDetail(render());
-    expect(detail?.props?.content).toContain("discovered");
-    expect(detail?.props?.content).toContain("Model ID: atlas-model [server]");
-  });
-
-  it("degrades a separate-process runtime mismatch to host-only data", async () => {
-    const cache = await mkdtemp(path.join(os.tmpdir(), "model-scout-tui-"));
-    tempDirectories.push(cache);
-    process.env.XDG_CACHE_HOME = cache;
-    const providers = [
-      {
-        id: "atlas",
-        name: "Atlas",
-        options: { baseURL: "https://atlas.test/v1" },
-        models: {
-          "atlas-model": { id: "atlas-model", name: "Atlas Model" },
-        },
-      },
-    ];
-    const separateProcess = createMockApi(providers);
-    await runTui(separateProcess.api);
-    const { marker, snapshot } = atlasExactSnapshot();
-    marker.runtimeKey = createRuntimeKey(process.pid + 1);
-    snapshot.runtimeKey = marker.runtimeKey;
-    expect(await persistRunningSnapshot(marker, cache)).toBe(true);
-    expect(await persistCompleteSnapshot(snapshot, cache)).toBe(true);
-    clearCatalogBridge();
-
-    await separateProcess.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    const render = separateProcess.dialog.replace.mock
-      .calls[0]?.[0] as () => unknown;
-    const detail = openFirstDetail(render());
-    expect(detail?.props?.content).not.toContain("· discovered");
-    expect(detail?.props?.content).toContain(
-      "provenance unavailable; showing host state only",
+    expect(h.providerList).toHaveBeenCalledWith(
+      { location: PROJECT },
+      expect.anything(),
     );
-    expect(detail?.props?.content).toContain("[host]");
-  });
-
-  it("falls back to host-only data when pinned client config is inaccessible", async () => {
-    const inaccessible = createMockApi([
-      {
-        id: "atlas",
-        name: "Atlas",
-        options: { baseURL: "https://atlas.test/v1" },
-        models: {
-          "atlas-model": { id: "atlas-model", name: "Atlas Model" },
-        },
-      },
-    ]);
-    inaccessible.api.client.client.getConfig = () => {
-      throw new Error("protected client unavailable");
-    };
-    await runTui(inaccessible.api);
-    const select = inaccessible.commandBySlash(COMMAND_NAME)?.onSelect as
-      | (() => Promise<void>)
-      | undefined;
-    await expect(select?.()).resolves.toBeUndefined();
-    const render = inaccessible.dialog.replace.mock
-      .calls[0]?.[0] as () => unknown;
-    const detail = openFirstDetail(render());
-    expect(detail?.props?.content).toContain(
-      "provenance unavailable; showing host state only",
-    );
-    expect(detail?.props?.content).toContain("[host]");
-    expect(inaccessible.toast).not.toHaveBeenCalled();
-  });
-
-  it("calls setSize AFTER replace (replace resets size to medium)", async () => {
-    void mock.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    await waitUntil(
-      () =>
-        mock.dialog.replace.mock.calls.length > 0 &&
-        mock.dialog.setSize.mock.calls.length > 0,
-    );
-    const replaceOrder = mock.dialog.replace.mock.invocationCallOrder[0];
-    const setSizeOrder = mock.dialog.setSize.mock.invocationCallOrder[0];
-    expect(replaceOrder).toBeDefined();
-    expect(setSizeOrder).toBeDefined();
-    expect(replaceOrder).toBeLessThan(setSizeOrder);
-  });
-
-  it("returns the content element directly (no api.ui.Dialog double-wrap)", async () => {
-    void mock.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    await waitUntil(() => mock.dialog.replace.mock.calls.length > 0);
-    const render = mock.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-    expect(typeof render).toBe("function");
-    expect(() => render()).not.toThrow();
-    expect(mock.api.ui.Dialog).not.toHaveBeenCalled();
-  });
-
-  it("never constructs a tab_select or a mode row in the unified browser", async () => {
-    void mock.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    await waitUntil(() => mock.dialog.replace.mock.calls.length > 0);
-    const render = mock.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-    const root = render();
-    expect(collectTags(root)).not.toContain("tab_select");
-    expect(findNodeById(root, "modelscout-mode")).toBeUndefined();
-    expect(findNodeById(root, "modelscout-mode-row")).toBeUndefined();
-  });
-
-  it("pairs the selected row with the host's primary/selected-text colors", async () => {
-    void mock.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    await waitUntil(() => mock.dialog.replace.mock.calls.length > 0);
-    const render = mock.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-    const results = findNodeById(render(), "modelscout-results");
-    const theme = mock.api.theme.current;
-    expect(results?.props?.selectedBackgroundColor).toBe(theme.primary);
-    expect(results?.props?.selectedTextColor).toBe(theme.selectedListItemText);
-    expect(results?.props?.backgroundColor).toBe(theme.backgroundPanel);
-    expect(results?.props?.focusedBackgroundColor).toBe(theme.backgroundPanel);
-  });
-
-  it("uses one bounded full-width list screen at 100 columns", async () => {
-    const singlePane = createMockApi(mock.api.state.provider, true, 100);
-    await runTui(singlePane.api);
-    await singlePane.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    const render = singlePane.dialog.replace.mock
-      .calls[0]?.[0] as () => unknown;
-    const root = render();
-    expect(findNodeById(root, "modelscout-pane")).toBeUndefined();
-    expect(findNodeById(root, "modelscout-list-screen")?.props?.width).toBe(
-      "100%",
-    );
-    expect(findNodeById(root, "modelscout-detail-screen")?.props?.width).toBe(
-      "100%",
-    );
-    const footer = findNodeById(root, "modelscout-footer-text");
-    expect((footer?.props?.content as string).length).toBeLessThanOrEqual(84);
-    expect(findNodeById(root, "modelscout-browser")?.props).toMatchObject({
-      overflow: "hidden",
-      width: 88,
-      height: 25,
-      maxHeight: 25,
-    });
-  });
-
-  it.each([80, 109, 110, 160])(
-    "keeps the same single-pane structure at %i columns",
-    async (columns) => {
-      const boundary = createMockApi(mock.api.state.provider, true, columns);
-      await runTui(boundary.api);
-      await boundary.commandBySlash(COMMAND_NAME)?.onSelect?.();
-      const render = boundary.dialog.replace.mock
-        .calls[0]?.[0] as () => unknown;
-      const root = render();
-      expect(findNodeById(root, "modelscout-pane")).toBeUndefined();
-      // Outer width (content + 2+2 padding) stays at the dialog budget of
-      // min(120, columns - 8); the numeric width is content-box only.
-      expect(findNodeById(root, "modelscout-browser")?.props?.width).toBe(
-        Math.max(1, Math.min(120, columns - 8) - 4),
-      );
-    },
-  );
-
-  it.each([40, 30, 24, 18, 14])(
-    "passes a composed total-height budget at %i terminal rows",
-    async (rows) => {
-      const sized = createMockApi(mock.api.state.provider, true, 120, rows);
-      await runTui(sized.api);
-      await sized.commandBySlash(COMMAND_NAME)?.onSelect?.();
-      const render = sized.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-      const root = render();
-      const available = Math.min(25, Math.max(1, rows - 12));
-      expect(findNodeById(root, "modelscout-browser")?.props).toMatchObject({
-        height: available,
-        maxHeight: available,
-      });
-    },
-  );
-
-  it("uses safe browser dimensions when terminal dimensions are unavailable", async () => {
-    const unknownSize = createMockApi(mock.api.state.provider);
-    const renderer = unknownSize.api.renderer as {
-      terminalWidth?: number;
-      terminalHeight?: number;
-    };
-    renderer.terminalWidth = undefined;
-    renderer.terminalHeight = undefined;
-    await runTui(unknownSize.api);
-    await unknownSize.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    const render = unknownSize.dialog.replace.mock
-      .calls[0]?.[0] as () => unknown;
-    expect(findNodeById(render(), "modelscout-browser")?.props).toMatchObject({
-      width: 76,
-      height: 12,
-      maxHeight: 12,
-    });
-  });
-
-  it("passes a non-recursive onClose that disposes browser key listeners", async () => {
-    void mock.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    await waitUntil(() => mock.dialog.replace.mock.calls.length > 0);
-    const render = mock.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-    const onClose = mock.dialog.replace.mock.calls[0]?.[1] as () => void;
-
-    render();
-    expect(mock.keyListeners.size).toBe(1);
-    onClose();
-    onClose();
-
-    expect(mock.keyListeners.size).toBe(0);
-    expect(mock.keyInput.off).toHaveBeenCalledTimes(1);
-    expect(mock.dialog.clear).not.toHaveBeenCalled();
-  });
-
-  it("replaces a prior render listener before constructing another browser", async () => {
-    void mock.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    await waitUntil(() => mock.dialog.replace.mock.calls.length > 0);
-    const render = mock.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-    const onClose = mock.dialog.replace.mock.calls[0]?.[1] as () => void;
-
-    render();
-    render();
-    expect(mock.keyListeners.size).toBe(1);
-    expect(mock.keyInput.off).toHaveBeenCalledTimes(1);
-
-    onClose();
-    expect(mock.keyListeners.size).toBe(0);
-    expect(mock.keyInput.off).toHaveBeenCalledTimes(2);
-  });
-
-  it("falls back to bounded flat content when browser construction fails", async () => {
-    await mock.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    const render = mock.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-    mock.keyInput.on.mockImplementationOnce(() => {
-      throw new Error("key input unavailable");
-    });
-
-    let root: unknown;
-    expect(() => {
-      root = render();
-    }).not.toThrow();
-    expect(mock.toast).toHaveBeenCalledWith(
+    expect(h.catalog).toHaveBeenCalledWith(
+      {},
       expect.objectContaining({
-        variant: "error",
-        message: "key input unavailable",
+        location: PROJECT,
+        signal: expect.any(AbortSignal),
       }),
     );
-    expect(
-      findTextContaining(root, "(interactive browser unavailable)"),
-    ).toBeDefined();
-    expect((root as MockNode).props).toMatchObject({
-      overflow: "hidden",
-      height: 25,
-      maxHeight: 25,
+  });
+
+  it("falls back to the default location when the plugin has none", async () => {
+    const h = harness({ location: undefined });
+    await h.run();
+    expect(h.catalog).toHaveBeenCalledWith(
+      {},
+      expect.objectContaining({ location: { directory: "/default/project" } }),
+    );
+  });
+
+  it("shows the dialog first and sizes it afterwards", async () => {
+    const h = harness();
+    await h.run();
+    expect(h.dialog.set).toHaveBeenCalledWith({ size: "xlarge" });
+    expect(h.dialog.show.mock.invocationCallOrder[0]).toBeLessThan(
+      h.dialog.set.mock.invocationCallOrder[0] ?? 0,
+    );
+  });
+
+  it("renders server evidence next to host rows", async () => {
+    const h = harness();
+    const root = await h.run();
+    const detail = openDetail(root, 1);
+    expect(detail).toContain("Model ID: atlas-model [server]");
+    expect(detail).toContain("Context: 8K [probe]");
+    expect(detail).toContain("Max output: 32K [host default]");
+    expect(summary(root)).toMatch(/^Model Scout · 1\/1 models/);
+  });
+
+  it("names a running discovery in the summary", async () => {
+    const h = harness();
+    h.catalog.mockResolvedValueOnce(payload("running"));
+    expect(summary(await h.run())).toContain("discovery running");
+  });
+
+  it("says discovery is starting until the updated event brings evidence", async () => {
+    const h = harness();
+    h.catalog.mockResolvedValueOnce({
+      schemaVersion: CATALOG_SCHEMA_VERSION,
+      packageVersion: "2.0.0",
+      status: "pending",
+      providers: [],
+    });
+    const root = await h.run();
+    expect(summary(root)).toContain("discovery starting");
+    expect(openDetail(root, 1)).toContain("Model ID: atlas-model [host]");
+
+    h.emitRpc({ location: PROJECT, data: { completedAt: "x" } });
+    await vi.waitFor(() =>
+      expect(summary(root)).not.toContain("discovery starting"),
+    );
+    expect(openDetail(root, 1)).toContain("Model ID: atlas-model [server]");
+  });
+
+  it.each([
+    [
+      "the server half is unavailable",
+      { type: "rpc.unavailable", message: "RPC is unavailable" },
+      "host state only: server plugin unavailable",
+    ],
+    [
+      "the handler fails",
+      { type: "rpc.internal", message: "RPC call failed" },
+      "host state only: server error (rpc.internal)",
+    ],
+    [
+      "the call times out",
+      Object.assign(new Error("timed out"), { name: "TimeoutError" }),
+      "host state only: server timed out",
+    ],
+    [
+      "the transport fails",
+      new TypeError("fetch failed"),
+      "host state only: server unreachable",
+    ],
+  ])("degrades to host rows when %s", async (_label, error, notice) => {
+    const h = harness();
+    h.catalog.mockRejectedValueOnce(error);
+    const root = await h.run();
+    expect(summary(root)).toContain(notice);
+    expect(openDetail(root, 0)).toContain(
+      "evidence unavailable; showing host state only",
+    );
+    expect(h.toast.show).not.toHaveBeenCalled();
+  });
+
+  it("degrades to host rows when the evidence fails validation", async () => {
+    const h = harness();
+    h.catalog.mockResolvedValueOnce({ ...payload(), schemaVersion: 3 });
+    const root = await h.run();
+    expect(summary(root)).toContain("host state only: invalid server evidence");
+    expect(openDetail(root, 1)).toContain("Model ID: atlas-model [host]");
+  });
+
+  it("toasts and opens nothing when the host lists fail", async () => {
+    const h = harness();
+    h.modelList.mockRejectedValueOnce(new Error("service down"));
+    await h.command().run();
+    expect(h.dialog.show).not.toHaveBeenCalled();
+    expect(h.toast.show).toHaveBeenCalledWith(
+      expect.objectContaining({
+        variant: "error",
+        title: "Model Scout",
+        message: "service down",
+      }),
+    );
+  });
+
+  it("toasts when showing the dialog throws", async () => {
+    const h = harness();
+    h.dialog.show.mockImplementationOnce(() => {
+      throw new Error("dialog unavailable");
+    });
+    await expect(h.command().run()).resolves.toBeUndefined();
+    expect(h.toast.show).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "dialog unavailable" }),
+    );
+  });
+
+  it("maps the dialog surface tokens onto the browser colors", async () => {
+    const h = harness();
+    const results = findNodeById(await h.run(), "modelscout-results");
+    expect(results?.props).toMatchObject({
+      backgroundColor: tokens.background.base,
+      focusedBackgroundColor: tokens.background.base,
+      selectedBackgroundColor: tokens.background.action.primary.focused,
+      textColor: tokens.text.base,
+      selectedTextColor: tokens.text.action.primary.focused,
     });
   });
 
-  it("keeps forged provider/model strings on their fallback lines", async () => {
-    const forged = createMockApi([
-      {
-        id: "atlas",
-        name: "Atlas\nForged Provider — 9 models",
-        options: { baseURL: "https://atlas.test/v1" },
-        models: {
-          "atlas-model\r\n  forged-standalone-row": {
-            id: "atlas-model\r\n  forged-standalone-row",
-            name: "Atlas Model",
-            family: "atlas-family\u2028Forged Provider — 9 models",
-            parameterSize: "8B\u2029forged",
-            quantization: "Q4\u202eforged",
-          },
-        },
-      },
+  it.each([
+    [160, 40, 112, 25],
+    [80, 24, 74, 12],
+  ])(
+    "sizes a %i×%i terminal to a content-sized root",
+    async (columns, rows, width, height) => {
+      const h = harness({ terminalWidth: columns, terminalHeight: rows });
+      expect(
+        findNodeById(await h.run(), "modelscout-browser")?.props,
+      ).toMatchObject({ width, height, maxHeight: height });
+    },
+  );
+});
+
+describe("dialog lifecycle", () => {
+  it("disposes the key listener and subscriptions once when the host closes it", async () => {
+    const h = harness();
+    await h.run();
+    expect(h.keyListeners.size).toBe(1);
+
+    h.current()?.onClose?.();
+    h.current()?.onClose?.();
+
+    expect(h.keyListeners.size).toBe(0);
+    expect(h.keyInput.off).toHaveBeenCalledTimes(1);
+    expect(h.stopRpc).toHaveBeenCalledOnce();
+    expect(h.stopData).toHaveBeenCalledOnce();
+    expect(h.dialog.clear).not.toHaveBeenCalled();
+  });
+
+  it("keeps one key listener when the host renders the dialog again", async () => {
+    const h = harness();
+    await h.run();
+    h.current()?.render();
+    expect(h.keyListeners.size).toBe(1);
+  });
+
+  it("closes its own open dialog on plugin cleanup", async () => {
+    const h = harness();
+    await h.run();
+    h.cleanup();
+    expect(h.dialog.clear).toHaveBeenCalledOnce();
+    expect(h.keyListeners.size).toBe(0);
+    expect(h.stopRpc).toHaveBeenCalledOnce();
+  });
+
+  it("leaves a dialog that replaced its own alone on cleanup", async () => {
+    const h = harness();
+    await h.run();
+    h.context.ui.dialog.show(() => undefined);
+    h.cleanup();
+    expect(h.dialog.clear).not.toHaveBeenCalled();
+  });
+
+  it("does not open a dialog after cleanup ran during loading", async () => {
+    const h = harness();
+    const running = h.command().run();
+    h.cleanup();
+    await running;
+    expect(h.dialog.show).not.toHaveBeenCalled();
+  });
+
+  it("falls back to flat content when the browser cannot be built", async () => {
+    const h = harness();
+    await h.command().run();
+    h.keyInput.on.mockImplementationOnce(() => {
+      throw new Error("key input unavailable");
+    });
+    const root = h.current()?.render();
+    expect(h.toast.show).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "key input unavailable" }),
+    );
+    const body = findTextContaining(root, "(interactive browser unavailable)");
+    expect(body?.props?.content).toContain("Atlas — 1 model");
+    expect(body?.props?.fg).toBe(tokens.text.feedback.error.base);
+  });
+
+  it("keeps forged provider and model strings on their fallback lines", async () => {
+    const h = harness();
+    h.setHostModels([
+      hostModel("atlas-model\r\n  forged-standalone-row", "Atlas\u2028Forged"),
     ]);
-    await runTui(forged.api);
-    await forged.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    const render = forged.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-    forged.keyInput.on.mockImplementationOnce(() => {
+    h.catalog.mockRejectedValueOnce({ type: "rpc.unavailable", message: "" });
+    await h.command().run();
+    h.keyInput.on.mockImplementationOnce(() => {
       throw new Error("forced fallback\nForged Error — standalone line");
     });
-
-    const root = render();
-    const body = findTextContaining(root, "(interactive browser unavailable)");
-    expect(body).toBeDefined();
-    const content = body?.props?.content as string;
-    // Only intentional structural newlines remain; every external control,
-    // line/paragraph separator, and bidi control has been spaced out.
+    const content = findTextContaining(
+      h.current()?.render(),
+      "(interactive browser unavailable)",
+    )?.props?.content as string;
     expect(content.replaceAll("\n", "")).not.toMatch(
       /[\p{Cc}\p{Zl}\p{Zp}\u202A-\u202E\u2066-\u2069]/u,
     );
     const lines = content.split("\n");
-    expect(lines).not.toContain("Forged Provider — 9 models");
     expect(lines).not.toContain("  forged-standalone-row");
-    expect(lines).not.toContain("Forged Error — standalone line");
-    // The sanitized values stay inline on their structured rows.
-    expect(lines).toContain("Atlas Forged Provider — 9 models — 1 model");
     expect(lines).toContain("  atlas-model   forged-standalone-row");
     expect(
       lines.some((line) =>
         line.includes("forced fallback Forged Error — standalone line"),
       ),
     ).toBe(true);
-    expect(
-      lines.some((line) =>
-        line.includes("atlas-family Forged Provider — 9 models"),
-      ),
-    ).toBe(true);
   });
 
-  it("never renders a span/text-node directly under a box (opentui orphan rule)", async () => {
-    void mock.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    await waitUntil(() => mock.dialog.replace.mock.calls.length > 0);
-    const render = mock.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-    expect(findOrphanSpan(render())).toBeUndefined();
-  });
-
-  it("never renders a span directly under a box for the empty state", async () => {
-    const empty = createMockApi([]);
-    await runTui(empty.api);
-    void empty.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    await waitUntil(() => empty.dialog.replace.mock.calls.length > 0);
-    const render = empty.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-    expect(findOrphanSpan(render())).toBeUndefined();
-  });
-
-  it("does not throw when provider state is empty", async () => {
-    const empty = createMockApi([]);
-    await runTui(empty.api);
-    void empty.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    await waitUntil(() => empty.dialog.replace.mock.calls.length > 0);
-    const render = empty.dialog.replace.mock.calls[0]?.[0] as () => unknown;
-    expect(() => render()).not.toThrow();
-  });
-
-  it("never throws out of onSelect: a failing replace is caught and toasted", async () => {
-    mock.dialog.replace.mockImplementationOnce(() => {
-      throw new Error("dialog unavailable");
-    });
-    expect(() => mock.commandBySlash(COMMAND_NAME)?.onSelect?.()).not.toThrow();
-    expect(await waitUntil(() => mock.toast.mock.calls.length > 0)).toBe(true);
-    expect(mock.toast).toHaveBeenCalledWith(
-      expect.objectContaining({ variant: "error", title: "Model Scout" }),
-    );
-  });
-});
-
-describe("tui graceful degradation", () => {
-  it("does nothing when api.command is unavailable", async () => {
-    const mock = createMockApi([], false);
-    await expect(runTui(mock.api)).resolves.toBeUndefined();
-    expect(mock.onDispose).not.toHaveBeenCalled();
-  });
-
-  it("toasts (never throws) when the @opentui reconciler fails to load", async () => {
-    // Re-import the plugin with @opentui/solid mocked to throw at import time,
-    // exercising the loadRenderer() rejection arm of openDialog.
+  it("toasts when OpenTUI cannot be loaded", async () => {
     vi.resetModules();
     vi.doMock("@opentui/solid", () => {
       throw new Error("opentui unavailable");
     });
-    const fresh = (await import("../src/tui")).default;
-    const mock = createMockApi([]);
-    await fresh.tui(
-      mock.api as unknown as TuiPluginApi,
-      undefined,
-      {} as TuiPluginMeta,
+    try {
+      const fresh = (await import("../src/tui")).default;
+      const h = harness();
+      const layers: Array<() => Layer> = [];
+      void fresh.setup({
+        ...h.context,
+        keymap: { layer: (factory: () => Layer) => layers.push(factory) },
+      } as unknown as Plugin.Context);
+      await layers[0]?.().commands?.[0]?.run();
+      expect(h.dialog.show).not.toHaveBeenCalled();
+      expect(h.toast.show).toHaveBeenCalledWith(
+        expect.objectContaining({ variant: "error", title: "Model Scout" }),
+      );
+    } finally {
+      vi.resetModules();
+      vi.doMock("@opentui/solid", reconcilerMock);
+    }
+  });
+});
+
+describe("live updates", () => {
+  it("reloads in place on an updated event for the same location", async () => {
+    const h = harness();
+    const root = await h.run();
+    h.setHostModels([hostModel(), hostModel("atlas-new", "Atlas New")]);
+
+    h.emitRpc({ location: PROJECT, data: { completedAt: "x" } });
+
+    await vi.waitFor(() =>
+      expect(optionNames(root).some((name) => name.includes("Atlas New"))).toBe(
+        true,
+      ),
     );
-    void mock.commandBySlash(COMMAND_NAME)?.onSelect?.();
-    expect(await waitUntil(() => mock.toast.mock.calls.length > 0)).toBe(true);
-    expect(mock.toast).toHaveBeenCalledWith(
-      expect.objectContaining({ variant: "error", title: "Model Scout" }),
+    expect(h.catalog).toHaveBeenLastCalledWith(
+      {},
+      expect.objectContaining({ location: PROJECT }),
     );
-    vi.doUnmock("@opentui/solid");
-    vi.resetModules();
+  });
+
+  it("reloads on model.updated for the same location", async () => {
+    const h = harness();
+    const root = await h.run();
+    h.setHostModels([hostModel(), hostModel("atlas-new", "Atlas New")]);
+    h.emitModelUpdated({ type: "model.updated", location: PROJECT });
+    await vi.waitFor(() =>
+      expect(optionNames(root).some((name) => name.includes("Atlas New"))).toBe(
+        true,
+      ),
+    );
+  });
+
+  it("ignores events for other or missing locations", async () => {
+    const h = harness();
+    await h.run();
+    h.emitRpc({ location: { directory: "/elsewhere" }, data: {} });
+    h.emitModelUpdated({ type: "model.updated" });
+    h.emitModelUpdated({
+      type: "model.updated",
+      location: { directory: "/elsewhere" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(h.modelList).toHaveBeenCalledOnce();
+  });
+
+  it("coalesces a burst of events into one follow-up reload", async () => {
+    const h = harness();
+    await h.run();
+    for (let index = 0; index < 4; index++)
+      h.emitRpc({ location: PROJECT, data: {} });
+    await vi.waitFor(() => expect(h.modelList).toHaveBeenCalledTimes(3));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(h.modelList).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the last rows and says so when a reload fails", async () => {
+    const h = harness();
+    const root = await h.run();
+    h.modelList.mockRejectedValueOnce(new Error("offline"));
+    h.emitRpc({ location: PROJECT, data: {} });
+    await vi.waitFor(() =>
+      expect(summary(root)).toContain("update failed; showing the last result"),
+    );
+    expect(optionNames(root)).toHaveLength(2);
+  });
+
+  it("reloads once after opening when an update arrived during the first reads", async () => {
+    const h = harness();
+    h.modelList.mockImplementationOnce(async (input) => {
+      // The catalog changes while the first read is in flight.
+      h.setHostModels([hostModel(), hostModel("atlas-new", "Atlas New")]);
+      h.emitRpc({ location: PROJECT, data: { completedAt: "x" } });
+      h.emitModelUpdated({ type: "model.updated", location: PROJECT });
+      return { location: input.location, data: [hostModel()] };
+    });
+    const root = await h.run();
+    await vi.waitFor(() =>
+      expect(optionNames(root).some((name) => name.includes("Atlas New"))).toBe(
+        true,
+      ),
+    );
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(h.modelList).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops listening when the dialog never opens", async () => {
+    const h = harness();
+    h.modelList.mockRejectedValueOnce(new Error("service down"));
+    await h.command().run();
+    expect(h.stopRpc).toHaveBeenCalledOnce();
+    expect(h.stopData).toHaveBeenCalledOnce();
+  });
+
+  it("stops reacting to events after the dialog closes", async () => {
+    const h = harness();
+    await h.run();
+    h.current()?.onClose?.();
+    h.emitRpc({ location: PROJECT, data: {} });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(h.modelList).toHaveBeenCalledOnce();
+  });
+});
+
+describe("refresh key", () => {
+  it("requests a refresh for the captured location and reloads when accepted", async () => {
+    const h = harness();
+    const root = await h.run();
+    h.press({ name: "r", sequence: "R", shift: true });
+    await vi.waitFor(() => expect(h.modelList).toHaveBeenCalledTimes(2));
+    expect(h.refresh).toHaveBeenCalledWith(
+      {},
+      expect.objectContaining({
+        location: PROJECT,
+        signal: expect.any(AbortSignal),
+      }),
+    );
+    await vi.waitFor(() =>
+      expect(summary(root)).toMatch(/^Model Scout · 1\/1 models/),
+    );
+  });
+
+  it.each([
+    ["throttled", "refresh skipped: the last one was under a minute ago"],
+    ["no-targets", "refresh skipped: no providers to discover"],
+  ])("explains a refresh the server declined as %s", async (reason, notice) => {
+    const h = harness();
+    const root = await h.run();
+    h.refresh.mockResolvedValueOnce({ accepted: false, reason });
+    h.press({ name: "r", sequence: "R", shift: true });
+    await vi.waitFor(() => expect(summary(root)).toContain(notice));
+    expect(h.modelList).toHaveBeenCalledOnce();
+  });
+
+  it("explains a refresh that failed", async () => {
+    const h = harness();
+    const root = await h.run();
+    h.refresh.mockRejectedValueOnce({
+      type: "rpc.unavailable",
+      message: "RPC is unavailable",
+    });
+    h.press({ name: "r", sequence: "R", shift: true });
+    await vi.waitFor(() =>
+      expect(summary(root)).toContain(
+        "refresh failed: server plugin unavailable",
+      ),
+    );
   });
 });

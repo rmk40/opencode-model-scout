@@ -1,0 +1,394 @@
+#!/usr/bin/env node
+// Live checks against the harness server (scripts/live-harness.mjs start).
+// Not shipped and not part of `npm run check`.
+//
+//   node scripts/live-check.mjs [--skip-chat] [--chat-model <provider/model>]
+//
+// Expected Actualyze values are derived from the endpoint's own /models list,
+// fetched at check time with ACTUALYZE_API_KEY_FILE (see live-harness.mjs).
+// The chat check sends one plain prompt to --chat-model, or else to the first
+// listed Actualyze model.
+//
+// Prints only the fields it checks and PASS/FAIL. It never prints a raw
+// model.list or provider.list response: both carry the plaintext apiKey.
+// Failures print a fixed category and, where captured, the HTTP status, never
+// an exception message: fetch errors can include a credential-bearing URL and
+// JSON errors can include response text.
+//
+// This script imports src/catalog-evidence.ts directly, so it needs a Node
+// version that strips TypeScript types by default (22.18+ or 23.6+).
+
+import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
+import { validateCatalogPayload } from "../src/catalog-evidence.ts";
+import {
+  ACTUALYZE_API_KEY_FILE,
+  ACTUALYZE_BASE_URL,
+  ACTUALYZE_ENABLED,
+  ACTUALYZE_PROVIDER,
+  MOCK_MODELS,
+  PROJECT,
+  api,
+  envArgv,
+  isolatedEnv,
+  readState,
+} from "./live-harness.mjs";
+
+const PLUGIN_ID = "opencode-model-scout";
+const ACTUALYZE = ACTUALYZE_PROVIDER;
+const MOCK = "mock-compat";
+
+const args = process.argv.slice(2);
+const skipChat = args.includes("--skip-chat");
+const chatModelIndex = args.indexOf("--chat-model");
+const chatModelArg = chatModelIndex >= 0 ? args[chatModelIndex + 1] : undefined;
+
+/**
+ * The Actualyze `/models` list entries, fetched directly from the endpoint.
+ * Resolves to `{ list }` or `{ failure }`, where `failure` is a fixed category.
+ */
+async function fetchActualyzeList() {
+  let key;
+  try {
+    key = (await readFile(ACTUALYZE_API_KEY_FILE, "utf8")).trim();
+  } catch {
+    return { failure: "key file unreadable" };
+  }
+  let response;
+  try {
+    response = await fetch(`${ACTUALYZE_BASE_URL}/models`, {
+      headers: { authorization: `Bearer ${key}` },
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch {
+    return { failure: "request failed" };
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    return { failure: `HTTP ${response.status}` };
+  }
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    return { failure: "response is not JSON" };
+  }
+  return { list: Array.isArray(body?.data) ? body.data : [] };
+}
+
+let failures = 0;
+let passes = 0;
+
+function show(value) {
+  return JSON.stringify(value);
+}
+
+function check(label, ok, detail = "") {
+  if (ok) passes += 1;
+  else failures += 1;
+  // Details are printed only for failures, and never include raw responses.
+  console.log(
+    `${ok ? "PASS" : "FAIL"} ${label}${!ok && detail ? ` ${detail}` : ""}`,
+  );
+  return ok;
+}
+
+function equalField(label, actual, expected) {
+  const ok = show(actual) === show(expected);
+  return check(
+    label,
+    ok,
+    ok ? "" : `expected ${show(expected)} got ${show(actual)}`,
+  );
+}
+
+function sorted(values) {
+  return Array.isArray(values) ? [...values].sort() : values;
+}
+
+/**
+ * Expected `Model.Info` fields for a model discovered from an Actualyze list
+ * entry. No effort variants: the Actualyze chat endpoint ignores
+ * `reasoning_effort`.
+ */
+function expectedFromActualyze(entry) {
+  const capabilities = entry.capabilities ?? {};
+  const input = Array.isArray(entry.modalities?.input)
+    ? entry.modalities.input
+    : capabilities.vision === true
+      ? ["text", "image"]
+      : ["text"];
+  return {
+    limit: {
+      context: entry.context_window,
+      output: entry.max_output_tokens,
+    },
+    tools: capabilities.tool_use === false ? false : true,
+    input: sorted(input),
+    output: ["text"],
+    variants: [],
+    cost: entry.cost
+      ? [
+          {
+            input: entry.cost.input,
+            output: entry.cost.output,
+            cache: {
+              read: entry.cost.cache_read ?? 0,
+              write: entry.cost.cache_write ?? 0,
+            },
+          },
+        ]
+      : [],
+    released: typeof entry.created === "number" ? entry.created * 1000 : 0,
+    enabled: true,
+  };
+}
+
+function actualFields(model) {
+  return {
+    limit: { context: model.limit?.context, output: model.limit?.output },
+    tools: model.capabilities?.tools,
+    input: sorted(model.capabilities?.input),
+    output: model.capabilities?.output,
+    variants: Array.isArray(model.variants)
+      ? model.variants.map((variant) => ({
+          id: variant.id,
+          reasoningEffort: variant.settings?.reasoningEffort,
+        }))
+      : model.variants,
+    cost: Array.isArray(model.cost)
+      ? model.cost.map((cost) => ({
+          input: cost.input,
+          output: cost.output,
+          cache: { read: cost.cache?.read, write: cost.cache?.write },
+        }))
+      : model.cost,
+    released: model.time?.released,
+    enabled: model.enabled,
+  };
+}
+
+async function checkPlugins(state) {
+  console.log("== plugin.list");
+  const { status, json } = await api(state, "GET", "/api/plugin");
+  if (!check("plugin.list HTTP 200", status === 200, `(HTTP ${status})`))
+    return;
+  const plugin = (Array.isArray(json?.data) ? json.data : []).find(
+    (entry) => entry?.id === PLUGIN_ID,
+  );
+  if (!check(`${PLUGIN_ID} listed`, plugin !== undefined)) return;
+  equalField(`${PLUGIN_ID} state`, plugin.state?.status, "active");
+  for (const feature of ["server", "tui", "rpc"]) {
+    equalField(
+      `${PLUGIN_ID} feature ${feature}`,
+      plugin.features?.[feature],
+      true,
+    );
+  }
+}
+
+async function checkModels(state) {
+  console.log("== model.list");
+  const listed = actualyzeList ?? [];
+  const { status, json } = await api(state, "GET", "/api/model");
+  if (!check("model.list HTTP 200", status === 200, `(HTTP ${status})`)) return;
+  const models = Array.isArray(json?.data) ? json.data : [];
+  const byKey = new Map(
+    models.map((model) => [`${model.providerID}/${model.id}`, model]),
+  );
+
+  for (const entry of listed) {
+    const key = `${ACTUALYZE}/${entry.id}`;
+    const model = byKey.get(key);
+    if (!check(`${key} listed`, model !== undefined)) continue;
+    const expected = expectedFromActualyze(entry);
+    const actual = actualFields(model);
+    for (const field of Object.keys(expected)) {
+      equalField(`${key} ${field}`, actual[field], expected[field]);
+    }
+  }
+  const extra = models
+    .filter((model) => model.providerID === ACTUALYZE)
+    .map((model) => model.id)
+    .filter((id) => !listed.some((entry) => entry.id === id));
+  if (actualyzeList) {
+    equalField(`${ACTUALYZE} has no unexpected models`, extra, []);
+  }
+
+  for (const entry of MOCK_MODELS) {
+    const key = `${MOCK}/${entry.id}`;
+    const model = byKey.get(key);
+    if (entry.id.includes("embed")) {
+      check(
+        `${key} not offered as a chat model`,
+        model === undefined || model.enabled === false,
+      );
+      continue;
+    }
+    if (!check(`${key} listed`, model !== undefined)) continue;
+    equalField(
+      `${key} limit.context`,
+      model.limit?.context,
+      entry.max_model_len,
+    );
+  }
+}
+
+function readCatalog(state) {
+  return api(state, "POST", `/api/rpc/${PLUGIN_ID}/catalog`, { input: {} });
+}
+
+const SETTLE_TIMEOUT_MS = 60_000;
+const SETTLE_POLL_MS = 500;
+
+/**
+ * Wait until discovery has finished (status "complete"), so the model and
+ * RPC checks do not race the first sync or a discovery job still running.
+ */
+async function waitForCatalog(state) {
+  const deadline = Date.now() + SETTLE_TIMEOUT_MS;
+  let last = "no response";
+  while (Date.now() < deadline) {
+    try {
+      const { status, json } = await readCatalog(state);
+      const payload =
+        status === 200 ? validateCatalogPayload(json?.output) : undefined;
+      if (payload && payload.status === "complete") return;
+      last = payload ? payload.status : `HTTP ${status}`;
+    } catch {
+      last = "request failed";
+    }
+    await new Promise((resolve) => setTimeout(resolve, SETTLE_POLL_MS));
+  }
+  check(
+    `catalog completes within ${SETTLE_TIMEOUT_MS / 1000} s`,
+    false,
+    `(${last})`,
+  );
+}
+
+async function checkRpc(state) {
+  console.log("== rpc catalog");
+  const { status, json } = await readCatalog(state);
+  if (
+    !check(
+      "rpc catalog HTTP 200",
+      status === 200,
+      status === 200
+        ? ""
+        : `(HTTP ${status} ${show(json?.type ?? json?.error?.type ?? "")})`,
+    )
+  )
+    return;
+  const payload = validateCatalogPayload(json?.output);
+  if (!check("catalog payload passes the strict v4 validator", payload)) return;
+  for (const [id, count] of [
+    ...(actualyzeList ? [[ACTUALYZE, actualyzeList.length]] : []),
+    [MOCK, MOCK_MODELS.length],
+  ]) {
+    const provider = payload.providers.find((entry) => entry.id === id);
+    if (!check(`catalog has evidence for ${id}`, provider !== undefined))
+      continue;
+    check(`${id} lastGoodAt set`, provider.lastGoodAt !== null);
+    equalField(`${id} failure`, provider.failure, null);
+    equalField(`${id} model evidence count`, provider.models.length, count);
+  }
+  const actualyze = payload.providers.find((entry) => entry.id === ACTUALYZE);
+  if (actualyze) {
+    equalField(
+      `${ACTUALYZE} resolvedProbe`,
+      actualyze.resolvedProbe.state === "known"
+        ? actualyze.resolvedProbe.value
+        : "unknown",
+      "actualyze",
+    );
+  }
+}
+
+function runChat(state, model) {
+  return new Promise((resolve) => {
+    const child = spawn(
+      "env",
+      envArgv(isolatedEnv({ OPENCODE_PASSWORD: state.password }), [
+        "run",
+        "--server",
+        state.url,
+        "--model",
+        model,
+        "--format",
+        "json",
+        "Reply with the single word: pong",
+      ]),
+      { cwd: PROJECT, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    let stdout = "";
+    child.stdout.on("data", (chunk) => (stdout += chunk));
+    // stderr is drained and discarded: it may echo provider details.
+    child.stderr.on("data", () => {});
+    const timer = setTimeout(() => child.kill("SIGKILL"), 180_000);
+    child.on("close", (code, signal) => {
+      clearTimeout(timer);
+      const errorTypes = [];
+      for (const line of stdout.split("\n")) {
+        try {
+          const event = JSON.parse(line);
+          if (/error/i.test(String(event?.type))) {
+            errorTypes.push(
+              String(event.error?.name ?? event.error?.type ?? event.type),
+            );
+          }
+        } catch {
+          // Non-JSON line.
+        }
+      }
+      resolve({ code, signal, errorTypes });
+    });
+  });
+}
+
+async function checkChat(state) {
+  console.log("== chat");
+  const firstEntry = actualyzeList?.[0];
+  const model =
+    chatModelArg ?? (firstEntry ? `${ACTUALYZE}/${firstEntry.id}` : undefined);
+  if (!model) {
+    console.log("skip: no Actualyze model to test; pass --chat-model");
+    return;
+  }
+  const { code, signal, errorTypes } = await runChat(state, model);
+  const ok = code === 0 && errorTypes.length === 0;
+  check(
+    `chat ${model}`,
+    ok,
+    ok
+      ? ""
+      : `(exit ${code ?? signal}${errorTypes.length ? `, errors ${show(errorTypes)}` : ""})`,
+  );
+}
+
+const state = await readState();
+if (!state) {
+  console.log(
+    "harness is not running; run `node scripts/live-harness.mjs start`",
+  );
+  process.exit(1);
+}
+let actualyzeList;
+if (ACTUALYZE_ENABLED) {
+  const { list, failure } = await fetchActualyzeList();
+  if (check("fetch Actualyze /models", failure === undefined, `(${failure})`))
+    actualyzeList = list;
+} else {
+  console.log("note: Actualyze checks skipped (ACTUALYZE_* not set)");
+}
+await waitForCatalog(state);
+for (const step of [checkPlugins, checkModels, checkRpc]) {
+  try {
+    await step(state);
+  } catch {
+    check(step.name, false, "(threw an exception)");
+  }
+}
+if (!skipChat) await checkChat(state);
+console.log(`\n${passes} passed, ${failures} failed`);
+process.exitCode = failures === 0 ? 0 : 1;

@@ -26,7 +26,7 @@ export const probeTgi: ProviderProbe = async (
   context?: ProbeContext,
 ): Promise<ProbeResult> => {
   try {
-    const headers = buildHeaders(apiKey);
+    const headers = buildHeaders(apiKey, context?.headers);
 
     const info = await probeFetchJson<TgiInfoResponse>(
       `${baseURL}/info`,

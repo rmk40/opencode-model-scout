@@ -1,52 +1,54 @@
 import { describe, expect, it } from "vitest";
 import {
   CATALOG_SCHEMA_VERSION,
-  createAttemptId,
-  createProviderFingerprint,
-  createRuntimeKey,
-  createServerKey,
-  createWorktreeKey,
   knownScalar,
   unknownCapability,
   unknownScalar,
+  type CapabilityEvidence,
   type CatalogModelRecord,
-  type ExactCatalogSnapshot,
-} from "../src/catalog-snapshot";
+  type CatalogPayload,
+  type CatalogProviderRecord,
+} from "../src/catalog-evidence";
 import {
   collectModelGroups,
-  hostProviderFingerprint,
-  toModelRow,
-  type SdkModelView,
-  type SdkProviderView,
+  coreMetadataCoverage,
+  type HostCatalog,
+  type HostModel,
+  type HostProvider,
 } from "../src/tui-models";
-import { discoverableProviderEntries } from "../src/discover";
 
-function evidenceModel(id = "atlas-model"): CatalogModelRecord {
+const probeSupported: CapabilityEvidence = {
+  state: "supported",
+  source: "provider-probe",
+  strength: "authoritative",
+};
+const probeUnsupported: CapabilityEvidence = {
+  state: "unsupported",
+  source: "provider-probe",
+  strength: "authoritative",
+};
+
+function evidenceModel(
+  id = "atlas-model",
+  overrides: Partial<CatalogModelRecord> = {},
+): CatalogModelRecord {
   return {
     id,
     origin: "discovered",
+    enabled: true,
     identity: knownScalar(id, "server-list", "reported"),
     name: knownScalar("Atlas Model", "heuristic", "inferred"),
     modelType: knownScalar("llm", "provider-probe", "authoritative"),
     context: knownScalar(8192, "provider-probe", "authoritative"),
-    output: unknownScalar(),
+    output: knownScalar(32_000, "host-default", "assumed"),
     family: knownScalar("atlas", "models.dev", "inferred"),
     organizationOwner: unknownScalar(),
     parameterSize: knownScalar("8B", "provider-probe", "authoritative"),
     quantization: knownScalar("Q4_K_M", "provider-probe", "authoritative"),
     sizeBytes: knownScalar(4_000_000_000, "provider-probe", "authoritative"),
-    probeIdentity: knownScalar("atlas", "provider-probe", "reported"),
+    probeIdentity: knownScalar("actualyze", "provider-probe", "reported"),
     capabilities: {
-      vision: {
-        state: "unsupported",
-        source: "provider-probe",
-        strength: "authoritative",
-      },
-      toolCall: {
-        state: "supported",
-        source: "provider-probe",
-        strength: "authoritative",
-      },
+      toolCall: probeSupported,
       reasoning: unknownCapability(),
       temperature: {
         state: "supported",
@@ -54,251 +56,195 @@ function evidenceModel(id = "atlas-model"): CatalogModelRecord {
         strength: "assumed",
       },
     },
+    inputModalities: {
+      text: probeSupported,
+      image: probeUnsupported,
+      pdf: unknownCapability(),
+      audio: unknownCapability(),
+      video: unknownCapability(),
+    },
+    cost: {
+      input: knownScalar(3, "provider-probe", "reported"),
+      output: knownScalar(15, "provider-probe", "reported"),
+      cacheRead: unknownScalar(),
+      cacheWrite: unknownScalar(),
+    },
+    ...overrides,
   };
 }
 
-function exact(model = evidenceModel()): ExactCatalogSnapshot {
-  const startedAt = new Date().toISOString();
+function evidenceProvider(
+  overrides: Partial<CatalogProviderRecord> = {},
+): CatalogProviderRecord {
   return {
-    exactAttempt: true,
-    snapshot: {
-      schemaVersion: CATALOG_SCHEMA_VERSION,
-      packageVersion: "1.6.0",
-      status: "complete",
-      attemptId: createAttemptId(),
-      startedAt,
-      completedAt: startedAt,
-      worktreeKey: createWorktreeKey("/tmp/worktree"),
-      serverKey: createServerKey("http://127.0.0.1:4096")!,
-      runtimeKey: createRuntimeKey(),
-      providerFingerprint: createProviderFingerprint([
-        { id: "atlas", baseURL: "https://atlas.test/v1" },
-      ]),
-      providers: [
-        {
-          id: "atlas",
-          endpointOrigin: knownScalar(
-            "https://atlas.test",
-            "pre-existing",
-            "configured",
-          ),
-          configuredProbe: knownScalar("auto", "pre-existing", "configured"),
-          resolvedProbe: knownScalar("atlas", "provider-probe", "reported"),
-          status: "ready",
-          modelListAttempt: "ready",
-          probeAttempt: "complete",
-          skippedModelIds: [],
-          models: [model],
-        },
-      ],
-    },
+    id: "atlas",
+    endpointOrigin: knownScalar(
+      "https://atlas.test",
+      "pre-existing",
+      "configured",
+    ),
+    configuredProbe: knownScalar("auto", "pre-existing", "configured"),
+    resolvedProbe: knownScalar("actualyze", "provider-probe", "reported"),
+    lastGoodAt: "2026-10-11T08:00:00.000Z",
+    failure: null,
+    modelListAttempt: "ready",
+    probeAttempt: "complete",
+    skippedModelIds: [],
+    models: [evidenceModel()],
+    ...overrides,
   };
 }
 
-function host(overrides: Partial<SdkModelView> = {}): SdkProviderView[] {
-  return [
-    {
-      id: "atlas",
-      name: "Atlas",
-      options: { baseURL: "https://atlas.test/v1" },
-      models: {
-        "atlas-model": {
-          id: "atlas-model",
-          name: "Atlas Model",
-          family: "atlas",
-          limit: { context: 8192 },
-          capabilities: {
-            output: { text: true },
-            attachment: false,
-            toolcall: true,
-            temperature: true,
-          },
-          ...overrides,
-        },
-      },
-    },
-  ];
+function catalog(
+  providers: CatalogProviderRecord[] = [evidenceProvider()],
+): CatalogPayload {
+  return {
+    schemaVersion: CATALOG_SCHEMA_VERSION,
+    packageVersion: "2.0.0",
+    status: "complete",
+    completedAt: "2026-10-11T08:00:00.000Z",
+    providers,
+  };
 }
 
-describe("host/snapshot reconciliation", () => {
-  it("accepts agreeing evidence and preserves assumed temperature confidence", () => {
-    const row = collectModelGroups(host(), exact())[0].models[0];
+function hostModel(overrides: Partial<HostModel> = {}): HostModel {
+  return {
+    id: "atlas-model",
+    providerID: "atlas",
+    name: "Atlas Model",
+    family: "atlas",
+    enabled: true,
+    capabilities: { tools: true, input: ["text"], output: ["text"] },
+    variants: [],
+    cost: [{ input: 3, output: 15, cache: { read: 0, write: 0 } }],
+    limit: { context: 8192, output: 32_000 },
+    ...overrides,
+  };
+}
+
+const atlasProvider: HostProvider = {
+  id: "atlas",
+  name: "Atlas",
+  package: "@opencode/ai/providers/openai-compatible",
+  settings: { baseURL: "https://atlas.test/openai/v1" },
+};
+
+function host(...models: HostModel[]): HostCatalog {
+  return {
+    providers: [atlasProvider],
+    models: models.length > 0 ? models : [hostModel()],
+  };
+}
+
+function firstRow(hostCatalog: HostCatalog, payload?: CatalogPayload) {
+  const row = collectModelGroups(hostCatalog, payload)[0]?.models[0];
+  if (!row) throw new Error("missing row");
+  return row;
+}
+
+describe("host and evidence reconciliation", () => {
+  it("keeps agreeing evidence with its provenance", () => {
+    const row = firstRow(host(), catalog());
     expect(row.context).toBe(8192);
     expect(row.provenance?.context).toMatchObject({
       source: "provider-probe",
       strength: "authoritative",
     });
-    expect(row.capabilities?.toolCall).toMatchObject({
-      state: "supported",
-      source: "provider-probe",
-      strength: "authoritative",
-    });
-    expect(row.capabilities?.temperature).toEqual({
-      state: "supported",
+    expect(row.capabilities?.toolCall).toEqual(probeSupported);
+    expect(row.capabilities?.temperature).toMatchObject({
       source: "policy-default",
-      strength: "assumed",
     });
     expect(row.origin).toBe("discovered");
+    expect(row.warnings).toEqual([]);
   });
 
-  it("applies authoritative negatives only with exact-attempt evidence", () => {
-    const exactRow = collectModelGroups(host(), exact())[0].models[0];
-    expect(exactRow.capabilities?.vision.state).toBe("unsupported");
+  it("takes host-default limits from evidence, not from the always-present host value", () => {
+    const row = firstRow(host(), catalog());
+    expect(row.output).toBe(32_000);
+    expect(row.provenance?.output).toMatchObject({ source: "host-default" });
+    expect(coreMetadataCoverage(row).missing).toContain("output");
 
-    const hostOnly = collectModelGroups(host())[0].models[0];
-    expect(hostOnly.capabilities?.vision.state).toBe("unknown");
-    expect(hostOnly.origin).toBeUndefined();
+    const hostOnly = firstRow(host());
+    expect(hostOnly.provenance?.output).toMatchObject({
+      source: "unmatched-host",
+    });
+    expect(coreMetadataCoverage(hostOnly).missing).not.toContain("output");
   });
 
-  it("keeps conflicting host values and emits non-fatal warnings", () => {
-    const providers = host({ limit: { context: 4096 } });
-    const row = collectModelGroups(providers, exact())[0].models[0];
+  it("applies authoritative negatives only when evidence exists", () => {
+    expect(firstRow(host(), catalog()).inputModalities?.image).toEqual(
+      probeUnsupported,
+    );
+    expect(firstRow(host()).inputModalities?.image.state).toBe("unknown");
+    expect(firstRow(host()).origin).toBeUndefined();
+  });
+
+  it("keeps a conflicting host limit and warns about it", () => {
+    const row = firstRow(
+      host(hostModel({ limit: { context: 4096, output: 32_000 } })),
+      catalog(),
+    );
     expect(row.context).toBe(4096);
     expect(row.provenance?.context).toMatchObject({
       source: "unmatched-host",
-      strength: "unmatched",
     });
     expect(row.warnings).toContain(
       "provenance conflict for context; using host value",
     );
   });
 
-  it.each([
-    ["zero", 0],
-    ["negative", -4096],
-    ["fractional", 8192.25],
-    ["unsafe", Number.MAX_SAFE_INTEGER + 2],
-  ])(
-    "does not let a %s host limit override positive exact snapshot evidence",
-    (_label, limit) => {
-      // opencode's provider state normalizes omitted limits to 0. Such host
-      // values are absent, not a conflicting host claim, so the exact
-      // snapshot context (8192, provider-probe) must win without warnings.
-      const providers = host({ limit: { context: limit, output: limit } });
-      const row = collectModelGroups(providers, exact())[0].models[0];
-      expect(row.context).toBe(8192);
-      expect(row.provenance?.context).toMatchObject({
-        source: "provider-probe",
-        strength: "authoritative",
-      });
-      expect(row.warnings ?? []).not.toContain(
-        "provenance conflict for context; using host value",
-      );
-      // Snapshot output is unknown and the host limit is absent: stay unset.
-      expect(row.output).toBeUndefined();
-    },
-  );
-
-  it("surfaces snapshot-only limits when the host omits them entirely", () => {
-    const providers = host({ limit: undefined });
-    const row = collectModelGroups(providers, exact())[0].models[0];
-    expect(row.context).toBe(8192);
-    expect(row.provenance?.context).toMatchObject({
-      source: "provider-probe",
-      strength: "authoritative",
-    });
-  });
-
-  it("uses exact context and output evidence when host limits are invalid", () => {
-    const snapshot = exact();
-    snapshot.snapshot.providers[0].models[0].output = knownScalar(
-      2048,
-      "provider-probe",
-      "authoritative",
+  it("reports capability conflicts in both directions", () => {
+    const hostImage = firstRow(
+      host(
+        hostModel({
+          capabilities: {
+            tools: false,
+            input: ["text", "image"],
+            output: ["text"],
+          },
+        }),
+      ),
+      catalog(),
     );
-    const row = collectModelGroups(
-      host({ limit: { context: 0, output: -1 } }),
-      snapshot,
-    )[0].models[0];
-
-    expect(row.context).toBe(8192);
-    expect(row.output).toBe(2048);
-    expect(row.provenance?.context).toMatchObject({
-      source: "provider-probe",
-      strength: "authoritative",
+    expect(hostImage.inputModalities?.image).toMatchObject({
+      state: "supported",
+      source: "unmatched-host",
     });
-    expect(row.provenance?.output).toMatchObject({
-      source: "provider-probe",
-      strength: "authoritative",
-    });
-    expect(row.warnings).toEqual([]);
-  });
-
-  it("does not promote one model conflict to provider or sibling warnings", () => {
-    const providers = host({ limit: { context: 4096 } });
-    providers[0].models!["atlas-clean"] = {
-      id: "atlas-clean",
-      name: "Atlas Model",
-      limit: { context: 8192 },
-      capabilities: { output: { text: true } },
-    };
-    const snapshot = exact();
-    snapshot.snapshot.providers[0].models.push(evidenceModel("atlas-clean"));
-    const group = collectModelGroups(providers, snapshot)[0];
-    const conflict = group.models.find((model) => model.id === "atlas-model");
-    const clean = group.models.find((model) => model.id === "atlas-clean");
-    expect(conflict?.warnings).toContain(
-      "provenance conflict for context; using host value",
-    );
-    expect(clean?.warnings).not.toContain(
-      "provenance conflict for context; using host value",
-    );
-    expect(group.warnings).not.toContain(
-      "provenance conflict for context; using host value",
+    expect(hostImage.capabilities?.toolCall.state).toBe("unknown");
+    expect(hostImage.warnings).toEqual(
+      expect.arrayContaining([
+        "provenance conflict for image input; using host support",
+        "provenance conflict for toolCall; using host value",
+      ]),
     );
   });
 
-  it("accepts exact snapshot-only diagnostic fields", () => {
-    const row = collectModelGroups(host(), exact())[0].models[0];
-    expect(row).toMatchObject({
-      parameterSize: "8B",
-      quantization: "Q4_K_M",
-      sizeBytes: 4_000_000_000,
-      probeIdentity: "atlas",
-    });
-    const hostOnly = collectModelGroups(host())[0].models[0];
-    expect(hostOnly.parameterSize).toBeUndefined();
-    expect(hostOnly.probeIdentity).toBeUndefined();
-  });
-
-  it("uses exact model type evidence when the host cannot represent embedding type", () => {
-    const embedding = evidenceModel();
-    embedding.modelType = knownScalar(
-      "embedding",
-      "provider-probe",
-      "authoritative",
+  it("lets an authoritative probe type override the host's image-based guess", () => {
+    const row = firstRow(
+      host(
+        hostModel({
+          capabilities: {
+            tools: true,
+            input: ["text", "image"],
+            output: ["text"],
+          },
+        }),
+      ),
+      catalog(),
     );
-    const providers = host({ capabilities: undefined });
-    const row = collectModelGroups(providers, exact(embedding))[0].models[0];
-    expect(row.type).toBe("embedding");
-    expect(row.provenance?.type).toMatchObject({
-      source: "provider-probe",
-      strength: "authoritative",
-    });
-  });
-
-  it("keeps stronger exact model type evidence over host attachment inference", () => {
-    const providers = host({
-      capabilities: { attachment: true, output: { text: true } },
-    });
-    const row = collectModelGroups(providers, exact())[0].models[0];
     expect(row.type).toBe("llm");
     expect(row.warnings).toContain(
       "provenance conflict for type; using provider probe value",
     );
   });
 
-  it("keeps an explicit host model type over conflicting snapshot evidence", () => {
-    const embedding = evidenceModel();
-    embedding.modelType = knownScalar(
-      "embedding",
-      "provider-probe",
-      "authoritative",
-    );
-    const row = toModelRow(
-      "atlas-chat",
-      { id: "atlas-chat", type: "llm" },
-      embedding,
+  it("keeps the host-inferred type over weaker conflicting evidence", () => {
+    const heuristic = evidenceModel("atlas-model", {
+      modelType: knownScalar("vlm", "heuristic", "inferred"),
+    });
+    const row = firstRow(
+      host(),
+      catalog([evidenceProvider({ models: [heuristic] })]),
     );
     expect(row.type).toBe("llm");
     expect(row.warnings).toContain(
@@ -306,188 +252,183 @@ describe("host/snapshot reconciliation", () => {
     );
   });
 
-  it("joins on provider ID plus model ID", () => {
-    const wrongModel = evidenceModel("other-model");
-    const row = collectModelGroups(host(), exact(wrongModel))[0].models[0];
-    expect(row.provenance?.context).toMatchObject({
+  it("derives reasoning support from host variants when evidence is silent", () => {
+    const row = firstRow(
+      host(hostModel({ variants: [{ id: "low" }, { id: "high" }] })),
+      catalog(),
+    );
+    expect(row.capabilities?.reasoning).toMatchObject({
+      state: "supported",
       source: "unmatched-host",
     });
-    expect(row.parameterSize).toBeUndefined();
   });
 
-  it("reports provider attempt and resolved probe metadata", () => {
-    const group = collectModelGroups(host(), exact())[0];
-    expect(group).toMatchObject({
-      status: "ready",
-      configuredProbe: "auto",
-      resolvedProbe: "atlas",
-    });
-  });
-
-  it("fingerprints every base URL path and configured probe without credentials", () => {
-    const providers = host();
-    providers[0].options = {
-      baseURL: "https://user:secret@atlas.test/v1/private?token=secret",
-      probe: "auto",
-    };
-    expect(hostProviderFingerprint(providers)).toBe(
-      createProviderFingerprint([
-        {
-          id: "atlas",
-          baseURL: "https://atlas.test/v1/private",
-          probe: "auto",
-        },
-      ]),
-    );
-  });
-
-  it("includes exact empty providers and npm-only non-v1 host providers", () => {
-    const emptyExact = exact();
-    emptyExact.snapshot.providers[0].status = "empty";
-    emptyExact.snapshot.providers[0].modelListAttempt = "empty";
-    emptyExact.snapshot.providers[0].models = [];
-    const [empty] = collectModelGroups(
-      [
-        {
-          id: "atlas",
-          options: { baseURL: "https://atlas.test/v1" },
-          models: {},
-        },
-      ],
-      emptyExact,
-    );
-    expect(empty).toMatchObject({ status: "empty", models: [] });
-
-    const [npmOnly] = collectModelGroups([
-      {
-        id: "atlas-npm",
-        options: { baseURL: "https://atlas.test/openai" },
-        models: {
-          model: {
-            id: "model",
-            api: { npm: "@ai-sdk/openai-compatible" },
-          },
-        },
-      },
-    ]);
-    expect(npmOnly.id).toBe("atlas-npm");
-  });
-
-  it("keeps all positive exact evidence for a snapshot-only provider", () => {
-    // The provider exists only in the exact snapshot (absent from host
-    // state). Positive evidence — scalar family/parameterSize and supported
-    // capabilities — must reconcile exactly like negatives do.
-    const [group] = collectModelGroups([], exact());
-    expect(group).toMatchObject({
-      id: "atlas",
-      exactProvenance: true,
-      status: "ready",
-    });
-    const row = group.models[0];
+  it("shows evidence-only diagnostics and prefers evidence cost over zero-filled host prices", () => {
+    const row = firstRow(host(), catalog());
     expect(row).toMatchObject({
-      family: "atlas",
       parameterSize: "8B",
       quantization: "Q4_K_M",
       sizeBytes: 4_000_000_000,
-      probeIdentity: "atlas",
+      probeIdentity: "actualyze",
+    });
+    expect(row.cost?.cacheRead).toEqual({ state: "unknown" });
+
+    const hostOnly = firstRow(host());
+    expect(hostOnly.parameterSize).toBeUndefined();
+    expect(hostOnly.cost?.cacheRead).toMatchObject({
+      state: "known",
+      value: 0,
+    });
+  });
+
+  it("joins on provider ID plus model ID", () => {
+    const row = firstRow(
+      host(),
+      catalog([evidenceProvider({ models: [evidenceModel("other-model")] })]),
+    );
+    expect(row.id).toBe("atlas-model");
+    expect(row.parameterSize).toBeUndefined();
+    expect(row.warnings).toContain(
+      "discovery evidence has no record of this model",
+    );
+  });
+
+  it("adds disabled models that only the evidence lists", () => {
+    const embedding = evidenceModel("atlas-embed", {
+      enabled: false,
+      modelType: knownScalar("embedding", "provider-probe", "authoritative"),
+      output: unknownScalar(),
+    });
+    const group = collectModelGroups(
+      host(),
+      catalog([evidenceProvider({ models: [evidenceModel(), embedding] })]),
+    )[0];
+    const row = group?.models.find((model) => model.id === "atlas-embed");
+    expect(row).toMatchObject({
+      enabled: false,
+      type: "embedding",
+      context: 8192,
+      warnings: [],
+    });
+    expect(row?.provenance?.identity).toMatchObject({
+      source: "server-list",
+    });
+  });
+
+  it("flags an enabled evidence model the host does not list yet", () => {
+    const group = collectModelGroups(
+      host(),
+      catalog([
+        evidenceProvider({
+          models: [evidenceModel(), evidenceModel("atlas-late")],
+        }),
+      ]),
+    )[0];
+    expect(
+      group?.models.find((model) => model.id === "atlas-late")?.warnings,
+    ).toContain("not in the host model list yet");
+  });
+});
+
+describe("provider grouping with evidence", () => {
+  it("carries discovery attempts, probe selection, and inventory timing", () => {
+    const failure = {
+      kind: "timeout" as const,
+      at: "2026-10-11T09:00:00.000Z",
+    };
+    const [group] = collectModelGroups(
+      host(),
+      catalog([evidenceProvider({ failure })]),
+    );
+    expect(group).toMatchObject({
+      id: "atlas",
+      provider: "Atlas",
+      endpoint: "https://atlas.test",
+      hasEvidence: true,
+      lastGoodAt: "2026-10-11T08:00:00.000Z",
+      failure,
+      modelListAttempt: "ready",
+      probeAttempt: "complete",
+      configuredProbe: "auto",
+      resolvedProbe: "actualyze",
+      warnings: [],
+    });
+  });
+
+  it("shows evidence providers the host does not list, named by ID", () => {
+    const [group] = collectModelGroups(
+      { providers: [], models: [] },
+      catalog(),
+    );
+    expect(group).toMatchObject({
+      id: "atlas",
+      provider: "atlas",
+      endpoint: "https://atlas.test",
+      hasEvidence: true,
+    });
+    expect(group?.models[0]).toMatchObject({
+      family: "atlas",
       context: 8192,
       type: "llm",
+      flags: ["Tools", "Temp"],
     });
-    expect(row.provenance?.family).toMatchObject({
-      source: "models.dev",
-      strength: "inferred",
-    });
-    expect(row.capabilities?.toolCall).toMatchObject({
-      state: "supported",
-      source: "provider-probe",
-      strength: "authoritative",
-    });
-    expect(row.capabilities?.temperature).toMatchObject({
-      state: "supported",
-      source: "policy-default",
-    });
-    expect(row.capabilities?.vision.state).toBe("unsupported");
-    expect(row.capabilities?.reasoning.state).toBe("unknown");
-    expect(row.flags).toEqual(["Tools", "Temp"]);
-    expect(row.warnings).toEqual([]);
   });
 
-  it("keeps host capability and family values winning over conflicting snapshots", () => {
-    const snapshot = exact();
-    snapshot.snapshot.providers[0].models[0].family = knownScalar(
-      "other-family",
-      "models.dev",
-      "inferred",
+  it("shows an evidence provider even when the host heuristic would skip it", () => {
+    const aliased: HostProvider = { ...atlasProvider, canonical: "openai" };
+    const groups = collectModelGroups(
+      { providers: [aliased], models: [hostModel()] },
+      catalog(),
     );
-    snapshot.snapshot.providers[0].models[0].capabilities.toolCall = {
-      state: "supported",
-      source: "provider-probe",
-      strength: "authoritative",
+    expect(groups.map((group) => group.id)).toEqual(["atlas"]);
+    expect(groups[0]?.provider).toBe("Atlas");
+  });
+
+  it("warns about a provider with an explicit probe missing from the catalog", () => {
+    const probed: HostProvider = {
+      ...atlasProvider,
+      settings: { ...atlasProvider.settings, probe: "auto" },
     };
-    const providers = host({
-      family: "atlas",
-      capabilities: { output: { text: true }, toolcall: false },
+    const groups = collectModelGroups(
+      { providers: [probed], models: [hostModel()] },
+      catalog([]),
+    );
+    expect(groups[0]).toMatchObject({
+      id: "atlas",
+      hasEvidence: false,
+      warnings: ["not in the server's discovery catalog"],
     });
-    const row = collectModelGroups(providers, snapshot)[0].models[0];
-    expect(row.family).toBe("atlas");
-    expect(row.warnings).toContain(
-      "provenance conflict for family; using host value",
-    );
-    // An explicit host false suppresses a supported snapshot claim.
-    expect(row.capabilities?.toolCall.state).toBe("unknown");
-    expect(row.warnings).toContain(
-      "provenance conflict for toolCall; using host value",
-    );
+    expect(groups[0]?.models[0]?.warnings).toEqual([]);
   });
 
-  it("treats either host image capability field as vision support", () => {
-    const row = toModelRow("atlas-vision", {
-      id: "atlas-vision",
-      capabilities: { attachment: false, input: { image: true } },
-    });
-    expect(row.type).toBe("vlm");
-    expect(row.capabilities?.vision.state).toBe("supported");
-  });
-
-  it("keeps server and TUI provider fingerprints invariant", () => {
-    const config = {
-      provider: {
-        atlas: {
-          npm: "@ai-sdk/openai-compatible",
-          options: {
-            baseURL: "https://atlas.test/openai/v2?token=secret",
-            probe: "atlas",
-          },
-        },
-        "atlas-empty": {
-          options: { baseURL: "https://atlas.test/empty", probe: "auto" },
-        },
-        ignored: { options: { baseURL: "" } },
-      },
+  it("does not warn about a provider with an explicit probe before the server resolves its targets", () => {
+    const probed: HostProvider = {
+      ...atlasProvider,
+      settings: { ...atlasProvider.settings, probe: "auto" },
     };
-    const tuiProviders: SdkProviderView[] = [
-      {
-        id: "atlas",
-        options: {
-          baseURL: "https://atlas.test/openai/v2?token=secret",
-          probe: "atlas",
-        },
-        models: {
-          model: {
-            id: "model",
-            api: { npm: "@ai-sdk/openai-compatible" },
-          },
-        },
-      },
-      {
-        id: "atlas-empty",
-        options: { baseURL: "https://atlas.test/empty", probe: "auto" },
-        models: {},
-      },
-      { id: "ignored", options: { baseURL: "" }, models: {} },
-    ];
-    expect(hostProviderFingerprint(tuiProviders)).toBe(
-      createProviderFingerprint(discoverableProviderEntries(config)),
+    const starting: CatalogPayload = {
+      schemaVersion: CATALOG_SCHEMA_VERSION,
+      packageVersion: "2.0.0",
+      status: "pending",
+      providers: [],
+    };
+    const [group] = collectModelGroups(
+      { providers: [probed], models: [hostModel()] },
+      starting,
     );
+    expect(group).toMatchObject({ id: "atlas", hasEvidence: false });
+    expect(group?.warnings).toEqual([]);
+    expect(group?.models[0]?.warnings).toEqual([]);
+  });
+
+  it("lists an auto-eligible provider missing from the catalog without a warning", () => {
+    // Auto-eligibility depends on provider load order the TUI cannot observe,
+    // so absence from the catalog is not evidence of a fault.
+    const groups = collectModelGroups(host(), catalog([]));
+    expect(groups[0]).toMatchObject({
+      id: "atlas",
+      hasEvidence: false,
+      warnings: [],
+    });
   });
 });

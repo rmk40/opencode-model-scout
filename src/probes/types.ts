@@ -24,6 +24,28 @@ export interface ProbeModelMeta {
   family?: string;
   /** Quantization level (e.g., "Q8_0", "4bit") */
   quantization?: string;
+  /**
+   * Authoritative input modalities reported by the provider (Actualyze
+   * `modalities.input`). When present it replaces `vision` for input
+   * mapping; `text` is listed explicitly when supported.
+   */
+  inputModalities?: ProbeInputModality[];
+  /** Prices reported by the provider, USD per million tokens. */
+  cost?: ProbeModelCost;
+}
+
+/** Input modalities a probe can report; matches OpenCode 2 `Model.Info`. */
+export type ProbeInputModality = "text" | "image" | "pdf" | "audio" | "video";
+
+/**
+ * Reported prices in USD per million tokens. Absent cache prices mean
+ * "unknown" (Actualyze omits prices it cannot resolve), not zero.
+ */
+export interface ProbeModelCost {
+  input: number;
+  output: number;
+  cacheRead?: number;
+  cacheWrite?: number;
 }
 
 /**
@@ -54,8 +76,10 @@ export interface ProbeContext {
   modelsResponse?: OpenAIModelEntry[];
   /** Whether discovery selected the probe automatically or explicitly. */
   probeSelection?: "auto" | "explicit";
-  /** Config-hook cancellation signal for probes with external I/O. */
+  /** Discovery cancellation signal for probes with external I/O. */
   signal?: AbortSignal;
+  /** Provider headers to send on probe requests. */
+  headers?: Readonly<Record<string, string>>;
 }
 
 /** Result returned by a provider probe. Keys are model IDs. */
@@ -72,8 +96,8 @@ export interface ProbeResult {
  * - Use probeFetch()/readJson()/readBody() from ./util for all HTTP calls
  *   (handles connection + body-read timeouts and abort)
  * - Never throw — return EMPTY_RESULT from ./util on any error
- * - Never write to stdout/stderr (no console.*) — this runs during opencode's
- *   config hook at startup and must stay silent
+ * - Never write to stdout/stderr (no console.*) — discovery runs inside the
+ *   shared OpenCode service and must stay silent
  */
 export type ProviderProbe = (
   baseURL: string,

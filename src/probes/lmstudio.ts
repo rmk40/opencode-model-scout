@@ -29,10 +29,10 @@ interface LmStudioModel {
 export const probeLmstudio: ProviderProbe = async (
   baseURL: string,
   apiKey?: string,
-  _context?: ProbeContext,
+  context?: ProbeContext,
 ): Promise<ProbeResult> => {
   try {
-    const headers = buildHeaders(apiKey);
+    const headers = buildHeaders(apiKey, context?.headers);
 
     const data = await probeFetchJson<LmStudioModel[]>(
       `${baseURL}/api/v1/models`,

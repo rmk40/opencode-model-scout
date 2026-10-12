@@ -1,4 +1,9 @@
-import type { ProbeModelMeta, ProbeResult, ProviderProbe } from "./types";
+import type {
+  ProbeContext,
+  ProbeModelMeta,
+  ProbeResult,
+  ProviderProbe,
+} from "./types";
 import {
   buildHeaders,
   probeFetchJson,
@@ -27,9 +32,10 @@ interface OmlxStatusResponse {
 export const probeOmlx: ProviderProbe = async (
   baseURL: string,
   apiKey?: string,
+  context?: ProbeContext,
 ): Promise<ProbeResult> => {
   try {
-    const headers = buildHeaders(apiKey);
+    const headers = buildHeaders(apiKey, context?.headers);
 
     const data = await probeFetchJson<OmlxStatusResponse>(
       `${baseURL}/v1/models/status`,

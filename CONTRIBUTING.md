@@ -1,570 +1,15 @@
 # Contributing to opencode-model-scout
 
-## Architecture Overview
-
-The plugin combines a startup discovery pipeline with an interactive TUI
-browser. The source files are organized into these concerns:
-
-```
-src/
-├── constants.ts          # Plugin name, command name
-├── index.ts              # Server plugin entry — config-hook discovery
-├── tui.ts                # TUI plugin entry — /modelscout dialog command
-├── tui-browser.ts        # Grouped model/provider list, facets, and detail views
-├── tui-client-adapter.ts # Pinned SDK server-correlation adapter
-├── tui-models.ts         # Host/snapshot reconciliation + metadata coverage
-├── tui-renderer.ts       # Typed imperative OpenTUI adapter
-├── catalog-snapshot.ts   # Evidence schema + atomic server/TUI snapshot bridge
-├── discover.ts           # Core discovery engine — pipeline orchestrator + table formatter
-├── models-dev.ts         # models.dev fallback matching
-├── format.ts             # Model name + number/byte formatting utilities
-└── probes/
-    ├── types.ts           # ProbeModelMeta, ProbeResult, ProviderProbe, ProbeContext
-    ├── util.ts            # Shared utilities: buildHeaders, probeFetch, EMPTY_RESULT
-    ├── index.ts           # Probe registry + resolveProbe (supports "auto")
-    ├── fingerprint.ts     # Server auto-detection (tiered fingerprinting)
-    ├── atlas.ts           # Atlas probe implementation
-    ├── omlx.ts            # oMLX probe implementation
-    ├── ollama.ts          # Ollama probe implementation
-    ├── vllm.ts            # vLLM probe implementation
-    ├── tgi.ts             # TGI probe implementation
-    ├── sglang.ts          # SGLang probe implementation
-    ├── lmstudio.ts        # LM Studio probe implementation
-    └── koboldcpp.ts       # KoboldCpp probe implementation
-```
-
-### Plugin Lifecycle
-
-```mermaid
-sequenceDiagram
-    participant OC as opencode
-    participant PI as Plugin Init
-    participant DM as discoverModels
-    participant FP as Fingerprint
-    participant PR as Probe
-    participant MD as models.dev
-    participant CS as Catalog Snapshot
-    participant TU as TUI Plugin
-
-    OC->>PI: Load plugin
-    PI->>OC: Return hooks
-    OC->>PI: config hook(config)
-    PI->>CS: Write running marker
-    PI->>MD: fetchModelsDevIndex(client)
-    MD-->>PI: FlatModel[] index
-    PI->>DM: discoverModels(config, index)
-
-    loop Each OpenAI-compatible provider
-        DM->>DM: fetchModels(baseURL)
-        DM->>DM: Categorize by keyword
-        alt probe = explicit name
-            DM->>PR: probe(baseURL, apiKey, context)
-            PR-->>DM: ProbeResult
-        else probe = "auto"
-            DM->>FP: fingerprint(baseURL, apiKey, modelsResponse)
-            FP-->>DM: DetectedServer or undefined
-            opt Server detected
-                DM->>DM: PROBE_MAP lookup
-                DM->>PR: probe(baseURL, apiKey, context)
-                PR-->>DM: ProbeResult
-            end
-        end
-        DM->>DM: applyProbeMeta per model
-        DM->>DM: applyModelsDevMeta per model
-        DM->>DM: Merge into config
-    end
-
-    DM-->>PI: Config + evidence records
-    PI->>CS: Write completed evidence snapshot
-    PI-->>OC: Config enriched
-
-    Note over OC,TU: Later, in the TUI plugin realm...
-    OC->>TU: /modelscout (api.command.register onSelect)
-    TU->>CS: Read exact server/worktree snapshot
-    TU->>TU: Reconcile with api.state.provider
-    TU-->>OC: Grouped list/detail browser, no model turn
-```
-
-### Enrichment Pipeline
-
-Each discovered model passes through three enrichment layers. Each layer only
-sets fields that aren't already present — later layers never overwrite earlier
-ones, and manually configured models are skipped entirely.
-
-```mermaid
-flowchart TD
-    A["GET /v1/models"] --> B["Keyword Categorization"]
-    B --> C{Probe configured?}
-    C -->|Explicit name| D["Provider Probe"]
-    C -->|"auto"| G["Fingerprint Server"]
-    C -->|No| E["models.dev Fallback"]
-    G -->|Detected| H["PROBE_MAP lookup"]
-    G -->|Not detected| E
-    H --> D
-    D --> E
-    E --> F["Enriched Model Config"]
-
-    style A fill:#e8f4fd
-    style D fill:#d4edda
-    style E fill:#fff3cd
-    style F fill:#f0f0f0
-    style G fill:#e8daef
-```
-
-**Layer 1 — Keyword categorization** sets basic model type:
-
-- IDs containing "embed" or "embedding" → categorized as embedding
-- IDs matching known LLM family names (qwen, llama, gemma, etc.) → chat
-- Everything else → unknown
-
-**Layer 2 — Provider probes** (when `options.probe` is set) call
-provider-specific APIs for authoritative metadata:
-
-- Context window and output limit
-- Model type (LLM/VLM/embedding)
-- Capability flags (tools, vision, reasoning)
-- Physical metadata (parameter size, quantization, disk size)
-
-When `"probe": "auto"` is set, the plugin fingerprints the server first
-(see [Server Auto-Detection](#server-auto-detection)) and maps the detected
-server to its probe via `PROBE_MAP`.
-
-**Layer 3 — models.dev fallback** matches model IDs against opencode's built-in
-database of ~4,000 cloud models to infer capabilities:
-
-- Only applies capability flags (tool_call, reasoning, attachment, etc.)
-- Does NOT apply context/output limits (these vary by quantization/provider)
-- Uses 3-tier matching: exact → family+size → family-only
-
-### Data Flow Through `applyProbeMeta`
-
-When a probe returns metadata, `applyProbeMeta()` maps probe fields to opencode
-config fields with specific precedence rules:
-
-```mermaid
-flowchart LR
-    P["Probe metadata"] --> A["applyProbeMeta"]
-    A --> C["Known config fields"]
-    A --> L["Per-field evidence ledger"]
-    C --> M["Merged provider config"]
-    L --> N["Authoritative negatives"]
-    L --> D["Probe-only diagnostics"]
-    L --> S["Catalog snapshot"]
-```
-
-Key rules:
-
-- `limit` is only set if the model doesn't already have one
-- VLM model type → `modalities: { input: ["text", "image"], output: ["text"] }`
-  - `attachment: true`
-- LLM model type → `modalities: { input: ["text"], output: ["text"] }`
-- Capability fields are only set if the model doesn't already have them.
-- Authoritative false values for `tool_call`, `reasoning`, and `attachment`
-  remain internal fallback-denial sentinels. Unknown values remain eligible for
-  fallback. An explicit probe `temperature: false` is preserved because
-  temperature is a valued provider option.
-- Parameter size, quantization, disk size, probe identity, source, and claim
-  strength stay in the evidence snapshot rather than becoming unknown opencode
-  model configuration fields.
-
-### Catalog Evidence Bridge
-
-The config hook and TUI plugin run in separate JavaScript realms within the same
-opencode process in the current host runtime. Discovery keeps a typed evidence
-ledger while it applies the normal config precedence rules, then writes a
-versioned snapshot under the opencode XDG cache. The filename uses SHA-256
-worktree and server keys. The payload stores neither raw worktree paths nor raw
-server URLs. A future host that moves either plugin to another process fails
-closed to host-only browsing because the runtime hashes no longer match.
-
-The local TUI SDK uses the virtual origin `http://opencode.internal`, while the
-server plugin receives an HTTP loopback URL. `createServerKey()` canonicalizes
-the virtual origin plus `localhost`, `127.0.0.1`, and `::1` at any port. Direct
-non-loopback server URLs remain distinct. A separate runtime hash derived from
-`process.pid` distinguishes concurrent local processes without storing a raw
-PID.
-
-Snapshot writes follow a running-marker and completion protocol:
-
-1. The server creates an attempt ID and atomically claims its server/worktree
-   file before discovery. Snapshot and lock writes observe the config-hook
-   abort signal before their atomic rename.
-2. Discovery records provider outcomes and per-field evidence without changing
-   the emitted config contract.
-3. Completion replaces only the running marker owned by the same attempt.
-4. On command open, the TUI validates schema, runtime key, server key, worktree
-   key, provider fingerprint, file size, and both startup bounds before
-   accepting evidence.
-5. Any mismatch falls back to `api.state.provider`; authoritative negatives and
-   probe-only fields are never accepted from an uncorrelated snapshot.
-
-Provider fingerprints cover every provider with a non-empty
-`options.baseURL`. The hash input contains provider ID, configured probe, and a
-credential-free normalized base URL including its path. The snapshot stores
-only the hash. Snapshot locks use a conservative stale threshold longer than
-the maximum 60-second hook budget and retry acquisition once after recovery.
-
-`src/tui-client-adapter.ts` intentionally isolates one pinned generated-SDK
-detail: the runtime client owns a `client.getConfig().baseUrl` property whose
-TypeScript declaration is protected. Shape drift must return `undefined` and
-degrade to host-only browsing rather than throwing.
-
-### Server Auto-Detection
-
-When `"probe": "auto"` is configured, the `fingerprint()` function in
-`src/probes/fingerprint.ts` identifies the server using a tiered strategy:
-
-```mermaid
-flowchart TD
-    A["Start fingerprinting"] --> B["Tier 1: Inspect modelsResponse"]
-    B --> BA{"Any exact atlas<br/>owner?"}
-    BA -->|Yes| RA["atlas"]
-    BA -->|No| B1{"Unanimous owned_by<br/>in OWNED_BY_MAP?"}
-    B1 -->|Yes| R2["Matched server"]
-    B1 -->|No| B2{"Non-standard fields?<br/>aliases, tags, status"}
-    B2 -->|Yes| R1["llamacpp"]
-    B2 -->|No| C["Tier 2: Endpoint probes"]
-    C --> C1{"GET /info<br/>has router field?"}
-    C1 -->|Yes| R3["tgi"]
-    C1 -->|No| C2{"GET /api/v1/models<br/>has key + type fields?"}
-    C2 -->|Yes| R4["lmstudio"]
-    C2 -->|No| D["Tier 3: Low confidence"]
-    D --> D1{"GET / or /api/tags<br/>looks like Ollama?"}
-    D1 -->|Yes| R5["return undefined"]
-    D1 -->|No| R6["return undefined"]
-
-    style B fill:#d4edda
-    style C fill:#fff3cd
-    style D fill:#f8d7da
-```
-
-**Tier 1 -- modelsResponse inspection** (free, no HTTP):
-
-- An exact `owned_by: "atlas"` on any valid entry selects Atlas, including in a
-  mixed catalog. Auto-selected Atlas probing requests details only for that
-  Atlas-owned subset.
-- Other recognized owners must be unanimous across the catalog (`omlx`, `vllm`,
-  `sglang`, `llamacpp`, `koboldcpp`, `library` → `ollama`).
-- If `owned_by` is unknown or mixed, checks for non-standard fields (`aliases`, `tags`, `status`) that indicate llama.cpp
-
-**Tier 2 -- endpoint probes** (sequential HTTP, 2s global timeout):
-
-- `GET /info` with a `router` field → TGI
-- `GET /api/v1/models` with `key` + `type` fields → LM Studio
-
-**Tier 3 -- low confidence** (returns `undefined` silently):
-
-- `GET /` containing "Ollama is running" or `/api/tags` responding with a
-  model list returns `undefined` silently.
-
-Once detected, `PROBE_MAP` maps the server to its probe implementation:
-
-| Detected Server | Probe Used |
-| --------------- | ---------- |
-| atlas           | atlas      |
-| ollama          | ollama     |
-| llamacpp        | ollama     |
-| omlx            | omlx       |
-| lmstudio        | lmstudio   |
-| tgi             | tgi        |
-| sglang          | sglang     |
-| vllm            | vllm       |
-| koboldcpp       | koboldcpp  |
-
-Note that llama.cpp maps to the `ollama` probe because llama.cpp's HTTP server
-implements an Ollama-compatible API.
-
-## Building a New Probe
-
-Probes are the most impactful way to contribute. If you run a local inference
-server that has a metadata API, you can write a probe for it.
-
-### Probe Contract
-
-Every probe must implement the `ProviderProbe` type signature:
-
-```typescript
-type ProviderProbe = (
-  baseURL: string, // Normalized, no trailing /v1
-  apiKey?: string, // From provider options
-  context?: ProbeContext, // Pre-fetched data from the discovery layer
-) => Promise<ProbeResult>;
-
-interface ProbeContext {
-  /** Pre-fetched /v1/models entries, for probes that need them */
-  modelsResponse?: OpenAIModelEntry[];
-  /** Whether discovery selected the probe automatically or explicitly */
-  probeSelection?: "auto" | "explicit";
-  /** Config-hook cancellation signal for probes with external I/O */
-  signal?: AbortSignal;
-}
-
-interface ProbeResult {
-  models: Record<string, ProbeModelMeta>;
-}
-```
-
-The `context` parameter provides data already fetched by the discovery layer.
-Probes can read `context.modelsResponse` to access the `/v1/models` entries
-without making a redundant HTTP call. This is especially useful for probes like
-vLLM and SGLang where the models response already contains non-standard fields
-(e.g., `max_model_len`) with useful metadata.
-
-Probes must follow these rules:
-
-1. **Use `probeFetch()`** from `./util` for all HTTP calls — it handles the
-   connection/headers timeout (2s default) and abort signal composition.
-2. **Read bodies with `readJson()` / `readBody()`** from `./util`, never raw
-   `res.json()` / `res.text()`. The helpers bound the body read with a timeout
-   and cancel the stream; a raw read has no timeout and can hang forever if a
-   server sends headers then stalls the body.
-3. **Never throw** — catch all errors and return `EMPTY_RESULT` from `./util`
-   on failure.
-4. **Never write to stdout/stderr** (no `console.*`). Probes run in opencode's
-   config hook at startup; any output leaks into opencode. Fail silently.
-5. **Leave unknown capabilities undefined.** Return `false` only when the
-   provider reports an authoritative boolean. Discovery keeps tool, reasoning,
-   and attachment negatives as internal fallback-denial sentinels, then removes
-   them before config merge. An explicit temperature false remains a normal
-   valued option.
-
-### Step-by-Step
-
-1. Create `src/probes/yourprovider.ts`:
-
-```typescript
-import type {
-  ProbeModelMeta,
-  ProbeResult,
-  ProbeContext,
-  ProviderProbe,
-} from "./types";
-import { buildHeaders, probeFetch, readJson, EMPTY_RESULT } from "./util";
-
-export const probeYourProvider: ProviderProbe = async (
-  baseURL: string,
-  apiKey?: string,
-  context?: ProbeContext,
-): Promise<ProbeResult> => {
-  try {
-    // Option A: Use context.modelsResponse if the /v1/models response
-    // already contains the metadata you need (e.g., max_model_len)
-    if (context?.modelsResponse) {
-      const models: Record<string, ProbeModelMeta> = {};
-      for (const entry of context.modelsResponse) {
-        models[entry.id] = {
-          context: (entry as Record<string, unknown>).context_window as
-            | number
-            | undefined,
-          temperature: true,
-        };
-      }
-      return { models };
-    }
-
-    // Option B: Call a provider-specific metadata API
-    const headers = buildHeaders(apiKey);
-    const res = await probeFetch(`${baseURL}/your/metadata/endpoint`, {
-      headers,
-    });
-
-    if (!res) return EMPTY_RESULT;
-    if (!res.ok) return EMPTY_RESULT; // degrade silently — no console output
-
-    // Bounded body read (never raw res.json()).
-    const data = await readJson<{ models?: unknown[] }>(res);
-    if (!data) return EMPTY_RESULT;
-    const models: Record<string, ProbeModelMeta> = {};
-
-    // Map response to ProbeModelMeta per model
-    for (const entry of (data.models ?? []) as Record<string, unknown>[]) {
-      models[entry.id as string] = {
-        context: entry.context_window as number | undefined,
-        maxTokens: entry.max_output as number | undefined,
-        modelType: entry.supports_vision ? "vlm" : "llm",
-        vision: entry.supports_vision ? true : undefined,
-        toolCall: entry.supports_tools ? true : undefined,
-        temperature: true,
-      };
-    }
-
-    return { models };
-  } catch {
-    return EMPTY_RESULT; // never throw, never log
-  }
-};
-```
-
-2. Register it in `src/probes/index.ts`:
-
-```typescript
-import { probeYourProvider } from "./yourprovider";
-
-const PROBES: Record<string, ProviderProbe> = {
-  omlx: probeOmlx,
-  ollama: probeOllama,
-  yourprovider: probeYourProvider, // Add this line
-};
-```
-
-3. Write tests in `test/probes/yourprovider.test.ts` — mock `global.fetch`,
-   test success path, error handling, and edge cases. See
-   `test/probes/omlx.test.ts` for a template.
-
-4. Update the README probe documentation.
-
-### ProbeModelMeta Fields
-
-All fields are optional. Set what your provider can report:
-
-| Field           | Type                            | Description                           |
-| --------------- | ------------------------------- | ------------------------------------- |
-| `context`       | `number`                        | Context window in tokens              |
-| `maxTokens`     | `number`                        | Maximum output tokens                 |
-| `modelType`     | `"llm" \| "vlm" \| "embedding"` | Model classification                  |
-| `toolCall`      | `boolean`                       | Supports function/tool calling        |
-| `reasoning`     | `boolean`                       | Supports extended thinking mode       |
-| `temperature`   | `boolean`                       | Supports temperature parameter        |
-| `vision`        | `boolean`                       | Supports image input                  |
-| `loaded`        | `boolean`                       | Currently loaded in memory            |
-| `sizeBytes`     | `number`                        | Model file size on disk               |
-| `parameterSize` | `string`                        | Human-readable param count ("30.5B")  |
-| `family`        | `string`                        | Model family ("qwen3", "llama")       |
-| `quantization`  | `string`                        | Quantization level ("Q4_K_M", "4bit") |
-
-### What Makes a Good Probe
-
-- **Fast** — complete in under 2 seconds even with many models
-- **Parallel** — if per-model calls are needed (like Ollama's `/api/show`),
-  use `Promise.allSettled()` to call them concurrently
-- **Resilient** — partial failures should not prevent other models from being
-  enriched. If one model's metadata call fails, the others should still work.
-- **Accurate** — only report what the provider API confirms. Don't guess
-  capabilities that aren't explicitly reported.
-
-## Adding New Server Fingerprints
-
-If you're adding support for a new server type that should be auto-detected
-via `"probe": "auto"`, you need to update three things in
-`src/probes/fingerprint.ts`:
-
-### 1. Add to `OWNED_BY_MAP` (Tier 1)
-
-If the server sets a distinctive `owned_by` value in its `/v1/models` response,
-add it to the map for free detection with no HTTP overhead:
-
-```typescript
-const OWNED_BY_MAP: Record<string, DetectedServer> = {
-  omlx: "omlx",
-  vllm: "vllm",
-  // ...
-  yourserver: "yourserver", // Add this line
-};
-```
-
-### 2. Add a Tier 2 endpoint probe (if needed)
-
-If the server cannot be identified by `owned_by` alone, add a Tier 2 check
-that probes a server-specific endpoint. Add it to the sequential probe chain
-in the `fingerprint()` function, before the Tier 3 section:
-
-```typescript
-// Step N: GET /your/unique/endpoint → YourServer
-try {
-  const res = await probeFetch(`${baseURL}/your/unique/endpoint`, {
-    headers,
-    signal: combinedSignal,
-    timeoutMs: 1000,
-  });
-  if (res?.ok) {
-    // Bounded body read (never raw res.json()).
-    const data = await readJson<Record<string, unknown>>(res, 1000);
-    if (data && /* response shape is unique to this server */) {
-      return "yourserver";
-    }
-  }
-} catch {
-  // JSON parse failure — continue
-}
-```
-
-### 3. Update `PROBE_MAP`
-
-Map the detected server to the probe implementation that should handle it:
-
-```typescript
-export const PROBE_MAP: Record<DetectedServer, ProbeKey> = {
-  // ...
-  yourserver: "yourserver", // Maps to the probe registered in PROBES
-};
-```
-
-If the new server is API-compatible with an existing probe (like llama.cpp
-using the ollama probe), map it to the existing probe key instead.
-
-### 4. Update types
-
-Add the new server name to both the `DetectedServer` and `ProbeKey` union
-types (if it uses its own probe) at the top of `fingerprint.ts`.
-
-## models.dev Matching
-
-The `src/models-dev.ts` module handles fallback enrichment when no probe is
-available. Understanding its matching logic is important if you're debugging
-why a model did or didn't get capabilities applied.
-
-### Matching Strategy
-
-```mermaid
-flowchart TD
-    A["Local model ID<br/>#quot;qwen3:0.6b#quot;"] --> B["Normalize<br/>#quot;qwen3-0.6b#quot;"]
-    B --> C{"Exact match in<br/>models.dev index?"}
-    C -->|Yes| D["Return metadata"]
-    C -->|No| E["Extract family: #quot;qwen#quot;<br/>Extract size: #quot;0.6b#quot;"]
-    E --> F{"Family + size<br/>match?"}
-    F -->|Yes| D
-    F -->|No| G{"Family-only<br/>match?"}
-    G -->|Yes| D
-    G -->|No| H["No match<br/>return undefined"]
-
-    style D fill:#d4edda
-    style H fill:#f8d7da
-```
-
-**Normalization** strips the owner prefix (`qwen/qwen3-30b` → `qwen3-30b`),
-replaces `:` with `-`, and lowercases.
-
-**Family extraction** takes the leading alphabetic characters: `qwen3` →
-`qwen`, `deepseek-r1` → `deepseek`, `llama-3.2` → `llama`.
-
-**Size extraction** finds the first number+suffix pattern: `qwen3:0.6b` →
-`0.6b`, `qwen3-30b-a3b` → `30b`. Size matching uses word boundaries to
-prevent `4b` from matching inside `14b`.
-
-### What models.dev Applies
-
-Only capability flags — never limits:
-
-| Applied       | NOT applied     |
-| ------------- | --------------- |
-| `tool_call`   | `limit.context` |
-| `reasoning`   | `limit.output`  |
-| `attachment`  | `cost`          |
-| `temperature` |                 |
-| `family`      |                 |
-| `modalities`  |                 |
-
-Context and output limits vary dramatically by quantization level and provider,
-so they can only come from probes.
-
-## Development
-
-### Prerequisites
-
-- Node.js 22+
-- npm
-
-### Setup
+## Prerequisites
+
+- Node.js 22.18 or later. CI runs Node 24. `scripts/live-check.mjs` imports a
+  TypeScript source file directly and needs a Node version that strips types
+  by default.
+- npm.
+- For the live harness only: an installed OpenCode 2 CLI (`opencode`), tested
+  with 2.0.26.
+
+## Setup
 
 ```bash
 git clone https://github.com/rmk40/opencode-model-scout.git
@@ -572,139 +17,530 @@ cd opencode-model-scout
 npm install
 ```
 
-### Commands
+`npm install` also installs the Husky hooks:
+
+- **pre-commit** runs `lint-staged` (ESLint `--fix` and Prettier on staged
+  files).
+- **pre-push** runs `npm run check`.
+
+## Commands
 
 ```bash
-npm run check        # typecheck + lint + format:check + test (CI gate)
-npm run fix          # eslint --fix + prettier --write (auto-fix everything)
-npm run lint         # ESLint only
-npm run lint:fix     # ESLint with auto-fix
-npm run format       # Prettier write
-npm run format:check # Prettier check only
-npm run typecheck    # TypeScript type checking only
-npm run test:run     # Run tests once
-npm run test         # Run tests in watch mode
-npm run compile      # Build dist/ via tsup
-npm run build        # check + compile (full validation + build)
+npm run check         # typecheck, lint, format:check, unit, E2E, compile, check:dist (CI gate)
+npm run test:e2e      # embedded-host E2E lane only
+npm run fix           # eslint --fix + prettier --write
+npm run lint          # ESLint only
+npm run lint:fix      # ESLint with auto-fix
+npm run format        # Prettier write
+npm run format:check  # Prettier check only
+npm run typecheck     # tsc --noEmit
+npm run test          # unit tests in watch mode
+npm run test:run      # unit tests once
+npm run test:coverage # unit tests with coverage
+npm run compile       # tsup → dist/ with type declarations
+npm run compile:dev   # tsup → dist/ without declarations
+npm run check:dist    # fail on runtime @opencode/* or effect imports in dist/
+npm run build         # same as check
 ```
 
-### Git Hooks
+## Testing
 
-Husky hooks run automatically:
+There are two automated lanes, both part of `npm run check`, and one manual
+lane.
 
-- **pre-commit** — `lint-staged` runs ESLint --fix and Prettier on staged files
-- **pre-push** — `npm run check` (full validation gate)
+### Unit tests
 
-### Testing
-
-Tests use [vitest](https://vitest.dev/) with `globals: true`. All network
-calls are mocked via `vi.fn()` on `global.fetch`.
+`npm run test:run` runs every `*.test.ts` under `test/` except `test/e2e/`.
+`test/setup.ts` replaces `global.fetch` with a `vi.fn()` mock for every file,
+so unit tests never reach the network. Mock responses per test:
 
 ```bash
-# Run a specific test file
 npx vitest run test/probes/omlx.test.ts
-
-# Run with coverage
-npm run test:coverage
 ```
 
-### Testing Against Live Providers
+### Embedded-host E2E
 
-If you have oMLX or Ollama running locally, you can verify probe output
-manually:
+`npm run test:e2e` runs `test/e2e/*.e2e.test.ts` with
+`vitest.e2e.config.ts`, which leaves out `test/setup.ts` so `fetch` is real.
+The tests start an in-process OpenCode host through `@opencode/sdk`, load
+`src/server.ts` as a plugin, serve local OpenAI-compatible and Actualyze mocks
+over HTTP, and check the host's own model list and the plugin RPC. They need
+no network access beyond localhost.
+
+### Live harness
+
+`scripts/live-harness.mjs` runs the installed `opencode` against the built
+`dist/` in an isolated scratch tree. It is not shipped and not part of
+`npm run check`. Use it before a release and whenever a change touches how the
+plugin talks to the host.
 
 ```bash
-# oMLX (requires auth)
-curl -s http://localhost:8000/v1/models/status \
-  -H "Authorization: Bearer your-key" | jq .
-
-# Ollama — list models
-curl -s http://localhost:11434/api/tags | jq .
-
-# Ollama — show model details
-curl -s http://localhost:11434/api/show \
-  -d '{"model":"qwen3:0.6b"}' | jq .
+npm run compile:dev                # the harness never builds
+node scripts/live-harness.mjs start
+node scripts/live-check.mjs
+node scripts/live-harness.mjs status
+node scripts/live-harness.mjs stop
 ```
 
-### Project Structure
+`start` writes a project config with `plugins: ["<repo>/dist"]` and a
+`mock-compat` provider backed by a local mock server, then starts
+`opencode serve` on `127.0.0.1`. Every OpenCode process runs under `env -i`
+with `HOME` and the four `XDG_*` variables pointing into the scratch tree, so
+your real config, data, and background service are never touched.
+
+| Variable                  | Purpose                                                                                                    |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `SCOUT_HARNESS_DIR`       | Scratch tree. Defaults to `opencode-model-scout-harness` under the OS temp directory.                      |
+| `ACTUALYZE_BASE_URL`      | Optional Actualyze endpoint, for example `http://localhost:3001/openai/v1`.                                |
+| `ACTUALYZE_API_KEY_FILE`  | File holding an inference-scoped key for that endpoint. The provider is configured only when both are set. |
+| `OPENCODE_BIN`            | The `opencode` executable. Defaults to the first `opencode` on `PATH`.                                     |
+| `SCOUT_HARNESS_PORT`      | Port for `opencode serve`. Defaults to 47931.                                                              |
+| `SCOUT_HARNESS_MOCK_PORT` | Port for the mock server. Defaults to 47932.                                                               |
+
+`live-check.mjs` waits up to 60 seconds for the RPC catalog to report
+`complete`, then checks that the plugin is listed and active, that the
+discovered models carry the expected limits, capabilities, variants, and
+prices (Actualyze expectations come from the endpoint's own `/models` list),
+that the RPC catalog passes the strict validator, and that one plain chat
+request succeeds against the first model in the Actualyze list, without an
+effort variant. Pass `--skip-chat` to skip the chat request or
+`--chat-model <provider/model>` to pick its model.
+
+The scripts print only the fields they check. Never print a raw `model.list`
+or `provider.list` response while debugging: both contain provider settings
+with the plaintext API key.
+
+`scripts/report-actualyze-model-capabilities.mjs` is a separate developer tool
+that reports what an Actualyze endpoint advertises per model.
+
+## Architecture
+
+### Plugin lifecycle
+
+The server half runs inside OpenCode's background service, once per open
+location. The TUI half runs in the terminal client and talks to the server
+half over plugin RPC.
+
+```mermaid
+sequenceDiagram
+    participant OC as OpenCode service
+    participant SV as server.ts setup
+    participant TR as Model transform
+    participant RF as Refresher
+    participant ST as Shared store
+    participant DP as discoverProvider
+    participant TU as TUI plugin
+
+    OC->>SV: setup(ctx)
+    SV->>ST: seed bindings from ctx.storage
+    SV->>OC: register provider and model transforms
+    SV->>OC: register RPC (catalog, refresh)
+    SV->>RF: start() without awaiting
+    SV-->>OC: cleanup function
+    OC->>TR: fold the model catalog
+    TR-->>OC: patches from stored inventories
+    loop Each trigger (startup, events, interval, refresh RPC)
+        RF->>OC: provider.list()
+        RF->>ST: start or join a job per target
+        ST->>DP: discoverProvider(target, signal)
+        DP-->>ST: inventory or failure
+        ST->>OC: persist binding in ctx.storage
+        ST->>RF: binding updated
+        RF->>OC: model.reload()
+        OC->>TR: fold again with the new inventory
+        RF-->>TU: RPC event updated
+    end
+    TU->>OC: /modelscout reads model.list and provider.list
+    TU->>SV: RPC catalog for discovery evidence
+```
+
+### Server half
+
+- **`src/server.ts`** adapts the plugin context for the refresher, loads
+  persisted bindings, registers the two transforms and the RPC handlers, and
+  starts the refresher. It awaits no network I/O.
+- **`src/transform.ts`** holds the provider recorder and the model transform.
+  The recorder stores the provider IDs that exist before config providers
+  load; `eligibleTarget()` uses that set to decide which providers are
+  auto-eligible. The model transform runs in two passes: a pure pass maps
+  each target's inventory to patches inside `try`/`catch`, then a second pass
+  applies them with `editor.update`. Model IDs already in the provider's
+  source record are skipped. A target with `settings.apiKey` is served from
+  its store entry; any other target only through the binding the refresher
+  made active for this instance after resolving its credential.
+- **`src/refresher.ts`** turns host events, the refresh interval, and RPC
+  `refresh` calls into debounced syncs. A sync resolves each target's
+  credential, subscribes to the target's store entry, starts discovery for
+  stale or changed targets, and reloads the catalog when a served binding
+  changes. It also builds the RPC `catalog` payload.
+- **`src/store.ts`** is the process-wide store on `globalThis`. It owns
+  bindings and jobs keyed by the full target fingerprint plus, for a target
+  without `settings.apiKey`, the fingerprint of its resolved credential. It
+  throttles starts to one per minute per target (a job aborted because its
+  last subscriber left does not count), and bumps a generation on
+  invalidation so stale job results are dropped.
+- **`src/discover.ts`** contains `discoverProvider()`, which fetches
+  `/v1/models`, resolves and runs the probe, and returns an inventory, and
+  `toModelInfo()`, the pure mapping from an inventory to `Model.Info` patches
+  and evidence records.
+
+### Enrichment pipeline
+
+```mermaid
+flowchart TD
+    A["GET /v1/models"] --> B{"settings.probe?"}
+    B -->|"probe ID"| D["Provider probe"]
+    B -->|"auto"| G["Fingerprint server"]
+    B -->|"none"| E["Inventory"]
+    G -->|"Detected"| H["PROBE_MAP lookup"]
+    G -->|"Not detected"| E
+    H --> D
+    D --> E
+    E --> M["toModelInfo"]
+    I["models.dev index"] --> M
+    K["Keyword heuristics"] --> M
+    M --> P["Model.Info patches"]
+    M --> V["Evidence for /modelscout"]
+```
+
+`toModelInfo()` resolves each field from the strongest source that has it:
+probe evidence (including authoritative negatives), then a models.dev match,
+then keyword heuristics on the model ID, then OpenCode's defaults. Each value
+is recorded with its source and strength in a `CatalogModelRecord`, which the
+TUI shows as source labels.
+
+Mapping rules worth knowing:
+
+- An unknown output limit is emitted as `0`, which the host reads as
+  "unknown". A known output limit is capped at the known context.
+- Image input is added only on image evidence. Unknown image support stays
+  text-only rather than taking the host's text-and-image default.
+- Reasoning models on an openai-compatible package get `low`, `medium`, and
+  `high` variants with `settings.reasoningEffort`. Actualyze models and
+  embedding models get none.
+- Embedding models are emitted with `enabled: false`.
+- Parameter size, quantization, disk size, and temperature support have no
+  `Model.Info` field. They exist only as evidence.
+
+### models.dev matching
+
+`src/models-dev-index.ts` builds the matcher from `editor.provider.list()`
+inside the model transform. It uses the provider records that existed before
+config providers loaded (models.dev templates and built-ins), minus discovery
+targets and the never-probed providers. The index is memoized on the
+identities of the provider records.
+
+```mermaid
+flowchart TD
+    A["Model ID qwen3:0.6b"] --> B["Normalize to qwen3-0.6b"]
+    B --> C{"Exact match?"}
+    C -->|Yes| D["Use match"]
+    C -->|No| E["Family qwen, size 0.6b"]
+    E --> F{"Family and size match?"}
+    F -->|Yes| D
+    F -->|No| G{"Family match?"}
+    G -->|Yes| D
+    G -->|No| H["No match"]
+```
+
+Normalization strips an owner prefix (`qwen/qwen3-30b` becomes `qwen3-30b`),
+replaces `:` with `-`, and lowercases. The family is the leading run of
+letters. Size matching uses digit boundaries so `4b` does not match inside
+`14b`.
+
+OpenCode normalizes models.dev before plugins see it, so a match can supply
+only these values:
+
+| From a match                                   | Not from a match |
+| ---------------------------------------------- | ---------------- |
+| tool support                                   | context limit    |
+| image, PDF, audio, and video input             | output limit     |
+| family                                         | temperature      |
+| reasoning, when the record has effort variants | prices           |
+
+A match without effort variants leaves reasoning unknown, not unsupported,
+because the host derives variants per provider package.
+
+### Server to TUI
+
+`src/rpc.ts` defines the RPC contract as a plain object:
+
+- `catalog({})` returns the evidence payload defined in
+  `src/catalog-evidence.ts` (schema version 4): status, timestamps, and one
+  record per target provider with its endpoint origin, probe selection, last
+  good inventory time, latest failure, and per-model evidence.
+- `refresh({ providerID? })` starts discovery for one target or all of them
+  and returns `{ accepted, reason? }`. It joins an in-flight job and respects
+  the one-minute floor per target. When nothing starts or joins, `reason` is
+  `throttled` or `no-targets`.
+- The `updated` event carries `{ completedAt }` after a discovery cycle, and
+  after a sync first resolves the targets or changes the bindings they
+  serve. The status is `pending` only until that first sync; with no job
+  running it is `complete` as of the newest served inventory.
+
+The TUI captures one location when the dialog opens and passes it in every
+RPC call. It validates every `catalog` response with
+`validateCatalogPayload()` before use. If the call fails, the browser falls
+back to the host's model and provider lists with a notice.
+
+### Server auto-detection
+
+`fingerprint()` in `src/probes/fingerprint.ts` identifies the server when
+`settings.probe` is `"auto"`:
+
+```mermaid
+flowchart TD
+    A["Start"] --> B["Tier 1: inspect /v1/models entries"]
+    B --> BA{"Any owner actualyze or atlas?"}
+    BA -->|Yes| RA["actualyze"]
+    BA -->|No| B1{"Unanimous owner<br/>in OWNED_BY_MAP?"}
+    B1 -->|Yes| R2["Matched server"]
+    B1 -->|No| B2{"aliases, tags,<br/>or status fields?"}
+    B2 -->|Yes| R1["llamacpp"]
+    B2 -->|No| C["Tier 2: endpoint probes"]
+    C --> C1{"GET /info has router?"}
+    C1 -->|Yes| R3["tgi"]
+    C1 -->|No| C2{"GET /api/v1/models<br/>has key and type?"}
+    C2 -->|Yes| R4["lmstudio"]
+    C2 -->|No| D["Tier 3: Ollama banner or /api/tags"]
+    D --> R5["undefined"]
+```
+
+- **Tier 1** reads the already-fetched model list and makes no requests. An
+  exact `owned_by` of `actualyze` or `atlas` on any entry selects Actualyze,
+  even in a mixed catalog. Other owners (`omlx`, `vllm`, `sglang`,
+  `llamacpp`, `koboldcpp`, and `library` for Ollama) must be unanimous.
+- **Tier 2** probes server-specific endpoints in sequence under a 2-second
+  budget.
+- **Tier 3** recognizes Ollama by its banner or `/api/tags` but returns
+  `undefined`, so an Ollama server without unanimous `library` owners needs an
+  explicit `"probe": "ollama"`.
+
+`PROBE_MAP` maps each detected server to its probe. `llamacpp` maps to the
+`ollama` probe, because llama.cpp serves Ollama-compatible endpoints.
+
+## Adding a Probe
+
+Probes are the most useful contribution: if your inference server has a
+metadata API, a probe makes its models first-class in OpenCode. Read
+[`src/probes/AGENTS.md`](src/probes/AGENTS.md) before you start; it lists the
+rules every probe follows.
+
+### Probe contract
+
+```typescript
+type ProviderProbe = (
+  baseURL: string, // normalized, without a trailing /v1
+  apiKey?: string,
+  context?: ProbeContext,
+) => Promise<ProbeResult>;
+
+interface ProbeContext {
+  /** The /v1/models entries discovery already fetched */
+  modelsResponse?: OpenAIModelEntry[];
+  /** Whether the probe was chosen by auto-detection or named explicitly */
+  probeSelection?: "auto" | "explicit";
+  /** Discovery cancellation signal */
+  signal?: AbortSignal;
+  /** Provider headers to send on every probe request */
+  headers?: Readonly<Record<string, string>>;
+}
+
+interface ProbeResult {
+  models: Record<string, ProbeModelMeta>;
+}
+```
+
+Every probe must:
+
+1. Make HTTP calls with `probeFetch()` from `./util` and pass
+   `context.signal` to it.
+2. Build headers with `buildHeaders(apiKey, context?.headers)`, so the API key
+   and the provider's headers reach the server.
+3. Read bodies with `readJson()` or `readBody()`, never raw `res.json()` or
+   `res.text()`. The helpers bound the body read and cancel the stream.
+4. Never throw. Catch everything and return `EMPTY_RESULT`.
+5. Never write to stdout or stderr. Probes run inside OpenCode's shared
+   background service.
+6. Leave unknown values undefined. Return `false` only when the server
+   reports it; a `false` is authoritative and overrides models.dev.
+
+### Step by step
+
+1. Create `src/probes/yourserver.ts`:
+
+   ```typescript
+   import type { ProbeModelMeta, ProbeResult, ProviderProbe } from "./types";
+   import { buildHeaders, EMPTY_RESULT, probeFetch, readJson } from "./util";
+
+   export const probeYourServer: ProviderProbe = async (
+     baseURL,
+     apiKey,
+     context,
+   ): Promise<ProbeResult> => {
+     try {
+       const res = await probeFetch(`${baseURL}/api/model-info`, {
+         headers: buildHeaders(apiKey, context?.headers),
+         signal: context?.signal,
+       });
+       if (!res) return EMPTY_RESULT;
+       if (!res.ok) return EMPTY_RESULT;
+
+       const data = await readJson<{ models?: unknown[] }>(res);
+       if (!data || !Array.isArray(data.models)) return EMPTY_RESULT;
+
+       const models: Record<string, ProbeModelMeta> = {};
+       for (const raw of data.models) {
+         const entry = raw as Record<string, unknown>;
+         if (typeof entry.id !== "string") continue;
+         models[entry.id] = {
+           context:
+             typeof entry.context_window === "number"
+               ? entry.context_window
+               : undefined,
+           vision: entry.supports_vision === true ? true : undefined,
+           toolCall: entry.supports_tools === true ? true : undefined,
+         };
+       }
+       return { models };
+     } catch {
+       return EMPTY_RESULT;
+     }
+   };
+   ```
+
+   If the server's `/v1/models` entries already carry the metadata (vLLM's
+   `max_model_len`, for example), read `context.modelsResponse` instead of
+   making another request.
+
+2. Register it in `PROBES` in `src/probes/index.ts`. `ProbeKey` derives from
+   that object, so the new ID becomes a valid `settings.probe` value.
+3. For auto-detection, update `src/probes/fingerprint.ts` (see below).
+4. Add `test/probes/yourserver.test.ts`. Mock `fetch` and cover the success
+   path, HTTP errors, malformed bodies, and partial data. The existing probe
+   tests are good templates.
+5. Add the server to the Supported Servers table in `README.md`.
+
+### `ProbeModelMeta` fields
+
+All fields are optional. `discover.ts` runs every probe result through
+`sanitizeProbeMeta()`, which drops values of the wrong type, so a new field
+also needs a line there.
+
+| Field             | Type                                                   | Description                                              |
+| ----------------- | ------------------------------------------------------ | -------------------------------------------------------- |
+| `context`         | `number`                                               | Context window in tokens                                 |
+| `maxTokens`       | `number`                                               | Maximum output tokens                                    |
+| `modelType`       | `"llm" \| "vlm" \| "embedding"`                        | Model classification                                     |
+| `toolCall`        | `boolean`                                              | Tool calling support                                     |
+| `reasoning`       | `boolean`                                              | Reasoning or thinking support                            |
+| `temperature`     | `boolean`                                              | Temperature control support                              |
+| `vision`          | `boolean`                                              | Image input support                                      |
+| `inputModalities` | `("text" \| "image" \| "pdf" \| "audio" \| "video")[]` | Authoritative input list; replaces `vision` when present |
+| `cost`            | `{ input, output, cacheRead?, cacheWrite? }`           | Prices in USD per million tokens                         |
+| `loaded`          | `boolean`                                              | Currently loaded in memory                               |
+| `sizeBytes`       | `number`                                               | Model file size on disk                                  |
+| `parameterSize`   | `string`                                               | Parameter count, such as `"30.5B"`                       |
+| `family`          | `string`                                               | Model family, such as `"qwen3"`                          |
+| `quantization`    | `string`                                               | Quantization level, such as `"Q4_K_M"`                   |
+
+### What makes a good probe
+
+- **Fast.** Finish well inside the discovery budget (15 seconds by default)
+  even with many models.
+- **Parallel and bounded.** For per-model calls, use a bounded worker pool or
+  `Promise.allSettled()`.
+- **Resilient.** One model's failed request must not discard the others.
+- **Accurate.** Report only what the server's API states.
+
+### Adding a server fingerprint
+
+To make a new server detectable with `"probe": "auto"`, edit
+`src/probes/fingerprint.ts`:
+
+1. Add the server to the `DetectedServer` union and to `PROBE_MAP`. Map it to
+   an existing probe key if the server is API-compatible with one.
+2. If the server sets a distinctive `owned_by`, add it to `OWNED_BY_MAP`.
+   That costs no requests.
+3. Otherwise add a Tier 2 check before the Tier 3 section:
+
+   ```typescript
+   // Step N: GET /your/unique/endpoint → yourserver
+   if (combinedSignal.aborted) return undefined;
+   try {
+     const res = await probeFetch(`${baseURL}/your/unique/endpoint`, {
+       headers,
+       signal: combinedSignal,
+       timeoutMs: 1000,
+     });
+     if (res?.ok) {
+       const data = await readJson<Record<string, unknown>>(res, 1000);
+       if (data && typeof data.server_name === "string") return "yourserver";
+     }
+   } catch {
+     // Malformed body; continue with the next check.
+   }
+   ```
+
+4. Add cases to `test/probes/fingerprint.test.ts`.
+
+## Project Structure
 
 ```
 opencode-model-scout/
 ├── src/
-│   ├── constants.ts       # Single source of truth for all naming strings
-│   ├── index.ts            # Server plugin entry — config-hook discovery
-│   ├── tui.ts              # TUI plugin entry — /modelscout dialog command
-│   ├── tui-browser.ts      # Interactive browser + facets + keyboard flow
-│   ├── tui-client-adapter.ts # Pinned SDK correlation boundary
-│   ├── tui-models.ts       # Host/snapshot reconciliation + coverage
-│   ├── tui-renderer.ts     # Typed imperative OpenTUI adapter
-│   ├── catalog-snapshot.ts # Evidence schema + persistence
-│   ├── discover.ts         # Pipeline orchestrator + table formatter (largest file)
-│   ├── models-dev.ts       # models.dev index + matching
-│   ├── format.ts           # Model name + number/byte prettification
+│   ├── server.ts             # Server plugin entry
+│   ├── refresher.ts          # Triggers, sync, refresh interval, RPC catalog
+│   ├── store.ts              # Shared discovery store and fingerprints
+│   ├── transform.ts          # Provider recorder, eligibility, model transform
+│   ├── discover.ts           # discoverProvider and toModelInfo
+│   ├── models-dev-index.ts   # models.dev matcher
+│   ├── catalog-evidence.ts   # Evidence schema and validator
+│   ├── rpc.ts                # RPC contract
+│   ├── tui.ts                # TUI plugin entry and /modelscout dialog
+│   ├── tui-browser.ts        # Browser state, keys, rendering
+│   ├── tui-models.ts         # Host and evidence reconciliation
+│   ├── tui-renderer.ts       # Imperative OpenTUI adapter
+│   ├── format.ts             # Name, count, and byte formatting
+│   ├── constants.ts          # IDs and shared constant sets
 │   └── probes/
-│       ├── types.ts         # Shared types (ProbeModelMeta, ProbeContext)
-│       ├── util.ts          # Shared probe utilities
-│       ├── index.ts         # Registry + resolveProbe (supports "auto")
-│       ├── fingerprint.ts   # Server auto-detection (tiered)
-│       ├── atlas.ts         # Atlas probe
-│       ├── omlx.ts          # oMLX probe
-│       ├── ollama.ts        # Ollama probe
-│       ├── vllm.ts          # vLLM probe
-│       ├── tgi.ts           # TGI probe
-│       ├── sglang.ts        # SGLang probe
-│       ├── lmstudio.ts      # LM Studio probe
-│       └── koboldcpp.ts     # KoboldCpp probe
+│       ├── AGENTS.md         # Probe rules
+│       ├── types.ts          # ProbeModelMeta, ProbeContext, ProviderProbe
+│       ├── util.ts           # probeFetch, readJson, buildHeaders, EMPTY_RESULT
+│       ├── index.ts          # Registry and resolveProbe
+│       ├── fingerprint.ts    # Auto-detection
+│       ├── actualyze.ts
+│       ├── omlx.ts
+│       ├── ollama.ts
+│       ├── vllm.ts
+│       ├── tgi.ts
+│       ├── sglang.ts
+│       ├── lmstudio.ts
+│       └── koboldcpp.ts
 ├── test/
-│   ├── probes/
-│   │   ├── atlas.test.ts
-│   │   ├── omlx.test.ts
-│   │   ├── ollama.test.ts
-│   │   ├── fingerprint.test.ts
-│   │   ├── vllm.test.ts
-│   │   ├── tgi.test.ts
-│   │   ├── sglang.test.ts
-│   │   ├── lmstudio.test.ts
-│   │   ├── koboldcpp.test.ts
-│   │   └── util.test.ts
-│   ├── discover.test.ts
-│   ├── format.test.ts
-│   ├── format-table.test.ts
-│   ├── tui.test.ts
-│   ├── tui-browser.test.ts
-│   ├── tui-client-adapter.test.ts
-│   ├── tui-models.test.ts
-│   ├── tui-renderer.test.ts
-│   ├── catalog-snapshot.test.ts
-│   └── models-dev.test.ts
-├── package.json
-├── tsconfig.json
-├── vitest.config.ts
+│   ├── setup.ts              # Global fetch mock for unit tests
+│   ├── probes/               # One test file per probe, plus registry and headers
+│   ├── e2e/                  # Embedded-host tests
+│   └── *.test.ts             # Server, transform, store, TUI, and format tests
+├── scripts/
+│   ├── check-dist.mjs
+│   ├── live-harness.mjs
+│   ├── live-check.mjs
+│   └── report-actualyze-model-capabilities.mjs
+├── tsup.config.ts            # Builds a flat dist/ (server.js, tui.js, rpc.js)
+├── vitest.config.ts          # Unit lane
+├── vitest.e2e.config.ts      # E2E lane
 ├── eslint.config.js
-├── .prettierignore
 ├── .husky/
-│   ├── pre-commit
-│   └── pre-push
-├── .github/workflows/
-│   ├── release.yml          # Tag → check + compile + npm publish + GitHub Release
-│   └── latest.yml           # Main push → check + rolling snapshot release
-├── AGENTS.md
-├── README.md
-├── CONTRIBUTING.md
-└── LICENSE
+└── .github/workflows/
+    ├── release.yml           # Tag → check, compile, npm publish, GitHub Release
+    └── latest.yml            # Push to main → check and rolling snapshot release
 ```
 
-### Naming Convention
+All naming strings live in `src/constants.ts`. `PLUGIN_ID` must stay
+identical for the server half, the TUI half, and the RPC contract.
 
-All naming strings (plugin name, command name) are defined in
-`src/constants.ts`. If the plugin needs to be renamed, only that file changes:
-
-```typescript
-export const PLUGIN_NAME = "opencode-model-scout";
-export const COMMAND_NAME = "modelscout";
-```
-
-### Commit Style
+## Commit Messages
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/):
 
@@ -712,5 +548,11 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/):
 feat: add LM Studio probe
 fix: size matching false-positive on 4b/14b
 docs: update probe comparison table
-test: add coverage for empty model list
+test: cover an empty model list
 ```
+
+## Pull Requests
+
+Run `npm run check` before opening a pull request. For
+changes to discovery, the transforms, or the TUI, also run the live harness
+and say in the pull request which checks you ran.
