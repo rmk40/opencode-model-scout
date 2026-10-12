@@ -6,8 +6,9 @@
 //
 // Expected Actualyze values are derived from the endpoint's own /models list,
 // fetched at check time with ACTUALYZE_API_KEY_FILE (see live-harness.mjs).
-// The chat check sends one plain prompt to --chat-model, or else to the first
-// listed Actualyze model.
+// Without that file the checks expect the built-in `actualyze` provider to be
+// hidden. The chat check sends one plain prompt to --chat-model, or else to
+// the first listed Actualyze model.
 //
 // Prints only the fields it checks and PASS/FAIL. It never prints a raw
 // model.list or provider.list response: both carry the plaintext apiKey.
@@ -19,10 +20,12 @@
 // version that strips TypeScript types by default (22.18+ or 23.6+).
 
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
 import { validateCatalogPayload } from "../src/catalog-evidence.ts";
 import {
-  ACTUALYZE_API_KEY_FILE,
+  ACTUALYZE_BASE_URL as BUILT_IN_BASE_URL,
+  ACTUALYZE_INTEGRATION_ID,
+} from "../src/constants.ts";
+import {
   ACTUALYZE_BASE_URL,
   ACTUALYZE_ENABLED,
   ACTUALYZE_PROVIDER,
@@ -31,11 +34,13 @@ import {
   api,
   envArgv,
   isolatedEnv,
+  readActualyzeKey,
   readState,
 } from "./live-harness.mjs";
 
 const PLUGIN_ID = "opencode-model-scout";
 const ACTUALYZE = ACTUALYZE_PROVIDER;
+const ACTUALYZE_ENDPOINT = ACTUALYZE_BASE_URL ?? BUILT_IN_BASE_URL;
 const MOCK = "mock-compat";
 
 const args = process.argv.slice(2);
@@ -48,15 +53,11 @@ const chatModelArg = chatModelIndex >= 0 ? args[chatModelIndex + 1] : undefined;
  * Resolves to `{ list }` or `{ failure }`, where `failure` is a fixed category.
  */
 async function fetchActualyzeList() {
-  let key;
-  try {
-    key = (await readFile(ACTUALYZE_API_KEY_FILE, "utf8")).trim();
-  } catch {
-    return { failure: "key file unreadable" };
-  }
+  const key = await readActualyzeKey();
+  if (!key) return { failure: "key file unreadable or empty" };
   let response;
   try {
-    response = await fetch(`${ACTUALYZE_BASE_URL}/models`, {
+    response = await fetch(`${ACTUALYZE_ENDPOINT}/models`, {
       headers: { authorization: `Bearer ${key}` },
       signal: AbortSignal.timeout(30_000),
     });
@@ -187,6 +188,73 @@ async function checkPlugins(state) {
   }
 }
 
+/**
+ * The built-in provider is listed only with a key. With one, its key must
+ * come from the integration (no `settings.apiKey`), and the endpoint is the
+ * configured override or the built-in one.
+ */
+async function checkActualyzeProvider(state) {
+  console.log("== provider.list");
+  const { status, json } = await api(state, "GET", "/api/provider");
+  if (!check("provider.list HTTP 200", status === 200, `(HTTP ${status})`))
+    return;
+  const provider = (Array.isArray(json?.data) ? json.data : []).find(
+    (entry) => entry?.id === ACTUALYZE,
+  );
+  if (!ACTUALYZE_ENABLED) {
+    check(`${ACTUALYZE} hidden without a key`, provider === undefined);
+    return;
+  }
+  if (!check(`${ACTUALYZE} listed`, provider !== undefined)) return;
+  equalField(
+    `${ACTUALYZE} integrationID`,
+    provider.integrationID,
+    ACTUALYZE_INTEGRATION_ID,
+  );
+  equalField(
+    `${ACTUALYZE} settings.baseURL`,
+    provider.settings?.baseURL,
+    ACTUALYZE_ENDPOINT,
+  );
+  equalField(
+    `${ACTUALYZE} settings.probe`,
+    provider.settings?.probe,
+    "actualyze",
+  );
+  check(
+    `${ACTUALYZE} has no settings.apiKey`,
+    provider.settings?.apiKey === undefined,
+  );
+}
+
+/**
+ * `/connect` offers exactly one Actualyze integration, the one the provider
+ * reads its key from, even when config has a `providers.actualyze` entry. It
+ * has a connection only when the harness passed a key.
+ */
+async function checkActualyzeIntegration(state) {
+  console.log("== integration.list");
+  const { status, json } = await api(state, "GET", "/api/integration");
+  if (!check("integration.list HTTP 200", status === 200, `(HTTP ${status})`))
+    return;
+  const listed = (Array.isArray(json?.data) ? json.data : []).filter(
+    (entry) =>
+      entry?.id === ACTUALYZE_INTEGRATION_ID ||
+      String(entry?.name).toLowerCase() === "actualyze",
+  );
+  equalField(
+    "one Actualyze integration",
+    listed.map((entry) => entry.id),
+    [ACTUALYZE_INTEGRATION_ID],
+  );
+  const connected = (listed[0]?.connections?.length ?? 0) > 0;
+  equalField(
+    `${ACTUALYZE_INTEGRATION_ID} connected`,
+    connected,
+    ACTUALYZE_ENABLED,
+  );
+}
+
 async function checkModels(state) {
   console.log("== model.list");
   const listed = actualyzeList ?? [];
@@ -213,6 +281,8 @@ async function checkModels(state) {
     .filter((id) => !listed.some((entry) => entry.id === id));
   if (actualyzeList) {
     equalField(`${ACTUALYZE} has no unexpected models`, extra, []);
+  } else if (!ACTUALYZE_ENABLED) {
+    equalField(`${ACTUALYZE} has no models without a key`, extra, []);
   }
 
   for (const entry of MOCK_MODELS) {
@@ -294,6 +364,8 @@ async function checkRpc(state) {
     equalField(`${id} model evidence count`, provider.models.length, count);
   }
   const actualyze = payload.providers.find((entry) => entry.id === ACTUALYZE);
+  if (!ACTUALYZE_ENABLED)
+    check(`catalog has no evidence for ${ACTUALYZE}`, actualyze === undefined);
   if (actualyze) {
     equalField(
       `${ACTUALYZE} resolvedProbe`,
@@ -379,10 +451,18 @@ if (ACTUALYZE_ENABLED) {
   if (check("fetch Actualyze /models", failure === undefined, `(${failure})`))
     actualyzeList = list;
 } else {
-  console.log("note: Actualyze checks skipped (ACTUALYZE_* not set)");
+  console.log(
+    "note: ACTUALYZE_API_KEY_FILE not set; checking that Actualyze stays hidden",
+  );
 }
 await waitForCatalog(state);
-for (const step of [checkPlugins, checkModels, checkRpc]) {
+for (const step of [
+  checkPlugins,
+  checkActualyzeIntegration,
+  checkActualyzeProvider,
+  checkModels,
+  checkRpc,
+]) {
   try {
     await step(state);
   } catch {

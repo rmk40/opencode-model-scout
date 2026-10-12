@@ -1,10 +1,11 @@
 /**
  * Synchronous catalog transforms.
  *
- * - The provider transform only records which provider IDs exist when it
- *   runs. External plugins run before the config provider plugin, so this
- *   set holds models.dev templates, built-ins, and earlier plugins'
- *   providers, but not config-only providers.
+ * - The provider transform records which provider IDs exist when it runs,
+ *   then adds the built-in Actualyze provider. External plugins run before
+ *   the config provider plugin, so the recorded set holds models.dev
+ *   templates, built-ins, and earlier plugins' providers, but not
+ *   config-only providers.
  * - The model transform adds scout's discovered models. It runs in two
  *   passes: a pure pass computes every patch inside `try`/`catch`, and only
  *   then are the patches applied with `editor.update`. Editor updates
@@ -16,6 +17,7 @@
  * host can abandon a candidate and restart the fold.
  */
 import type { Plugin } from "@opencode/plugin";
+import { addActualyzeProvider } from "./actualyze";
 import {
   NEVER_PROBED_PROVIDER_IDS,
   OPENAI_COMPATIBLE_PACKAGES,
@@ -33,12 +35,7 @@ import {
   type ModelsDevIndex,
   type SourceRecordLike,
 } from "./models-dev-index";
-import {
-  targetKeys,
-  type Binding,
-  type DiscoveryStore,
-  type TargetKeys,
-} from "./store";
+import { targetKeys, type Binding, type TargetKeys } from "./store";
 import type { ProviderInventory } from "./discover";
 
 type ModelTransform = Plugin.Context["model"]["transform"];
@@ -152,8 +149,9 @@ export interface TransformState {
   /** Provider IDs present when the provider transform last ran. */
   recorded: ReadonlySet<string> | undefined;
   /**
-   * The binding each target provider last served, kept so a probe-only
-   * settings edit keeps serving until rediscovery lands.
+   * The binding each target provider serves, set by the refresher once it
+   * has resolved the target's credential. It stays across a probe-only
+   * settings edit until rediscovery lands.
    */
   readonly active: Map<string, Binding>;
   /** Replaced on every model fold. */
@@ -165,29 +163,30 @@ export function createTransformState(): TransformState {
 }
 
 /**
- * The binding to serve for a target. A target with `settings.apiKey` is
- * served from the store entry for its current key. Any other target depends
- * on a credential only the refresher can resolve, so it is served only
- * through the instance's active binding, which the refresher sets after
- * resolving this instance's credential. The active binding is also what
- * keeps serving while only the probe selection changed.
+ * The binding to serve for a target: the instance's active binding, while
+ * its endpoint still matches. Which credential a target discovers with
+ * depends on the integration's connection, which only the refresher can
+ * look up, so even a target with `settings.apiKey` is served only after the
+ * refresher has resolved its credential and set the active binding. The
+ * active binding is also what keeps serving while only the probe selection
+ * changed.
  */
 export function servedBinding(
   target: EligibleTarget,
   state: TransformState,
-  store: DiscoveryStore,
 ): Binding | undefined {
-  if (target.apiKey) {
-    const current = store.served(target.keys.key);
-    if (current) return current;
-  }
   const active = state.active.get(target.providerID);
   return active && active.endpointKey === target.keys.endpointKey
     ? active
     : undefined;
 }
 
-export function createProviderRecorder(
+/**
+ * Record the provider IDs present before this transform, then add the
+ * built-in Actualyze provider. Recording comes first so the added provider
+ * never counts as pre-existing; it is a target through `settings.probe`.
+ */
+export function createProviderTransform(
   state: TransformState,
 ): (editor: ProviderEditor) => void {
   return (editor) => {
@@ -198,6 +197,7 @@ export function createProviderRecorder(
     } catch {
       state.recorded = undefined;
     }
+    addActualyzeProvider(editor);
   };
 }
 
@@ -257,7 +257,6 @@ function indexRecords(
 
 export function createModelTransform(
   state: TransformState,
-  store: DiscoveryStore,
 ): (editor: ModelEditor) => void {
   const indexCache = createModelsDevIndexCache();
   return (editor) => {
@@ -296,7 +295,7 @@ export function createModelTransform(
         return index;
       };
       for (const { target, declared } of targets) {
-        const binding = servedBinding(target, state, store);
+        const binding = servedBinding(target, state);
         if (!binding) {
           view.set(target.providerID, { declared, mapped: [], failed: false });
           continue;

@@ -177,7 +177,7 @@ export interface Refresher {
  */
 interface TargetState extends EligibleTarget {
   readonly credential: CredentialFingerprint;
-  /** The key used for discovery: `settings.apiKey` or the integration key. */
+  /** The key used for discovery: the integration key or `settings.apiKey`. */
   readonly discoveryKey?: string;
 }
 
@@ -431,7 +431,7 @@ export function createRefresher(deps: RefresherDeps): Refresher {
     for (const target of targets.values())
       newest = latest(
         newest,
-        servedBinding(target, state, store)?.inventory.completedAt,
+        servedBinding(target, state)?.inventory.completedAt,
       );
     return newest;
   };
@@ -443,7 +443,7 @@ export function createRefresher(deps: RefresherDeps): Refresher {
   const servedSignature = (): string =>
     [...targets.values()]
       .map((target) => {
-        const binding = servedBinding(target, state, store);
+        const binding = servedBinding(target, state);
         return [
           target.providerID,
           target.keys.key,
@@ -592,31 +592,41 @@ export function createRefresher(deps: RefresherDeps): Refresher {
   });
 
   /**
-   * Resolve the credential a target discovers with. A failed lookup says
-   * nothing about the credential, so it keeps the previous resolution for
-   * the same integration, or leaves the target out of this sync when there
-   * is none; treating it as "no credential" would drop a good binding and
-   * rediscover without a key. A credential switch removes the previous
-   * resolution, so a lookup that fails after a switch leaves the target out.
+   * Resolve the credential a target discovers with, in the order the host
+   * uses for inference: the integration's active connection, then
+   * `settings.apiKey`, then no key.
+   *
+   * A failed lookup says nothing about the connection. It keeps the
+   * previous integration or keyless resolution for the same integration;
+   * otherwise it falls back to `settings.apiKey`, or leaves the target out
+   * of this sync when there is none. Treating it as "no connection" would
+   * drop a good binding and rediscover with another key or none. A
+   * credential switch removes the previous resolution, so a lookup that
+   * fails after a switch does not reuse the previous account.
    */
   const resolveTarget = async (
     target: EligibleTarget,
   ): Promise<TargetState | undefined> => {
-    if (target.apiKey) return withCredential(target, "settings", target.apiKey);
     let credential: ActiveCredential | undefined;
     try {
       credential = await host.activeCredential(target.integrationID);
     } catch {
       const previous = targets.get(target.providerID);
-      if (
-        !previous ||
-        previous.credential === "settings" ||
-        previous.integrationID !== target.integrationID
-      )
-        return undefined;
-      return withCredential(target, previous.credential, previous.discoveryKey);
+      const kept =
+        previous?.integrationID === target.integrationID &&
+        previous.credential !== "settings"
+          ? previous
+          : undefined;
+      if (kept && (kept.credential !== "none" || !target.apiKey))
+        return withCredential(target, kept.credential, kept.discoveryKey);
+      if (target.apiKey)
+        return withCredential(target, "settings", target.apiKey);
+      return undefined;
     }
-    if (!credential) return withCredential(target, "none", undefined);
+    if (!credential)
+      return target.apiKey
+        ? withCredential(target, "settings", target.apiKey)
+        : withCredential(target, "none", undefined);
     return withCredential(
       target,
       `integration:${fingerprint(
@@ -646,13 +656,11 @@ export function createRefresher(deps: RefresherDeps): Refresher {
       }
     }
     // A switch during this sync may have come after a lookup returned the
-    // previous account, so integration resolutions it covers are dropped;
-    // the switch scheduled another sync to resolve them again.
+    // previous account, or no connection, so every resolution it covers is
+    // dropped; the switch scheduled another sync to resolve them again.
     const resolved = (await Promise.all(eligible.map(resolveTarget))).filter(
       (target): target is TargetState =>
-        target !== undefined &&
-        (target.credential === "settings" ||
-          lastSwitch(target.integrationID) <= epoch),
+        target !== undefined && lastSwitch(target.integrationID) <= epoch,
     );
     if (disposed) return;
 
@@ -737,19 +745,23 @@ export function createRefresher(deps: RefresherDeps): Refresher {
     if (disposed || !TRIGGER_EVENTS.has(event.type)) return;
     if (!sameLocation(event.location, host.location)) return;
     if (event.type === "credential.switched") {
-      // Each affected target's resolution belongs to the previous account.
-      // Revoking it and leaving its store key means the target serves
-      // nothing until a sync resolves the new credential, and a failed
-      // lookup has no resolution to fall back to. Store entries stay: each
-      // is keyed by the credential that produced it, other locations may
-      // still use that credential, and a job is aborted only when its last
-      // subscriber leaves.
+      // Each affected target's resolution belongs to the previous account,
+      // or, for a `settings.apiKey` or keyless resolution, to a time when
+      // the integration had no connection; a newly connected key takes
+      // precedence over both. Revoking it and leaving its store key means
+      // the target serves nothing until a sync resolves the current
+      // connection, and a failed lookup has no integration resolution to
+      // fall back to. Store entries stay: each is keyed by the credential
+      // that produced it, other locations may still use that credential,
+      // and a job is aborted only when its last subscriber leaves.
+      // `credential.updated` carries no integration and only triggers a
+      // sync; the host also publishes `credential.switched` whenever an
+      // integration's active credential changes, including the first one.
       const integrationID = switchedIntegration(event.data);
       switches += 1;
       switchedAt.set(integrationID, switches);
       let dropped = false;
       for (const target of [...targets.values()]) {
-        if (target.credential === "settings") continue;
         if (
           integrationID !== undefined &&
           target.integrationID !== integrationID
@@ -810,7 +822,7 @@ export function createRefresher(deps: RefresherDeps): Refresher {
 
   const providerRecord = (target: TargetState): CatalogProviderRecord => {
     const entry = store.state(target.keys.key);
-    const binding = servedBinding(target, state, store);
+    const binding = servedBinding(target, state);
     const view = state.view.get(target.providerID);
     const inventory = binding?.inventory;
     const declared = view?.declared ?? new Set<string>();

@@ -115,6 +115,7 @@ beforeAll(async () => {
   for (const key of Object.keys(process.env)) {
     if (key.startsWith("OPENCODE")) delete process.env[key];
   }
+  delete process.env.ACTUALYZE_API_KEY;
   process.env.HOME = path.join(root, "home");
   process.env.XDG_CONFIG_HOME = path.join(root, "config");
   process.env.XDG_DATA_HOME = path.join(root, "data");
@@ -288,6 +289,44 @@ describe("server plugin in an embedded host", () => {
     ).toBe("pre-existing");
     expect(JSON.stringify(output)).not.toContain("compat-secret-key");
     expect(JSON.stringify(output)).not.toContain(ALIAS_KEY);
+  });
+
+  it("keeps the built-in Actualyze provider hidden without a key", async () => {
+    await findModel(COMPAT, "mock-llama-3.1-8b");
+    const providers = (await host!.provider.list({ location: location() }))
+      .data;
+    expect(providers.some((provider) => provider.id === "actualyze")).toBe(
+      false,
+    );
+    expect(
+      (await models()).some((model) => model.providerID === "actualyze"),
+    ).toBe(false);
+  });
+
+  it("offers one Actualyze integration, for a key or the environment", async () => {
+    const listed = (await host!.integration.list({ location: location() }))
+      .data;
+    expect(
+      listed
+        .filter((entry) => entry.name === "Actualyze")
+        .map((entry) => entry.id),
+    ).toEqual(["actualyze"]);
+    const integration = (
+      await host!.integration.get({
+        integrationID: "actualyze",
+        location: location(),
+      })
+    ).data;
+    expect(integration).toMatchObject({
+      name: "Actualyze",
+      connections: [],
+    });
+    expect(integration.methods).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "key" }),
+        expect.objectContaining({ type: "env", names: ["ACTUALYZE_API_KEY"] }),
+      ]),
+    );
   });
 
   it("declines a refresh for a provider that is not a target", async () => {

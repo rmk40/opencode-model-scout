@@ -2,9 +2,10 @@
  * OpenCode 2 server plugin entry (`./server`).
  *
  * `setup` reads persisted bindings (local storage only), registers the
- * provider and model transforms and the RPC contract, and starts the
- * refresher without awaiting any network I/O: plugins activate one at a
- * time, so an awaited fetch here would delay every later plugin.
+ * Actualyze integration, the provider and model transforms, and the RPC
+ * contract, and starts the refresher without awaiting any network I/O:
+ * plugins activate one at a time, so an awaited fetch here would delay
+ * every later plugin.
  *
  * All `@opencode/*` imports must stay type-only, because the host throws if
  * a plugin loads `@opencode/plugin` or `effect` from its own `node_modules`.
@@ -24,9 +25,10 @@ import {
   type RefresherHost,
 } from "./refresher";
 import { sharedStore } from "./store";
+import { registerActualyzeIntegration } from "./actualyze";
 import {
   createModelTransform,
-  createProviderRecorder,
+  createProviderTransform,
   createTransformState,
 } from "./transform";
 
@@ -87,8 +89,9 @@ const plugin = {
       // Storage is a startup cache; discovery repopulates it.
     }
 
-    await context.provider.transform(createProviderRecorder(state));
-    await context.model.transform(createModelTransform(state, store));
+    await context.integration.transform(registerActualyzeIntegration);
+    await context.provider.transform(createProviderTransform(state));
+    await context.model.transform(createModelTransform(state));
 
     // The RPC registration, which emits events, exists only after the
     // refresher its handlers call into.

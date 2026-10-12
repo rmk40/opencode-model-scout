@@ -125,6 +125,13 @@ describe("credentialKeys", () => {
   it("keeps the endpoint key the synchronous transform compares against", () => {
     expect(credentialKeys(base, accountA).endpointKey).toBe(base.endpointKey);
   });
+
+  it("separates a target with settings.apiKey resolved to that key from the same target resolved to its integration", () => {
+    const withKey = targetKeys(identity);
+    expect(credentialKeys(withKey, accountA).key).not.toBe(
+      credentialKeys(withKey, "settings").key,
+    );
+  });
 });
 
 describe("jobs", () => {

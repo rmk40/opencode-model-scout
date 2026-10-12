@@ -16,11 +16,37 @@ still on OpenCode 1, see [Using OpenCode 1](#using-opencode-1).
 
 ## Quick Start
 
+### With Actualyze
+
+Actualyze needs no provider config. The plugin adds an `actualyze` provider
+for `https://app.actualyze.ai/openai/v1`, and it appears as soon as OpenCode
+has your API key.
+
 1. Install the plugin:
 
    ```bash
    opencode plugin add opencode-model-scout
    ```
+
+2. Add your Actualyze API key in one of these ways:
+   - In the TUI, run `/connect` and pick **Actualyze**.
+   - From a shell, run `opencode auth login actualyze`.
+   - Set `ACTUALYZE_API_KEY` on the background service and restart it:
+
+     ```bash
+     opencode service set env ACTUALYZE_API_KEY <key>
+     opencode service restart
+     ```
+
+     The service does not see variables exported in your shell (see
+     [The background service](#the-background-service-and-environment-variables)).
+
+3. The Actualyze models appear in the model picker once discovery finishes.
+   See [Actualyze](#actualyze) for other environments and details.
+
+### With another OpenAI-compatible server
+
+1. Install the plugin as above.
 
 2. Add a provider with `settings.probe` to `~/.config/opencode/opencode.json`:
 
@@ -203,7 +229,7 @@ The other built-ins are `-opencode.provider.lmstudio` and
 | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `package`          | `@opencode/ai/providers/openai-compatible`. Scout also accepts `aisdk:@ai-sdk/openai-compatible` and `@ai-sdk/openai-compatible`. The package matters for auto-eligibility and for reasoning-effort variants. |
 | `settings.baseURL` | Server URL, with or without a trailing `/v1`. Required.                                                                                                                                                       |
-| `settings.apiKey`  | Sent as `Authorization: Bearer <key>` on discovery requests. Without it, scout uses the provider's active API-key credential from OpenCode's credential store, if there is one.                               |
+| `settings.apiKey`  | Sent as `Authorization: Bearer <key>` on discovery requests when the provider has no connected key. A key connected in OpenCode (stored or from the environment) takes precedence, as it does for chat.       |
 | `settings.probe`   | `auto` or a probe ID from the table below.                                                                                                                                                                    |
 | `headers`          | Sent with every discovery and probe request. An `Authorization` header here replaces the one built from the API key.                                                                                          |
 
@@ -376,28 +402,70 @@ detected. Set `"probe": "ollama"` for it.
 ## Actualyze
 
 Actualyze serves its model catalog through an OpenAI-compatible endpoint, and
-each `/v1/models` entry carries the platform's full metadata. A provider for
-it looks like this:
+each `/v1/models` entry carries the platform's full metadata.
+
+### The built-in provider
+
+Scout adds this provider to OpenCode's catalog:
+
+| Field              | Value                                      |
+| ------------------ | ------------------------------------------ |
+| ID                 | `actualyze`                                |
+| Name               | Actualyze                                  |
+| `package`          | `@opencode/ai/providers/openai-compatible` |
+| `settings.baseURL` | `https://app.actualyze.ai/openai/v1`       |
+| `settings.probe`   | `actualyze`                                |
+
+It also registers an Actualyze integration, which is what `/connect` and
+`opencode auth login actualyze` offer. The integration takes a stored API key
+or the `ACTUALYZE_API_KEY` environment variable of the background service.
+Discovery and chat both use that key. The integration's ID is `actualyze`,
+the same as the provider's, so a `providers.actualyze` config entry and
+`opencode auth login actualyze` both reach the integration the provider reads
+its key from.
+
+Until the integration has a key, OpenCode hides the provider, so installing
+the plugin without Actualyze changes nothing in the model picker.
+
+### Another Actualyze environment
+
+To use a different deployment, set only its base URL. Your config is merged
+over the built-in provider field by field, so the name, package, probe, and
+key handling stay as they are:
 
 ```json
 {
   "providers": {
     "actualyze": {
-      "name": "Actualyze",
-      "package": "@opencode/ai/providers/openai-compatible",
       "settings": {
-        "baseURL": "https://actualyze.example.com/openai/v1",
-        "apiKey": "{env:ACTUALYZE_API_KEY}",
-        "probe": "auto"
+        "baseURL": "https://actualyze.example.com/openai/v1"
       }
     }
   }
 }
 ```
 
-Remember that `{env:ACTUALYZE_API_KEY}` reads the background service's
-environment (see
-[The background service](#the-background-service-and-environment-variables)).
+Any `providers.actualyze` entry in your config makes OpenCode list the
+provider even without a key. Discovery then runs without credentials, and
+`/modelscout` shows the endpoint's error until you add one. Add the key with
+`/connect` or `opencode auth login actualyze` as usual: the entry does not
+create a second Actualyze integration. A `settings.apiKey` in the entry also
+works, without connecting the integration. A connected key takes precedence
+over `settings.apiKey` for both discovery and chat, so the two always use the
+same key.
+
+If a models.dev catalog or another plugin already defines an `actualyze`
+provider, scout leaves that provider as it is and does not add its own. When
+an `actualyze` integration also exists, as a catalog registers one with its
+provider, scout does not register its own, so `/connect` lists Actualyze once.
+Otherwise scout still registers the `actualyze` integration. A provider that
+another plugin defined with `"activation": "auto"` and no integration of its
+own then depends on that integration: OpenCode hides it until a key is
+connected there. Scout does not discover such a provider by default, because
+its ID is one OpenCode already knows; add `"probe": "actualyze"` to its
+`settings` in your config to opt in.
+
+### How the probe reads Actualyze
 
 - **Detection.** In auto mode, one entry with `owned_by` set exactly to
   `actualyze` or `atlas` is enough to select the probe, even in a catalog
@@ -497,15 +565,14 @@ model catalog changes.
 
 - **Stored inventories.** Each successful discovery is saved in OpenCode's
   plugin storage, keyed by a hash of the provider ID, normalized base URL,
-  probe selection, API key, and headers. For a provider without
-  `settings.apiKey`, the key also covers the credential scout used from
-  OpenCode's credential store, or its absence. The stored data holds model
-  IDs and metadata, never keys or headers. Scout keeps the 128 most recent
-  entries.
-- **Startup.** Stored inventories for providers with `settings.apiKey` are
-  served as soon as the plugin loads. Other providers get their stored
-  models once scout has looked up the credential that project uses and
-  found the one the inventory was discovered with.
+  probe selection, API key, and headers. Unless discovery used
+  `settings.apiKey`, the key also covers the connected key scout used, or
+  its absence. The stored data holds model IDs and metadata, never keys or
+  headers. Scout keeps the 128 most recent entries.
+- **Startup.** A provider gets its stored models once scout has looked up
+  the key that project uses (the connected key, else `settings.apiKey`) and
+  found the inventory discovered with it. That lookup runs right after the
+  plugin loads and makes no network request.
 - **Background refresh.** Scout rediscovers when the plugin loads, when
   configuration, providers, plugins, integrations, or credentials change, on
   the `refreshIntervalMs` schedule, and on `R` in `/modelscout`. Discovery for
@@ -524,6 +591,9 @@ model catalog changes.
 
 ## Troubleshooting
 
+- **Actualyze is not in the model picker.** The built-in provider stays
+  hidden until it has a key. Run `/connect` and pick **Actualyze**, or set
+  `ACTUALYZE_API_KEY` on the background service and restart it.
 - **A provider is not discovered.** Check the rules in
   [Which providers are discovered](#which-providers-are-discovered). Adding
   `"probe": "auto"` to its `settings` is the reliable opt-in, except for the

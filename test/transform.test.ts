@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { InventoryModel, ProviderInventory } from "../src/discover";
 import type { SourceModelLike } from "../src/models-dev-index";
-import { createStore, type Binding, type DiscoveryStore } from "../src/store";
+import type { Binding } from "../src/store";
 import {
   createModelTransform,
-  createProviderRecorder,
+  createProviderTransform,
   createTransformState,
   eligibleTarget,
   type ModelEditor,
@@ -191,12 +191,11 @@ function fakeModelEditor(records: SourceRecord[], available = records) {
 
 function run(
   state: TransformState,
-  store: DiscoveryStore,
   records: SourceRecord[],
   available = records,
 ) {
   const fake = fakeModelEditor(records, available);
-  createModelTransform(state, store)(fake.editor);
+  createModelTransform(state)(fake.editor);
   return fake.candidates;
 }
 
@@ -213,13 +212,13 @@ function inventory(
   };
 }
 
+/** Make a binding the instance's active one, as the refresher does. */
 function bind(
-  store: DiscoveryStore,
+  state: TransformState,
   target: ProviderLike,
-  recorded: ReadonlySet<string>,
   models: InventoryModel[],
 ): Binding {
-  const eligible = eligibleTarget(target, recorded)!;
+  const eligible = eligibleTarget(target, new Set())!;
   const binding: Binding = {
     key: eligible.keys.key,
     endpointKey: eligible.keys.endpointKey,
@@ -227,7 +226,7 @@ function bind(
     credential: "settings",
     inventory: inventory(models),
   };
-  store.seed(binding);
+  state.active.set(target.id, binding);
   return binding;
 }
 
@@ -251,14 +250,13 @@ function stateWith(recorded: string[]): TransformState {
 
 describe("model transform", () => {
   it("adds served models and leaves declared ones untouched", () => {
-    const store = createStore();
     const state = stateWith([]);
     const target = provider("local");
-    bind(store, target, state.recorded!, [
+    bind(state, target, [
       { id: "new-model", meta: { context: 8192 } },
       { id: "declared", meta: { context: 1 } },
     ]);
-    const models = run(state, store, [record(target, ["declared"])]);
+    const models = run(state, [record(target, ["declared"])]);
     expect(models.get("local")?.get("new-model")).toMatchObject({
       limit: { context: 8192, output: 0 },
       capabilities: { input: ["text"] },
@@ -271,112 +269,64 @@ describe("model transform", () => {
   });
 
   it("does nothing for a target whose provider record is missing on this fold", () => {
-    const store = createStore();
     const state = stateWith([]);
     const target = provider("local");
-    bind(store, target, state.recorded!, [{ id: "m" }]);
-    expect([...run(state, store, []).keys()]).toEqual([]);
+    bind(state, target, [{ id: "m" }]);
+    expect([...run(state, []).keys()]).toEqual([]);
     expect(state.view.size).toBe(0);
   });
 
   it("does not add models to an unavailable provider", () => {
-    const store = createStore();
     const state = stateWith([]);
     const target = provider("local");
-    bind(store, target, state.recorded!, [{ id: "m" }]);
-    expect(run(state, store, [record(target)], []).size).toBe(0);
+    bind(state, target, [{ id: "m" }]);
+    expect(run(state, [record(target)], []).size).toBe(0);
+  });
+
+  it("serves a target with settings.apiKey nothing until the refresher sets its active binding", () => {
+    const state = stateWith([]);
+    const target = provider("local");
+    expect(run(state, [record(target)]).get("local")?.size).toBe(0);
+    expect(state.view.get("local")?.inventory).toBeUndefined();
   });
 
   it("keeps serving the active binding across a probe-only edit", () => {
-    const store = createStore();
     const state = stateWith([]);
     const before = provider("local", {
       settings: { baseURL: "http://local/v1", probe: "omlx" },
     });
-    state.active.set(
-      "local",
-      bind(store, before, state.recorded!, [{ id: "m" }]),
-    );
+    bind(state, before, [{ id: "m" }]);
     const after = provider("local", {
       settings: { baseURL: "http://local/v1", probe: "vllm" },
     });
     expect(
-      run(state, store, [record(after)])
+      run(state, [record(after)])
         .get("local")
         ?.has("m"),
     ).toBe(true);
   });
 
   it("serves nothing after an endpoint change until rediscovery", () => {
-    const store = createStore();
     const state = stateWith([]);
     const before = provider("local", {
       settings: { baseURL: "http://local/v1" },
     });
-    state.active.set(
-      "local",
-      bind(store, before, state.recorded!, [{ id: "m" }]),
-    );
+    bind(state, before, [{ id: "m" }]);
     const after = provider("local", {
       settings: { baseURL: "http://elsewhere/v1" },
     });
-    expect(run(state, store, [record(after)]).get("local")?.size).toBe(0);
-  });
-
-  it("serves each endpoint's own inventory when two locations share a provider ID", () => {
-    const store = createStore();
-    const a = provider("shared", {
-      settings: { baseURL: "http://a/v1", apiKey: "k" },
-    });
-    const b = provider("shared", {
-      settings: { baseURL: "http://b/v1", apiKey: "k" },
-    });
-    bind(store, a, new Set(), [{ id: "from-a" }]);
-    bind(store, b, new Set(), [{ id: "from-b" }]);
-    const inA = run(stateWith([]), store, [record(a)]).get("shared");
-    const inB = run(stateWith([]), store, [record(b)]).get("shared");
-    expect([...inA!.keys()]).toEqual(["from-a"]);
-    expect([...inB!.keys()]).toEqual(["from-b"]);
-  });
-
-  describe("for a target without settings.apiKey", () => {
-    const keyless = provider("local", {
-      settings: { baseURL: "http://local/v1" },
-    });
-
-    it("serves no store entry the refresher has not made active for this instance", () => {
-      const store = createStore();
-      bind(store, keyless, new Set(), [{ id: "other-location-model" }]);
-      expect(
-        run(stateWith([]), store, [record(keyless)]).get("local")?.size,
-      ).toBe(0);
-    });
-
-    it("serves the instance's active binding", () => {
-      const store = createStore();
-      const state = stateWith([]);
-      state.active.set(
-        "local",
-        bind(createStore(), keyless, state.recorded!, [{ id: "own-model" }]),
-      );
-      expect(
-        run(state, store, [record(keyless)])
-          .get("local")
-          ?.has("own-model"),
-      ).toBe(true);
-    });
+    expect(run(state, [record(after)]).get("local")?.size).toBe(0);
   });
 
   it("isolates a provider whose patches cannot be computed", () => {
-    const store = createStore();
     const state = stateWith([]);
     const broken = provider("broken");
     const good = provider("good");
-    const binding = bind(store, broken, state.recorded!, []);
+    const binding = bind(state, broken, []);
     // A malformed inventory makes the pure mapping pass throw.
     (binding.inventory as { models: unknown }).models = null;
-    bind(store, good, state.recorded!, [{ id: "m" }]);
-    const models = run(state, store, [record(broken), record(good)]);
+    bind(state, good, [{ id: "m" }]);
+    const models = run(state, [record(broken), record(good)]);
     expect(models.get("broken")?.size).toBe(0);
     expect(models.get("good")?.has("m")).toBe(true);
     expect(state.view.get("broken")?.failed).toBe(true);
@@ -385,12 +335,10 @@ describe("model transform", () => {
   it("keeps separate recorded sets for two locations with different provider plugins", () => {
     const recorderA = createTransformState();
     const recorderB = createTransformState();
-    const editor = (ids: string[]) =>
-      ({
-        list: () => ids.map((id) => ({ provider: { id } })),
-      }) as unknown as ProviderEditor;
-    createProviderRecorder(recorderA)(editor(["plugin-provider"]));
-    createProviderRecorder(recorderB)(editor([]));
+    createProviderTransform(recorderA)(
+      fakeProviderEditor([provider("plugin-provider")]).editor,
+    );
+    createProviderTransform(recorderB)(fakeProviderEditor([]).editor);
     const target = provider("plugin-provider");
     expect(eligibleTarget(target, recorderA.recorded)).toBeUndefined();
     expect(eligibleTarget(target, recorderB.recorded)).toBeDefined();
@@ -398,14 +346,78 @@ describe("model transform", () => {
 
   it("replaces the recorded set on every fold", () => {
     const state = createTransformState();
-    const recorder = createProviderRecorder(state);
-    const editor = (ids: string[]) =>
-      ({
-        list: () => ids.map((id) => ({ provider: { id } })),
-      }) as unknown as ProviderEditor;
-    recorder(editor(["a", "b"]));
-    recorder(editor(["c"]));
+    const transform = createProviderTransform(state);
+    transform(fakeProviderEditor([provider("a"), provider("b")]).editor);
+    transform(fakeProviderEditor([provider("c")]).editor);
     expect(state.recorded).toEqual(new Set(["c"]));
+  });
+});
+
+// ── Built-in Actualyze provider ──────────────────────────────────────────
+
+function fakeProviderEditor(initial: readonly ProviderLike[]) {
+  const records = new Map(
+    initial.map((info) => [info.id, { provider: info, models: new Map() }]),
+  );
+  const editor = {
+    list: () => [...records.values()],
+    get: (id: string) => records.get(id),
+    add: ({ info }: { info: ProviderLike }) => {
+      records.set(info.id, { provider: info, models: new Map() });
+    },
+  } as unknown as ProviderEditor;
+  return { editor, records };
+}
+
+describe("provider transform", () => {
+  it("adds a discoverable Actualyze provider that does not count as pre-existing", () => {
+    const state = createTransformState();
+    const { editor, records } = fakeProviderEditor([provider("openrouter")]);
+    createProviderTransform(state)(editor);
+
+    expect(state.recorded).toEqual(new Set(["openrouter"]));
+    const added = records.get("actualyze")?.provider;
+    expect(added).toEqual({
+      id: "actualyze",
+      integrationID: "actualyze",
+      name: "Actualyze",
+      activation: "auto",
+      package: "@opencode/ai/providers/openai-compatible",
+      settings: {
+        baseURL: "https://app.actualyze.ai/openai/v1",
+        probe: "actualyze",
+      },
+    });
+    expect(eligibleTarget(added!, state.recorded)).toMatchObject({
+      providerID: "actualyze",
+      integrationID: "actualyze",
+      baseURL: "https://app.actualyze.ai/openai/v1",
+      probe: "actualyze",
+    });
+  });
+
+  it("keeps an existing actualyze provider, which stays out of auto-discovery", () => {
+    const state = createTransformState();
+    const catalog = provider("actualyze", {
+      package: "@ai-sdk/openai-compatible",
+      settings: { baseURL: "https://catalog.example/v1" },
+    });
+    const { editor, records } = fakeProviderEditor([catalog]);
+    createProviderTransform(state)(editor);
+
+    expect(records.get("actualyze")?.provider).toBe(catalog);
+    expect(state.recorded?.has("actualyze")).toBe(true);
+    expect(eligibleTarget(catalog, state.recorded)).toBeUndefined();
+  });
+
+  it("still records providers when adding Actualyze fails", () => {
+    const state = createTransformState();
+    const { editor } = fakeProviderEditor([provider("a")]);
+    (editor as { add: unknown }).add = () => {
+      throw new Error("rejected");
+    };
+    expect(() => createProviderTransform(state)(editor)).not.toThrow();
+    expect(state.recorded).toEqual(new Set(["a"]));
   });
 });
 
@@ -479,35 +491,27 @@ describe("replay", () => {
   it("produces the same catalog and evidence on every replay", () => {
     for (let seed = 1; seed <= 200; seed += 1) {
       const scenario = randomScenario(seed);
-      const store = createStore();
       const state = stateWith([]);
       scenario.providers.forEach((target, index) => {
-        const eligible = eligibleTarget(target, state.recorded);
-        if (!eligible) return;
+        if (!eligibleTarget(target, state.recorded)) return;
         const models = stripUndefined(
           scenario.inventories[index],
         ) as InventoryModel[];
-        store.seed({
-          key: eligible.keys.key,
-          endpointKey: eligible.keys.endpointKey,
-          providerID: target.id,
-          credential: "settings",
-          inventory: inventory(models),
-        });
+        bind(state, target, models);
       });
       const records = scenario.providers.map((target, index) =>
         record(target, scenario.declared[index]),
       );
 
-      const first = run(state, store, records);
+      const first = run(state, records);
       const firstView = state.view;
-      const second = run(state, store, records);
+      const second = run(state, records);
       expect(second, `seed ${seed}`).toEqual(first);
       expect(state.view, `seed ${seed}`).toEqual(firstView);
 
       // Applying the transform twice within one fold equals applying it once.
       const fake = fakeModelEditor(records);
-      const transform = createModelTransform(state, store);
+      const transform = createModelTransform(state);
       transform(fake.editor);
       transform(fake.editor);
       expect(fake.candidates, `seed ${seed}`).toEqual(first);

@@ -911,7 +911,7 @@ export function projectBrowser(
     items,
     emptyMessage:
       groups.length === 0
-        ? "No models available."
+        ? "No models available yet. To use Actualyze, add its API key with /connect."
         : filtered
           ? `No matches. ${filterSummary}`
           : "No models available.",

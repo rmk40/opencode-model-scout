@@ -15,6 +15,28 @@ export const COMMAND_NAME = "modelscout";
 export const ACTUALYZE_PROBE_ID = "actualyze";
 
 /**
+ * The built-in Actualyze provider. Scout adds it to every catalog that does
+ * not already have an `actualyze` provider; it stays hidden until scout's
+ * Actualyze integration has a connection (a stored key or the environment
+ * variable).
+ */
+export const ACTUALYZE_PROVIDER_ID = "actualyze";
+/**
+ * The Actualyze integration. Its ID is the provider ID because the host's
+ * config provider plugin registers an integration under the provider ID for
+ * every `providers.<id>` config entry unless one exists, and
+ * `opencode auth login actualyze` resolves an integration by exact ID before
+ * name. With any other ID, a `providers.actualyze` entry would add a second
+ * integration whose stored key the built-in provider never reads.
+ */
+export const ACTUALYZE_INTEGRATION_ID = ACTUALYZE_PROVIDER_ID;
+export const ACTUALYZE_NAME = "Actualyze";
+export const ACTUALYZE_BASE_URL = "https://app.actualyze.ai/openai/v1";
+/** The host's native Chat Completions package for openai-compatible APIs. */
+export const ACTUALYZE_PACKAGE = "@opencode/ai/providers/openai-compatible";
+export const ACTUALYZE_ENV = "ACTUALYZE_API_KEY";
+
+/**
  * Deprecated probe IDs accepted in `settings.probe` for the 2.x line, mapped
  * to their current ID.
  */

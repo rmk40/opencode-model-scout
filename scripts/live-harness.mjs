@@ -10,17 +10,25 @@
 //
 // Environment:
 //   SCOUT_HARNESS_DIR        scratch tree (default: <os tmpdir>/opencode-model-scout-harness)
+//   ACTUALYZE_API_KEY_FILE   file holding an inference-scoped Actualyze key
 //   ACTUALYZE_BASE_URL       optional Actualyze endpoint, e.g. http://localhost:3001/openai/v1
-//   ACTUALYZE_API_KEY_FILE   file holding an inference-scoped key for that endpoint
+//                            (default: the plugin's built-in production endpoint)
 //   OPENCODE_BIN             opencode executable (default: first `opencode` on PATH)
 //
-// The `actualyze` provider is configured only when both ACTUALYZE_* variables
-// are set. Every OpenCode process runs under `env -i` with HOME and the four
-// XDG variables pointing into the scratch tree, so no real config, data, or
-// background service is touched. Its PATH holds only the standard system
-// directories and the directory of the resolved opencode executable. Output
-// never includes provider settings: `model.list` and `provider.list` carry
-// the plaintext apiKey.
+// The Actualyze checks use the plugin's built-in `actualyze` provider. The
+// key reaches the server only as ACTUALYZE_API_KEY in its environment, so
+// discovery and chat go through the integration credential; it is never
+// written to the config, the state file, a log, or a command line. With
+// ACTUALYZE_BASE_URL the config sets only `settings.baseURL`. Without
+// ACTUALYZE_API_KEY_FILE the provider must stay hidden.
+//
+// Every OpenCode process runs with an environment built from scratch (`env
+// -i`, or the spawn `env` option for the server so the key stays off its
+// command line): HOME and the four XDG variables point into the scratch
+// tree, so no real config, data, or background service is touched. Its PATH
+// holds only the standard system directories and the directory of the
+// resolved opencode executable. Output never includes provider settings:
+// `model.list` and `provider.list` can carry a plaintext apiKey.
 
 import { Buffer } from "node:buffer";
 import { spawn } from "node:child_process";
@@ -52,9 +60,7 @@ export const ACTUALYZE_BASE_URL = process.env.ACTUALYZE_BASE_URL?.replace(
 export const ACTUALYZE_API_KEY_FILE = process.env.ACTUALYZE_API_KEY_FILE
   ? path.resolve(process.env.ACTUALYZE_API_KEY_FILE)
   : undefined;
-export const ACTUALYZE_ENABLED = Boolean(
-  ACTUALYZE_BASE_URL && ACTUALYZE_API_KEY_FILE,
-);
+export const ACTUALYZE_ENABLED = Boolean(ACTUALYZE_API_KEY_FILE);
 export const REPO = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
@@ -160,17 +166,9 @@ function harnessConfig() {
     $schema: "https://opencode.ai/config.json",
     plugins: [path.join(REPO, "dist")],
     providers: {
-      ...(ACTUALYZE_ENABLED
+      ...(ACTUALYZE_ENABLED && ACTUALYZE_BASE_URL
         ? {
-            [ACTUALYZE_PROVIDER]: {
-              name: "Actualyze",
-              package: "aisdk:@ai-sdk/openai-compatible",
-              settings: {
-                baseURL: ACTUALYZE_BASE_URL,
-                apiKey: `{file:${ACTUALYZE_API_KEY_FILE}}`,
-                probe: "auto",
-              },
-            },
+            [ACTUALYZE_PROVIDER]: { settings: { baseURL: ACTUALYZE_BASE_URL } },
           }
         : {}),
       "mock-compat": {
@@ -184,6 +182,17 @@ function harnessConfig() {
       },
     },
   };
+}
+
+/** The trimmed Actualyze key, or undefined when the file is unset, unreadable, or empty. */
+export async function readActualyzeKey() {
+  if (!ACTUALYZE_API_KEY_FILE) return undefined;
+  try {
+    const key = (await readFile(ACTUALYZE_API_KEY_FILE, "utf8")).trim();
+    return key.length > 0 ? key : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export async function readState() {
@@ -262,12 +271,15 @@ async function start() {
     process.exitCode = 1;
     return;
   }
+  let actualyzeKey;
   if (!ACTUALYZE_ENABLED) {
     console.log(
-      "note: ACTUALYZE_BASE_URL and ACTUALYZE_API_KEY_FILE are not both set; skipping the Actualyze provider",
+      "note: ACTUALYZE_API_KEY_FILE is not set; the Actualyze provider stays hidden",
     );
-  } else if (!existsSync(ACTUALYZE_API_KEY_FILE)) {
-    console.log(`warning: ${ACTUALYZE_API_KEY_FILE} does not exist`);
+  } else {
+    actualyzeKey = await readActualyzeKey();
+    if (!actualyzeKey)
+      console.log(`warning: ${ACTUALYZE_API_KEY_FILE} is missing or empty`);
   }
 
   await rm(LOGS, { recursive: true, force: true });
@@ -286,17 +298,19 @@ async function start() {
     [fileURLToPath(import.meta.url), "mock", String(MOCK_PORT)],
     "mock.log",
   );
+  // The spawn `env` option replaces the whole environment like `env -i`,
+  // without putting the key on a command line.
   const serverPid = spawnDetached(
-    "env",
-    envArgv(isolatedEnv({ OPENCODE_SERVER_PASSWORD: password }), [
-      "serve",
-      "--hostname",
-      HOST,
-      "--port",
-      String(SERVER_PORT),
-    ]),
+    opencodeBinary(),
+    ["serve", "--hostname", HOST, "--port", String(SERVER_PORT)],
     "serve.log",
-    { cwd: PROJECT },
+    {
+      cwd: PROJECT,
+      env: isolatedEnv({
+        OPENCODE_SERVER_PASSWORD: password,
+        ...(actualyzeKey ? { ACTUALYZE_API_KEY: actualyzeKey } : {}),
+      }),
+    },
   );
   const state = {
     url: `http://${HOST}:${SERVER_PORT}`,
@@ -318,6 +332,11 @@ async function start() {
       if (status === 200) {
         console.log(`started ${state.url} (server pid ${serverPid})`);
         console.log(`mock-compat at ${state.mockUrl} (pid ${mockPid})`);
+        console.log(
+          actualyzeKey
+            ? `actualyze key via ACTUALYZE_API_KEY, endpoint ${ACTUALYZE_BASE_URL ?? "built-in"}`
+            : "actualyze has no key",
+        );
         console.log(`project ${PROJECT}`);
         console.log(`logs ${LOGS}`);
         return;

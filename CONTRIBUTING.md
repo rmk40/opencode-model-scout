@@ -65,7 +65,8 @@ npx vitest run test/probes/omlx.test.ts
 The tests start an in-process OpenCode host through `@opencode/sdk`, load
 `src/server.ts` as a plugin, serve local OpenAI-compatible and Actualyze mocks
 over HTTP, and check the host's own model list and the plugin RPC. They need
-no network access beyond localhost.
+no network access beyond localhost: `test/e2e/actualyze.e2e.test.ts` wraps
+`fetch` so requests to the built-in Actualyze endpoint reach the local mock.
 
 ### Live harness
 
@@ -84,23 +85,36 @@ node scripts/live-harness.mjs stop
 
 `start` writes a project config with `plugins: ["<repo>/dist"]` and a
 `mock-compat` provider backed by a local mock server, then starts
-`opencode serve` on `127.0.0.1`. Every OpenCode process runs under `env -i`
-with `HOME` and the four `XDG_*` variables pointing into the scratch tree, so
-your real config, data, and background service are never touched.
+`opencode serve` on `127.0.0.1`. Every OpenCode process runs with an
+environment built from scratch, with `HOME` and the four `XDG_*` variables
+pointing into the scratch tree, so your real config, data, and background
+service are never touched.
 
-| Variable                  | Purpose                                                                                                    |
-| ------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| `SCOUT_HARNESS_DIR`       | Scratch tree. Defaults to `opencode-model-scout-harness` under the OS temp directory.                      |
-| `ACTUALYZE_BASE_URL`      | Optional Actualyze endpoint, for example `http://localhost:3001/openai/v1`.                                |
-| `ACTUALYZE_API_KEY_FILE`  | File holding an inference-scoped key for that endpoint. The provider is configured only when both are set. |
-| `OPENCODE_BIN`            | The `opencode` executable. Defaults to the first `opencode` on `PATH`.                                     |
-| `SCOUT_HARNESS_PORT`      | Port for `opencode serve`. Defaults to 47931.                                                              |
-| `SCOUT_HARNESS_MOCK_PORT` | Port for the mock server. Defaults to 47932.                                                               |
+| Variable                  | Purpose                                                                                                                       |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `SCOUT_HARNESS_DIR`       | Scratch tree. Defaults to `opencode-model-scout-harness` under the OS temp directory.                                         |
+| `ACTUALYZE_API_KEY_FILE`  | File holding an inference-scoped Actualyze key. Without it, the checks expect the built-in `actualyze` provider to be hidden. |
+| `ACTUALYZE_BASE_URL`      | Optional Actualyze endpoint, for example `http://localhost:3001/openai/v1`. Defaults to the built-in production endpoint.     |
+| `OPENCODE_BIN`            | The `opencode` executable. Defaults to the first `opencode` on `PATH`.                                                        |
+| `SCOUT_HARNESS_PORT`      | Port for `opencode serve`. Defaults to 47931.                                                                                 |
+| `SCOUT_HARNESS_MOCK_PORT` | Port for the mock server. Defaults to 47932.                                                                                  |
+
+The harness tests the built-in `actualyze` provider the way a user sets it
+up. The key reaches the server only as `ACTUALYZE_API_KEY` in its
+environment, so discovery and chat go through the integration credential.
+It is passed through the spawn environment rather than the command line and
+is never written to the config, the state file, or the logs. With
+`ACTUALYZE_BASE_URL`, the config sets only
+`providers.actualyze.settings.baseURL`.
 
 `live-check.mjs` waits up to 60 seconds for the RPC catalog to report
-`complete`, then checks that the plugin is listed and active, that the
-discovered models carry the expected limits, capabilities, variants, and
-prices (Actualyze expectations come from the endpoint's own `/models` list),
+`complete`, then checks that the plugin is listed and active, that exactly
+one Actualyze integration exists, with the ID `actualyze` and a connection
+only when a key file is set, that the `actualyze` provider is listed with
+the expected endpoint and no `settings.apiKey` (or hidden, without a key
+file), that the discovered models carry the expected limits, capabilities,
+variants, and prices (Actualyze expectations come from the endpoint's own
+`/models` list),
 that the RPC catalog passes the strict validator, and that one plain chat
 request succeeds against the first model in the Actualyze list, without an
 effort variant. Pass `--skip-chat` to skip the chat request or
@@ -157,25 +171,43 @@ sequenceDiagram
 ### Server half
 
 - **`src/server.ts`** adapts the plugin context for the refresher, loads
-  persisted bindings, registers the two transforms and the RPC handlers, and
-  starts the refresher. It awaits no network I/O.
-- **`src/transform.ts`** holds the provider recorder and the model transform.
-  The recorder stores the provider IDs that exist before config providers
-  load; `eligibleTarget()` uses that set to decide which providers are
-  auto-eligible. The model transform runs in two passes: a pure pass maps
-  each target's inventory to patches inside `try`/`catch`, then a second pass
-  applies them with `editor.update`. Model IDs already in the provider's
-  source record are skipped. A target with `settings.apiKey` is served from
-  its store entry; any other target only through the binding the refresher
-  made active for this instance after resolving its credential.
+  persisted bindings, registers the Actualyze integration, the two catalog
+  transforms, and the RPC handlers, and starts the refresher. It awaits no
+  network I/O.
+- **`src/actualyze.ts`** defines the built-in Actualyze provider and its
+  integration (a key method and the `ACTUALYZE_API_KEY` environment
+  variable). The integration ID is `actualyze`, the provider ID, because the
+  host's config provider plugin registers an integration under the provider
+  ID for every `providers.<id>` entry unless one exists, and
+  `opencode auth login actualyze` resolves an integration by exact ID first;
+  any other ID would leave a configured provider reading keys from an
+  integration nobody connects. The provider is added only when no
+  `actualyze` provider exists yet, and the integration only when no
+  `actualyze` integration exists, so a models.dev catalog that defines them
+  keeps them. An earlier plugin's `actualyze` provider with
+  `activation: "auto"` and no integration of its own is gated by this
+  integration and stays hidden until it has a connection.
+- **`src/transform.ts`** holds the provider transform and the model transform.
+  The provider transform stores the provider IDs that exist before config
+  providers load, then adds the Actualyze provider, so that provider never
+  counts as pre-existing; `eligibleTarget()` uses the stored set to decide
+  which providers are auto-eligible. The model transform runs in two passes:
+  a pure pass maps each target's inventory to patches inside `try`/`catch`,
+  then a second pass applies them with `editor.update`. Model IDs already in
+  the provider's source record are skipped. Every target is served only
+  through the binding the refresher made active for this instance after
+  resolving its credential.
 - **`src/refresher.ts`** turns host events, the refresh interval, and RPC
   `refresh` calls into debounced syncs. A sync resolves each target's
-  credential, subscribes to the target's store entry, starts discovery for
+  credential in the order the host uses for chat (the integration's active
+  connection, then `settings.apiKey`, then none), activates a stored binding
+  for it, subscribes to the target's store entry, starts discovery for
   stale or changed targets, and reloads the catalog when a served binding
   changes. It also builds the RPC `catalog` payload.
 - **`src/store.ts`** is the process-wide store on `globalThis`. It owns
-  bindings and jobs keyed by the full target fingerprint plus, for a target
-  without `settings.apiKey`, the fingerprint of its resolved credential. It
+  bindings and jobs keyed by the full target fingerprint plus, unless the
+  target resolved to its `settings.apiKey`, the fingerprint of its resolved
+  credential. It
   throttles starts to one per minute per target (a job aborted because its
   last subscriber left does not count), and bumps a generation on
   invalidation so stale job results are dropped.
@@ -492,7 +524,8 @@ opencode-model-scout/
 │   ├── server.ts             # Server plugin entry
 │   ├── refresher.ts          # Triggers, sync, refresh interval, RPC catalog
 │   ├── store.ts              # Shared discovery store and fingerprints
-│   ├── transform.ts          # Provider recorder, eligibility, model transform
+│   ├── actualyze.ts          # Built-in Actualyze provider and integration
+│   ├── transform.ts          # Provider transform, eligibility, model transform
 │   ├── discover.ts           # discoverProvider and toModelInfo
 │   ├── models-dev-index.ts   # models.dev matcher
 │   ├── catalog-evidence.ts   # Evidence schema and validator

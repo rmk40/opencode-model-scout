@@ -5,9 +5,9 @@
  * state is not shared; the store lives on `globalThis` under a versioned
  * `Symbol.for` key. Entries and their jobs are keyed by the full sync
  * fingerprint of a target (provider ID, normalized base URL, probe
- * selection, API key fingerprint, header fingerprint) plus, for a target
- * without `settings.apiKey`, the fingerprint of the credential the
- * instance resolved for it (see {@link credentialKeys}). Two locations
+ * selection, API key fingerprint, header fingerprint) plus, unless the
+ * instance resolved the target to its `settings.apiKey`, the fingerprint of
+ * the credential it resolved (see {@link credentialKeys}). Two locations
  * share work only when they would discover the same thing.
  *
  * A job belongs to the store, not to the instance that started it. It is
@@ -181,10 +181,12 @@ export function targetKeys(identity: TargetIdentity): TargetKeys {
 
 /**
  * Store identity of a target once its credential is resolved. A
- * `settings.apiKey` is already part of the sync key. Any other credential
- * (an integration connection, or none) depends on the instance that
- * resolved it, so its fingerprint is added to the key; locations with
- * different credentials never share an entry. The endpoint key stays the
+ * `settings.apiKey` is already part of the sync key, which is kept as is.
+ * Any other credential (an integration connection, or none) depends on the
+ * instance that resolved it, so its fingerprint is hashed with the sync key
+ * into a separate key; locations with different credentials never share an
+ * entry, and a target resolved to its integration never shares one with the
+ * same target resolved to its `settings.apiKey`. The endpoint key stays the
  * sync endpoint identity, which the synchronous model transform can compute
  * and compare against the instance's active binding.
  */

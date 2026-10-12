@@ -234,7 +234,7 @@ function modelDetail(model: ModelRow): string {
 /** The whole catalog as one text block, two lines per model. */
 function buildTableText(groups: readonly ProviderGroup[]): string {
   if (groups.length === 0)
-    return "No models discovered.\n\nNo OpenAI-compatible provider is configured, or discovery has not reported yet.";
+    return "No models discovered.\n\nNo OpenAI-compatible provider is configured, or discovery has not reported yet. To use Actualyze, add its API key with /connect.";
   const lines: string[] = [];
   for (const [index, group] of groups.entries()) {
     if (index > 0) lines.push("");

@@ -378,10 +378,10 @@ describe("sync", () => {
     store.seed(seeded);
     const second = setup(h, discover, store);
     const target = eligibleTarget(h.providers[0], new Set())!;
-    expect(servedBinding(target, second.state, store)).toBeUndefined();
+    expect(servedBinding(target, second.state)).toBeUndefined();
     await second.refresher.sync();
     expect(store.served(seeded.key)).toBeDefined();
-    expect(servedBinding(target, second.state, store)?.key).toBe(seeded.key);
+    expect(servedBinding(target, second.state)?.key).toBe(seeded.key);
     expect(discover).toHaveBeenCalledTimes(1);
   });
 
@@ -520,7 +520,7 @@ describe("events", () => {
     expect(h.listCalls()).toBe(2);
   });
 
-  it("stops serving matching integration targets on an unlocated credential switch", async () => {
+  it("stops serving every target of the switched integration on an unlocated credential switch", async () => {
     const h = harness([
       provider(
         "via-acme",
@@ -550,8 +550,8 @@ describe("events", () => {
       data: { integrationID: "acme", credentialID: "c3" },
     });
     expect(state.active.has("via-acme")).toBe(false);
+    expect(state.active.has("with-key")).toBe(false);
     expect(state.active.has("via-other")).toBe(true);
-    expect(state.active.has("with-key")).toBe(true);
     // The entry stays for any other location that still uses that credential.
     expect(store.served(viaAcme.key)).toBe(viaAcme);
     await flush();
@@ -628,7 +628,7 @@ describe("credential switch", () => {
     refresher.handleEvent(SWITCH);
     await refresher.sync();
     await flush();
-    expect(servedBinding(target, state, store)).toBeUndefined();
+    expect(servedBinding(target, state)).toBeUndefined();
     expect(refresher.catalog().providers).toEqual([]);
     expect(discover).toHaveBeenCalledTimes(1);
     // The old account's entry stays for locations that still use it.
@@ -640,7 +640,7 @@ describe("credential switch", () => {
       .fn<(target: DiscoveryTarget) => Promise<DiscoveryResult>>()
       .mockResolvedValueOnce({ ok: true, inventory: inventory(["a-model"]) })
       .mockResolvedValueOnce({ ok: true, inventory: inventory(["b-model"]) });
-    const { h, refresher, state, store, before, target } =
+    const { h, refresher, state, before, target } =
       await boundToAccountA(discover);
 
     h.credentials.set("acme", {
@@ -652,7 +652,7 @@ describe("credential switch", () => {
     await flush();
     expect(discover).toHaveBeenCalledTimes(2);
     expect(discover.mock.calls[1][0]).toMatchObject({ apiKey: "account-b" });
-    const served = servedBinding(target, state, store);
+    const served = servedBinding(target, state);
     expect(served?.inventory.models).toEqual([{ id: "b-model" }]);
     expect(served?.key).not.toBe(before.key);
   });
@@ -662,8 +662,7 @@ describe("credential switch", () => {
       ok: true as const,
       inventory: inventory(["a-model"]),
     }));
-    const { h, refresher, state, store, target } =
-      await boundToAccountA(discover);
+    const { h, refresher, state, target } = await boundToAccountA(discover);
     let finishLookup!: (credential: {
       connection: string;
       key: string;
@@ -680,7 +679,7 @@ describe("credential switch", () => {
     finishLookup({ connection: "credential:c1", key: "account-a" });
     await pending;
     await flush();
-    expect(servedBinding(target, state, store)).toBeUndefined();
+    expect(servedBinding(target, state)).toBeUndefined();
     expect(refresher.catalog().providers).toEqual([]);
   });
 
@@ -734,11 +733,183 @@ describe("credential switch", () => {
     oldJob.resolve({ ok: true, inventory: inventory(["a-model"]) });
     await flush();
     const target = eligibleTarget(viaAcme(), new Set())!;
-    expect(servedBinding(target, first.state, store)).toBeUndefined();
+    expect(servedBinding(target, first.state)).toBeUndefined();
     expect(a.reload).not.toHaveBeenCalled();
+    expect(servedBinding(target, second.state)?.inventory.models).toEqual([
+      { id: "a-model" },
+    ]);
+  });
+});
+
+describe("credential precedence with settings.apiKey", () => {
+  // Inference uses the integration's active connection before
+  // `settings.apiKey`, so discovery must use the same key.
+  const withSettingsKey = () =>
+    provider(
+      "local",
+      { baseURL: "http://local/v1", apiKey: "settings-a" },
+      { integrationID: "acme" },
+    );
+  const SWITCH: HostEvent = {
+    type: "credential.switched",
+    data: { integrationID: "acme", credentialID: "c1" },
+  };
+  const CONNECTED_B = { connection: "credential:c1", key: "connected-b" };
+
+  function discoverByKey() {
+    return vi.fn(async (target: DiscoveryTarget) => ({
+      ok: true as const,
+      inventory: inventory([`via-${target.apiKey}`]),
+    }));
+  }
+
+  it("discovers with the connected key instead of settings.apiKey", async () => {
+    const h = harness([withSettingsKey()]);
+    h.credentials.set("acme", CONNECTED_B);
+    const discover = discoverByKey();
+    const { refresher, state } = setup(h, discover);
+    await refresher.sync();
+    await flush();
+    expect(discover).toHaveBeenCalledTimes(1);
+    expect(discover.mock.calls[0][0]).toMatchObject({ apiKey: "connected-b" });
+    const served = servedBinding(
+      eligibleTarget(withSettingsKey(), new Set())!,
+      state,
+    );
+    expect(served?.inventory.models).toEqual([{ id: "via-connected-b" }]);
+    expect(served?.credential).toMatch(/^integration:/);
+  });
+
+  it("falls back to settings.apiKey once the connection is removed", async () => {
+    const h = harness([withSettingsKey()]);
+    h.credentials.set("acme", CONNECTED_B);
+    const discover = discoverByKey();
+    const { refresher, state } = setup(h, discover);
+    await refresher.sync();
+    await flush();
+
+    h.credentials.delete("acme");
+    refresher.handleEvent({
+      type: "credential.switched",
+      data: { integrationID: "acme", credentialID: null },
+    });
+    expect(state.active.has("local")).toBe(false);
+    await refresher.sync();
+    await flush();
+    expect(discover).toHaveBeenCalledTimes(2);
+    expect(discover.mock.calls[1][0]).toMatchObject({ apiKey: "settings-a" });
+    expect(state.active.get("local")?.inventory.models).toEqual([
+      { id: "via-settings-a" },
+    ]);
+  });
+
+  it("uses settings.apiKey when the first lookup fails", async () => {
+    const h = harness([withSettingsKey()]);
+    vi.spyOn(h.host, "activeCredential").mockRejectedValueOnce(
+      new Error("credential store unavailable"),
+    );
+    const discover = discoverByKey();
+    const { refresher, state } = setup(h, discover);
+    await refresher.sync();
+    await flush();
+    expect(discover.mock.calls[0][0]).toMatchObject({ apiKey: "settings-a" });
+    expect(state.active.get("local")?.credential).toBe("settings");
+  });
+
+  it("keeps the connected key when a later lookup fails", async () => {
+    const h = harness([withSettingsKey()]);
+    h.credentials.set("acme", CONNECTED_B);
+    const discover = discoverByKey();
+    const { refresher, state } = setup(h, discover);
+    await refresher.sync();
+    await flush();
+    const before = state.active.get("local");
+
+    vi.spyOn(h.host, "activeCredential").mockRejectedValueOnce(
+      new Error("credential store unavailable"),
+    );
+    await refresher.sync();
+    await flush();
+    expect(discover).toHaveBeenCalledTimes(1);
+    expect(state.active.get("local")).toBe(before);
+  });
+
+  it("revokes a settings.apiKey resolution when a key is connected, then discovers with it", async () => {
+    const h = harness([withSettingsKey()]);
+    const discover = discoverByKey();
+    const { refresher, state } = setup(h, discover);
+    await refresher.sync();
+    await flush();
+    expect(state.active.get("local")?.credential).toBe("settings");
+
+    h.credentials.set("acme", CONNECTED_B);
+    refresher.handleEvent(SWITCH);
+    expect(state.active.has("local")).toBe(false);
+    await refresher.sync();
+    await flush();
+    expect(discover.mock.calls[1][0]).toMatchObject({ apiKey: "connected-b" });
+    expect(state.active.get("local")?.inventory.models).toEqual([
+      { id: "via-connected-b" },
+    ]);
+  });
+
+  it("does not keep a settings.apiKey resolution from a lookup that a connection overtook", async () => {
+    const h = harness([withSettingsKey()]);
+    let finishLookup!: (credential: undefined) => void;
+    vi.spyOn(h.host, "activeCredential").mockImplementationOnce(
+      () => new Promise((done) => (finishLookup = done)),
+    );
+    const discover = discoverByKey();
+    const { refresher, state } = setup(h, discover);
+    const pending = refresher.sync();
+    await flush();
+
+    h.credentials.set("acme", CONNECTED_B);
+    refresher.handleEvent(SWITCH);
+    finishLookup(undefined);
+    await pending;
+    await flush();
     expect(
-      servedBinding(target, second.state, store)?.inventory.models,
-    ).toEqual([{ id: "a-model" }]);
+      discover.mock.calls.every(([target]) => target.apiKey !== "settings-a"),
+    ).toBe(true);
+    expect(state.active.get("local")?.credential ?? "none").not.toBe(
+      "settings",
+    );
+  });
+
+  it("does not serve a persisted settings.apiKey binding while a key is connected", async () => {
+    const h = harness([withSettingsKey()]);
+    h.credentials.set("acme", CONNECTED_B);
+    const store = createStore();
+    seedFresh(store, withSettingsKey(), new Date().toISOString(), ["stale"]);
+    const discover = discoverByKey();
+    const { refresher, state } = setup(h, discover, store);
+    await refresher.sync();
+    await flush();
+    expect(discover.mock.calls[0][0]).toMatchObject({ apiKey: "connected-b" });
+    expect(state.active.get("local")?.inventory.models).toEqual([
+      { id: "via-connected-b" },
+    ]);
+  });
+});
+
+describe("startup with a persisted binding", () => {
+  it("serves it after the first sync without discovery", async () => {
+    const h = harness([provider("local")]);
+    const store = createStore();
+    seedFresh(store, h.providers[0], new Date().toISOString(), ["stored"]);
+    const discover = vi.fn();
+    const { refresher, state } = setup(h, discover, store);
+    const target = eligibleTarget(h.providers[0], new Set())!;
+    expect(servedBinding(target, state)).toBeUndefined();
+
+    await refresher.sync();
+    expect(servedBinding(target, state)?.inventory.models).toEqual([
+      { id: "stored" },
+    ]);
+    expect(h.listCalls()).toBe(1);
+    expect(h.reload).toHaveBeenCalledTimes(1);
+    expect(discover).not.toHaveBeenCalled();
   });
 });
 
@@ -841,19 +1012,19 @@ describe("shared store across locations", () => {
         inventory: inventory(["account-a-model"]),
       });
       await flush();
-      expect(servedBinding(target, second.state, second.store)).toBeUndefined();
+      expect(servedBinding(target, second.state)).toBeUndefined();
 
       jobs.get("key-b")!.job.resolve({
         ok: true,
         inventory: inventory(["account-b-model"]),
       });
       await flush();
-      expect(
-        servedBinding(target, first.state, first.store)?.inventory.models,
-      ).toEqual([{ id: "account-a-model" }]);
-      expect(
-        servedBinding(target, second.state, second.store)?.inventory.models,
-      ).toEqual([{ id: "account-b-model" }]);
+      expect(servedBinding(target, first.state)?.inventory.models).toEqual([
+        { id: "account-a-model" },
+      ]);
+      expect(servedBinding(target, second.state)?.inventory.models).toEqual([
+        { id: "account-b-model" },
+      ]);
     });
 
     it("keeps each location's binding through the other's later syncs", async () => {

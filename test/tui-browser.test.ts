@@ -963,7 +963,9 @@ describe("unified browser projection", () => {
   it("distinguishes filtered-empty from catalog-empty results", () => {
     const filtered = projectBrowser(groups, "missing");
     expect(filtered.emptyMessage).toContain("No matches.");
-    expect(projectBrowser([], "").emptyMessage).toBe("No models available.");
+    expect(projectBrowser([], "").emptyMessage).toBe(
+      "No models available yet. To use Actualyze, add its API key with /connect.",
+    );
   });
 
   it("aggregates provider origins, core coverage, and capability states", () => {
