@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import {
   collectModelGroups,
+  coreMetadataCoverage,
   toModelRow,
+  type ModelRow,
   type SdkProviderView,
 } from "../src/tui-models";
 
@@ -44,6 +46,16 @@ describe("toModelRow", () => {
     expect(row.flags).toContain("Vision");
   });
 
+  it("classifies attachment support as vlm without nested image input", () => {
+    const row = toModelRow("atlas-vision", {
+      id: "atlas-vision",
+      capabilities: { attachment: true, output: { text: true } },
+    });
+
+    expect(row.type).toBe("vlm");
+    expect(row.flags).toContain("Vision");
+  });
+
   it("falls back to the id when name is missing", () => {
     const row = toModelRow("local-model", { id: "local-model" });
     expect(row.name).toBe("local-model");
@@ -60,6 +72,99 @@ describe("toModelRow", () => {
     expect(row.context).toBeUndefined();
     expect(row.output).toBeUndefined();
     expect(row.sizeBytes).toBeUndefined();
+  });
+
+  it.each([
+    ["zero", 0],
+    ["negative", -1],
+    ["fractional", 4096.5],
+    ["unsafe", Number.MAX_SAFE_INTEGER + 2],
+  ])("treats %s host limits as absent, not known metadata", (_label, limit) => {
+    // The host normalizes omitted limits to 0; such values must never render
+    // as "ctx 0" or count toward known core metadata.
+    const row = toModelRow("m", {
+      id: "m",
+      limit: { context: limit, output: limit },
+    });
+    expect(row.context).toBeUndefined();
+    expect(row.output).toBeUndefined();
+    expect(row.provenance?.context).toBeUndefined();
+    expect(row.provenance?.output).toBeUndefined();
+  });
+
+  it("keeps zero for general numeric metadata outside limits", () => {
+    const row = toModelRow("m", { id: "m", sizeBytes: 0 });
+    expect(row.sizeBytes).toBe(0);
+  });
+
+  it("retains positive snapshot capability evidence when the host is silent", () => {
+    // A host that omits capability booleans is silent, not conflicting:
+    // supported exact evidence must survive with its flags.
+    const row = toModelRow(
+      "atlas-model",
+      { id: "atlas-model" },
+      {
+        id: "atlas-model",
+        origin: "discovered",
+        identity: {
+          state: "known",
+          value: "atlas-model",
+          source: "server-list",
+          strength: "reported",
+        },
+        name: { state: "unknown" },
+        modelType: {
+          state: "known",
+          value: "llm",
+          source: "provider-probe",
+          strength: "authoritative",
+        },
+        context: { state: "unknown" },
+        output: { state: "unknown" },
+        family: {
+          state: "known",
+          value: "atlas",
+          source: "models.dev",
+          strength: "inferred",
+        },
+        organizationOwner: { state: "unknown" },
+        parameterSize: { state: "unknown" },
+        quantization: { state: "unknown" },
+        sizeBytes: { state: "unknown" },
+        probeIdentity: { state: "unknown" },
+        capabilities: {
+          vision: {
+            state: "supported",
+            source: "provider-probe",
+            strength: "authoritative",
+          },
+          toolCall: {
+            state: "supported",
+            source: "provider-probe",
+            strength: "authoritative",
+          },
+          reasoning: { state: "unknown" },
+          temperature: {
+            state: "supported",
+            source: "policy-default",
+            strength: "assumed",
+          },
+        },
+      },
+    );
+    expect(row.capabilities?.vision).toMatchObject({
+      state: "supported",
+      source: "provider-probe",
+    });
+    expect(row.capabilities?.toolCall.state).toBe("supported");
+    expect(row.capabilities?.temperature).toMatchObject({
+      state: "supported",
+      source: "policy-default",
+    });
+    expect(row.capabilities?.reasoning.state).toBe("unknown");
+    expect(row.flags).toEqual(["Vision", "Tools", "Temp"]);
+    expect(row.family).toBe("atlas");
+    expect(row.provenance?.family).toMatchObject({ source: "models.dev" });
   });
 
   it("surfaces probe-injected metadata fields", () => {
@@ -89,8 +194,9 @@ describe("collectModelGroups", () => {
   it("includes OpenAI-compatible providers via baseURL /v1", () => {
     const groups = collectModelGroups([local]);
     expect(groups).toHaveLength(1);
+    expect(groups[0]?.id).toBe("omlx");
     expect(groups[0]?.provider).toBe("oMLX");
-    expect(groups[0]?.baseURL).toBe("http://localhost:8000/v1");
+    expect(groups[0]?.endpoint).toBe("http://localhost:8000");
   });
 
   it("excludes built-in cloud providers that lack options.baseURL", () => {
@@ -176,11 +282,12 @@ describe("collectModelGroups", () => {
     expect(groups).toHaveLength(0);
   });
 
-  it("excludes discoverable providers with no models", () => {
+  it("keeps discoverable providers with no models for provider status views", () => {
     const groups = collectModelGroups([
       { id: "empty", options: { baseURL: "http://x/v1" }, models: {} },
     ]);
-    expect(groups).toHaveLength(0);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({ id: "empty", models: [] });
   });
 
   it("sorts models within a group and providers across groups", () => {
@@ -204,5 +311,107 @@ describe("collectModelGroups", () => {
       },
     ]);
     expect(groups[0]?.provider).toBe("raw-id");
+  });
+
+  it("keeps only a sanitized endpoint origin", () => {
+    const groups = collectModelGroups([
+      {
+        id: "atlas-public",
+        name: "Atlas",
+        options: {
+          baseURL:
+            "https://user:secret@atlas.test:8443/v1/private?token=secret#models",
+        },
+        models: { atlas: { id: "atlas" } },
+      },
+    ]);
+
+    expect(groups[0]?.endpoint).toBe("https://atlas.test:8443");
+  });
+
+  it("omits invalid endpoint URLs", () => {
+    const groups = collectModelGroups([
+      {
+        id: "atlas-public",
+        name: "Atlas",
+        options: { baseURL: "/v1/not-a-url" },
+        models: {
+          atlas: {
+            id: "atlas",
+            api: { npm: "@ai-sdk/openai-compatible" },
+          },
+        },
+      },
+    ]);
+
+    expect(groups[0]?.endpoint).toBeUndefined();
+  });
+});
+
+describe("core metadata coverage", () => {
+  const supported = {
+    state: "supported" as const,
+    source: "unmatched-host" as const,
+    strength: "unmatched" as const,
+  };
+  const unknown = { state: "unknown" as const };
+  const row = (overrides: Partial<ModelRow>): ModelRow => ({
+    id: "atlas-model",
+    name: "Atlas Model",
+    flags: [],
+    capabilities: {
+      vision: supported,
+      toolCall: supported,
+      reasoning: supported,
+      temperature: supported,
+    },
+    ...overrides,
+  });
+
+  it.each(["llm", "vlm"] as const)(
+    "requires all chat core fields for %s models",
+    (type) => {
+      expect(
+        coreMetadataCoverage(row({ type, context: 8192, output: 1024 })),
+      ).toEqual({ known: 7, total: 7, missing: [], complete: true });
+    },
+  );
+
+  it("reports unknown chat evidence as expected missing metadata", () => {
+    const coverage = coreMetadataCoverage(
+      row({
+        type: "vlm",
+        context: 8192,
+        capabilities: {
+          vision: supported,
+          toolCall: unknown,
+          reasoning: unknown,
+          temperature: supported,
+        },
+      }),
+    );
+    expect(coverage).toEqual({
+      known: 4,
+      total: 7,
+      missing: ["output", "tools", "reasoning"],
+      complete: false,
+    });
+  });
+
+  it("treats chat capabilities as inapplicable to embeddings", () => {
+    expect(
+      coreMetadataCoverage(
+        row({ type: "embedding", context: 2048, capabilities: undefined }),
+      ),
+    ).toEqual({ known: 2, total: 2, missing: [], complete: true });
+  });
+
+  it("requires type and context to establish an unknown model", () => {
+    expect(coreMetadataCoverage(row({ context: 4096 }))).toEqual({
+      known: 1,
+      total: 2,
+      missing: ["type"],
+      complete: false,
+    });
   });
 });

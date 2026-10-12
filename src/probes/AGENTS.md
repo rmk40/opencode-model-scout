@@ -2,10 +2,12 @@
 
 ## Writing Probes
 
-- Capability flags normally stay `true` or undefined. A probe may return `false`
-  only when the provider reports an authoritative boolean; discovery uses that
-  value as an internal fallback-denial sentinel and does not emit false config
-  flags. Missing or wrong-type values remain unknown so models.dev may fill them.
+- Capability fields normally stay `true` or undefined. A probe may return
+  `false` only when the provider reports an authoritative boolean. Discovery
+  keeps tool, reasoning, and vision negatives as internal fallback-denial
+  sentinels and does not emit them as false config flags. An explicit
+  `temperature: false` is preserved because temperature is a valued option.
+  Missing or wrong-type values remain unknown so models.dev may fill them.
 - `EMPTY_RESULT` is `Object.freeze()`d. Never mutate after returning it.
 - **Never write to stdout/stderr** (no `console.*`). This runs in opencode's config hook at startup; any output leaks into opencode. Failures degrade silently (return `EMPTY_RESULT`).
 - **Never read a body with raw `res.json()`/`res.text()`.** Use `readJson()`/`readBody()` from `./util` — they bound the body read with a timeout and cancel the stream. A raw read has no timeout and can hang forever if a server sends headers then stalls the body.

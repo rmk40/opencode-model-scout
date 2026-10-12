@@ -2,15 +2,19 @@
 
 ## Architecture Overview
 
-The plugin is structured as a pipeline that runs during opencode's config hook
-at startup. The source files are organized into four concerns:
+The plugin combines a startup discovery pipeline with an interactive TUI
+browser. The source files are organized into these concerns:
 
 ```
 src/
 ├── constants.ts          # Plugin name, command name
 ├── index.ts              # Server plugin entry — config-hook discovery
 ├── tui.ts                # TUI plugin entry — /modelscout dialog command
-├── tui-models.ts         # TUI data layer — SDK provider/model → display rows + formatters
+├── tui-browser.ts        # Grouped model/provider list, facets, and detail views
+├── tui-client-adapter.ts # Pinned SDK server-correlation adapter
+├── tui-models.ts         # Host/snapshot reconciliation + metadata coverage
+├── tui-renderer.ts       # Typed imperative OpenTUI adapter
+├── catalog-snapshot.ts   # Evidence schema + atomic server/TUI snapshot bridge
 ├── discover.ts           # Core discovery engine — pipeline orchestrator + table formatter
 ├── models-dev.ts         # models.dev fallback matching
 ├── format.ts             # Model name + number/byte formatting utilities
@@ -19,6 +23,7 @@ src/
     ├── util.ts            # Shared utilities: buildHeaders, probeFetch, EMPTY_RESULT
     ├── index.ts           # Probe registry + resolveProbe (supports "auto")
     ├── fingerprint.ts     # Server auto-detection (tiered fingerprinting)
+    ├── atlas.ts           # Atlas probe implementation
     ├── omlx.ts            # oMLX probe implementation
     ├── ollama.ts          # Ollama probe implementation
     ├── vllm.ts            # vLLM probe implementation
@@ -38,10 +43,13 @@ sequenceDiagram
     participant FP as Fingerprint
     participant PR as Probe
     participant MD as models.dev
+    participant CS as Catalog Snapshot
+    participant TU as TUI Plugin
 
     OC->>PI: Load plugin
     PI->>OC: Return hooks
     OC->>PI: config hook(config)
+    PI->>CS: Write running marker
     PI->>MD: fetchModelsDevIndex(client)
     MD-->>PI: FlatModel[] index
     PI->>DM: discoverModels(config, index)
@@ -66,13 +74,15 @@ sequenceDiagram
         DM->>DM: Merge into config
     end
 
-    DM-->>PI: Done
+    DM-->>PI: Config + evidence records
+    PI->>CS: Write completed evidence snapshot
     PI-->>OC: Config enriched
 
-    Note over OC,PI: Later, in the TUI process...
-    OC->>PI: /modelscout (api.command.register onSelect)
-    PI->>PI: collectModelGroups(api.state.provider) + render dialog
-    PI-->>OC: api.ui.dialog (model table) — no model turn
+    Note over OC,TU: Later, in the TUI plugin realm...
+    OC->>TU: /modelscout (api.command.register onSelect)
+    TU->>CS: Read exact server/worktree snapshot
+    TU->>TU: Reconcile with api.state.provider
+    TU-->>OC: Grouped list/detail browser, no model turn
 ```
 
 ### Enrichment Pipeline
@@ -133,44 +143,13 @@ config fields with specific precedence rules:
 
 ```mermaid
 flowchart LR
-    subgraph "ProbeModelMeta"
-        ctx["context"]
-        mt["maxTokens"]
-        mtype["modelType"]
-        vis["vision"]
-        tc["toolCall"]
-        rea["reasoning"]
-        tmp["temperature"]
-        fam["family"]
-        ps["parameterSize"]
-        qnt["quantization"]
-        sb["sizeBytes"]
-    end
-
-    subgraph "Model Config"
-        lim["limit.context<br/>limit.output"]
-        mod["modalities"]
-        att["attachment"]
-        tc2["tool_call"]
-        rea2["reasoning"]
-        tmp2["temperature"]
-        fam2["family"]
-        ps2["parameterSize"]
-        qnt2["quantization"]
-        sb2["sizeBytes"]
-    end
-
-    ctx --> lim
-    mt --> lim
-    mtype --> mod
-    vis --> att
-    tc --> tc2
-    rea --> rea2
-    tmp --> tmp2
-    fam --> fam2
-    ps --> ps2
-    qnt --> qnt2
-    sb --> sb2
+    P["Probe metadata"] --> A["applyProbeMeta"]
+    A --> C["Known config fields"]
+    A --> L["Per-field evidence ledger"]
+    C --> M["Merged provider config"]
+    L --> N["Authoritative negatives"]
+    L --> D["Probe-only diagnostics"]
+    L --> S["Catalog snapshot"]
 ```
 
 Key rules:
@@ -179,11 +158,56 @@ Key rules:
 - VLM model type → `modalities: { input: ["text", "image"], output: ["text"] }`
   - `attachment: true`
 - LLM model type → `modalities: { input: ["text"], output: ["text"] }`
-- Capability flags (`tool_call`, `reasoning`, `temperature`) are only set if
-  the model doesn't already have them
-- Capability flags are never emitted as `false`. An authoritative probe may
-  report `false` internally to block conflicting fallback metadata; unknown
-  values remain eligible for fallback.
+- Capability fields are only set if the model doesn't already have them.
+- Authoritative false values for `tool_call`, `reasoning`, and `attachment`
+  remain internal fallback-denial sentinels. Unknown values remain eligible for
+  fallback. An explicit probe `temperature: false` is preserved because
+  temperature is a valued provider option.
+- Parameter size, quantization, disk size, probe identity, source, and claim
+  strength stay in the evidence snapshot rather than becoming unknown opencode
+  model configuration fields.
+
+### Catalog Evidence Bridge
+
+The config hook and TUI plugin run in separate JavaScript realms within the same
+opencode process in the current host runtime. Discovery keeps a typed evidence
+ledger while it applies the normal config precedence rules, then writes a
+versioned snapshot under the opencode XDG cache. The filename uses SHA-256
+worktree and server keys. The payload stores neither raw worktree paths nor raw
+server URLs. A future host that moves either plugin to another process fails
+closed to host-only browsing because the runtime hashes no longer match.
+
+The local TUI SDK uses the virtual origin `http://opencode.internal`, while the
+server plugin receives an HTTP loopback URL. `createServerKey()` canonicalizes
+the virtual origin plus `localhost`, `127.0.0.1`, and `::1` at any port. Direct
+non-loopback server URLs remain distinct. A separate runtime hash derived from
+`process.pid` distinguishes concurrent local processes without storing a raw
+PID.
+
+Snapshot writes follow a running-marker and completion protocol:
+
+1. The server creates an attempt ID and atomically claims its server/worktree
+   file before discovery. Snapshot and lock writes observe the config-hook
+   abort signal before their atomic rename.
+2. Discovery records provider outcomes and per-field evidence without changing
+   the emitted config contract.
+3. Completion replaces only the running marker owned by the same attempt.
+4. On command open, the TUI validates schema, runtime key, server key, worktree
+   key, provider fingerprint, file size, and both startup bounds before
+   accepting evidence.
+5. Any mismatch falls back to `api.state.provider`; authoritative negatives and
+   probe-only fields are never accepted from an uncorrelated snapshot.
+
+Provider fingerprints cover every provider with a non-empty
+`options.baseURL`. The hash input contains provider ID, configured probe, and a
+credential-free normalized base URL including its path. The snapshot stores
+only the hash. Snapshot locks use a conservative stale threshold longer than
+the maximum 60-second hook budget and retry acquisition once after recovery.
+
+`src/tui-client-adapter.ts` intentionally isolates one pinned generated-SDK
+detail: the runtime client owns a `client.getConfig().baseUrl` property whose
+TypeScript declaration is protected. Shape drift must return `undefined` and
+degrade to host-only browsing rather than throwing.
 
 ### Server Auto-Detection
 
@@ -299,8 +323,10 @@ Probes must follow these rules:
 4. **Never write to stdout/stderr** (no `console.*`). Probes run in opencode's
    config hook at startup; any output leaks into opencode. Fail silently.
 5. **Leave unknown capabilities undefined.** Return `false` only when the
-   provider reports an authoritative boolean; discovery uses it to block a
-   conflicting fallback and removes the internal sentinel before config merge.
+   provider reports an authoritative boolean. Discovery keeps tool, reasoning,
+   and attachment negatives as internal fallback-denial sentinels, then removes
+   them before config merge. An explicit temperature false remains a normal
+   valued option.
 
 ### Step-by-Step
 
@@ -608,7 +634,11 @@ opencode-model-scout/
 │   ├── constants.ts       # Single source of truth for all naming strings
 │   ├── index.ts            # Server plugin entry — config-hook discovery
 │   ├── tui.ts              # TUI plugin entry — /modelscout dialog command
-│   ├── tui-models.ts       # TUI data layer — SDK models → rows + formatters
+│   ├── tui-browser.ts      # Interactive browser + facets + keyboard flow
+│   ├── tui-client-adapter.ts # Pinned SDK correlation boundary
+│   ├── tui-models.ts       # Host/snapshot reconciliation + coverage
+│   ├── tui-renderer.ts     # Typed imperative OpenTUI adapter
+│   ├── catalog-snapshot.ts # Evidence schema + persistence
 │   ├── discover.ts         # Pipeline orchestrator + table formatter (largest file)
 │   ├── models-dev.ts       # models.dev index + matching
 │   ├── format.ts           # Model name + number/byte prettification
@@ -617,6 +647,7 @@ opencode-model-scout/
 │       ├── util.ts          # Shared probe utilities
 │       ├── index.ts         # Registry + resolveProbe (supports "auto")
 │       ├── fingerprint.ts   # Server auto-detection (tiered)
+│       ├── atlas.ts         # Atlas probe
 │       ├── omlx.ts          # oMLX probe
 │       ├── ollama.ts        # Ollama probe
 │       ├── vllm.ts          # vLLM probe
@@ -626,6 +657,7 @@ opencode-model-scout/
 │       └── koboldcpp.ts     # KoboldCpp probe
 ├── test/
 │   ├── probes/
+│   │   ├── atlas.test.ts
 │   │   ├── omlx.test.ts
 │   │   ├── ollama.test.ts
 │   │   ├── fingerprint.test.ts
@@ -639,7 +671,11 @@ opencode-model-scout/
 │   ├── format.test.ts
 │   ├── format-table.test.ts
 │   ├── tui.test.ts
+│   ├── tui-browser.test.ts
+│   ├── tui-client-adapter.test.ts
 │   ├── tui-models.test.ts
+│   ├── tui-renderer.test.ts
+│   ├── catalog-snapshot.test.ts
 │   └── models-dev.test.ts
 ├── package.json
 ├── tsconfig.json

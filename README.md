@@ -304,46 +304,120 @@ context or output limits — those vary too much across quantization levels and
 providers to be guessed reliably.
 
 Atlas reports capability booleans authoritatively. A reported `false` blocks a
-models.dev fallback from enabling that capability, but the final opencode config
-still omits false flags. Missing, malformed, or otherwise unknown values remain
-eligible for fallback enrichment.
+models.dev fallback from enabling tool calling, reasoning, or attachment. Those
+negative values remain internal sentinels and are not emitted as false config
+flags. Temperature is a valued provider option, so an explicit probe
+`temperature: false` is preserved in the final opencode config. Missing,
+malformed, or otherwise unknown values remain eligible for fallback enrichment.
 
 ## `/modelscout` Command
 
-Inspect the discovered models in a TUI dialog:
+Inspect and filter discovered models in an interactive TUI browser:
 
 ```
-/modelscout    Open a dialog listing discovered models with metadata
+/modelscout    Open the interactive model and provider browser
 ```
 
-Selecting `/modelscout` from the slash autocomplete opens a scrollable dialog —
-it never sends a message to the model and never starts an assistant turn. Press
-**`esc`** to close it.
+Selecting `/modelscout` from slash autocomplete opens a dialog without sending
+a message to the model or starting an assistant turn. The full-width result
+list groups models beneath selectable provider headers. Press `enter` on a
+model to inspect its metadata, or on a provider header to inspect discovery
+status, probes, metadata gaps, and capability evidence. `backspace` returns to
+the preserved list, search, filters, and selection.
 
-Models are grouped by provider. Each model is shown on two compact lines: its id
-on the first, and a detail line with model type, context/output limits (compact,
-e.g. `ctx 262K`), on-disk size, capability flags (Vision, Tools, Reasoning), and
-provenance (family, parameter size, quantization). Example contents:
+The result list owns focus when the dialog opens, so `up` and `down` work
+immediately. Press `/` to focus search; pressing an arrow from search returns to
+the result list. Rows stay to one line so large catalogs remain scannable at
+narrow and wide terminal widths.
 
+| Key           | Action                                                   |
+| ------------- | -------------------------------------------------------- |
+| `up` / `down` | Move through results or scroll details                   |
+| `enter`       | Move from search to results or open the selected details |
+| `/`           | Return to the list if needed and focus search            |
+| `p`           | Cycle provider when more than one provider is available  |
+| `t`           | Cycle model type                                         |
+| `c`           | Cycle capability                                         |
+| `s`           | Cycle capability evidence state                          |
+| `m`           | Cycle complete/missing core metadata                     |
+| `o`           | Cycle discovered/pre-existing origin                     |
+| `r`           | Reset all model filters                                  |
+| `backspace`   | Return from details to the preserved list                |
+| `esc`         | Close the browser                                        |
+
+Model filter shortcuts work outside the search input. The active filter row
+shows the current provider, type, capability, evidence state, metadata, and
+origin values. The footer only advertises keys that work for the current
+focus: while search owns input it lists the search actions, and on list or
+detail screens it lists navigation plus the filter shortcuts. The facet key
+hint omits `p` for single-provider catalogs and `o` when exact origin
+evidence is unavailable. If a filter combination empties the results, the
+shortcuts stay active so you can keep cycling or press `r` to reset while any
+search query stays in place; `enter` or an arrow from search returns to those
+shortcuts even with zero results.
+
+Provider header rows carry a permanent `▸ ` marker, a `visible/total` model
+count when search or filters hide some models, core coverage for the visible
+models, and a `discovery <status>` cell. Searching for a provider name, ID,
+or endpoint shows that provider with all of its models that match the active
+filters; if a model filter excludes every model, the header hides too.
+Zero-model and failed providers stay reachable while no model filter is
+active. Origin filtering is unavailable when the TUI cannot correlate the
+current server discovery attempt.
+
+The detail screen uses three evidence states:
+
+| State         | Meaning                                                          |
+| ------------- | ---------------------------------------------------------------- |
+| `supported`   | A source reports or infers support                               |
+| `unsupported` | A probe or pre-existing configuration explicitly reports `false` |
+| `unknown`     | No authoritative value was reported; this is expected            |
+
+Each known value includes a concise bracketed source label such as `probe`,
+`config`, `server`, `models.dev`, `heuristic`, `default`, or `host`. Core
+metadata coverage is type-aware. Language and vision-language models use type,
+context, output, vision, tools, reasoning, and temperature. Embedding models use
+type and context.
+
+### Provenance Snapshot
+
+opencode's public provider state does not retain all probe diagnostics or
+authoritative negative evidence. The server plugin therefore writes a bounded,
+versioned snapshot to:
+
+```text
+$XDG_CACHE_HOME/opencode/model-scout/<worktree-hash>.<server-hash>.json
 ```
-Model Scout
 
-oMLX (local) — 3 models
-  gemma-4-26b-a4b-it-4bit
-    vlm  ·  ctx 262K  ·  out 33K  ·  Vision Tools Reasoning  ·  gemma
-  GLM-4.7-Flash-MLX-8bit
-    llm  ·  ctx 203K  ·  out 33K  ·  Tools Reasoning
-  qwen3-coder-next
-    llm  ·  ctx 262K  ·  out 33K  ·  43.8 GB  ·  Tools  ·  qwen 30B MXFP4
-```
+The file and directory use owner-only permissions where supported. The snapshot
+contains model IDs, metadata evidence, provider status, and sanitized endpoint
+origins. It does not contain API keys, authorization headers, response bodies,
+raw worktree paths, server URLs, URL credentials, paths, queries, fragments, or
+raw errors or process IDs. Writes use a temporary file and atomic rename. The
+payload carries a runtime hash derived from the process ID. The TUI computes the
+same hash independently and accepts a snapshot only when its runtime, server,
+worktree, provider fingerprint, schema, and lower and upper startup bounds match
+the active session. A process mismatch falls back to host state.
+
+For correlation, `http://opencode.internal` and HTTP control-server URLs on
+`localhost`, `127.0.0.1`, or `::1` map to one internal server key at any port.
+The runtime hash separates concurrent local launches. Direct non-loopback URLs
+remain distinct. Provider fingerprints include provider ID, configured probe,
+and the credential-free normalized base URL including its path. None of those
+raw values are stored in the fingerprint.
+
+Set `OPENCODE_MODEL_SCOUT_DISABLE_PERSISTENCE=1` before starting opencode to
+disable disk snapshots. The browser still works from opencode's effective host
+state, but origin, provider-attempt diagnostics, probe-only metadata, and exact
+source labels may be unavailable. Existing cache files can be removed from the
+directory above.
 
 > **Requires a TUI-capable opencode.** The command is registered through
 > opencode's TUI plugin command API; the model-discovery and enrichment that
 > happen at startup work everywhere, but on a host without the TUI plugin
-> runtime the `/modelscout` command simply does not appear. The dialog lists
-> every model from OpenAI-compatible/local providers in the merged config — it
-> does not separately label already-configured or skipped models, since that
-> discovery-only framing is not exposed to the TUI process.
+> runtime the `/modelscout` command simply does not appear. If exact provenance
+> cannot be loaded, the command degrades to the host-state browser rather than
+> hiding models or failing to open.
 
 ## Timeouts and Resilience
 
@@ -354,6 +428,10 @@ The plugin is designed to never block opencode startup:
 - **The entire config hook** has a 5-second abort timeout. Model-list requests,
   fingerprinting, and Atlas detail requests consume that signal. Legacy probes
   remain bounded by their individual request and body-read timeouts.
+- **The startup budget is configurable** with
+  `OPENCODE_MODEL_SCOUT_TIMEOUT_MS`. Valid values are clamped to 10 through
+  60000 milliseconds. Missing, non-numeric, or non-positive values use the
+  5-second default.
 - **Per-provider isolation** — each provider is wrapped in its own try-catch,
   so a failing provider never prevents discovery for other providers
 - **Per-model Atlas isolation** — detail requests use bounded concurrency and
@@ -361,9 +439,13 @@ The plugin is designed to never block opencode startup:
 - **All errors are caught and isolated** — a failing probe, an offline provider,
   or a malformed response never crashes the plugin or prevents opencode from
   starting
-- **Capability flags are never emitted as `false`** — an authoritative probe
-  value can block fallback internally, while unknown values remain eligible for
-  enrichment
+- **Negative chat capability flags stay internal.** Authoritative false values
+  for tool calling, reasoning, and attachment block fallback without becoming
+  emitted false flags. An explicit `temperature: false` remains in the config
+  because temperature is a valued option.
+- **Provenance persistence is best-effort.** Missing, disabled, corrupt,
+  mismatched, oversized, or unwritable snapshots never block startup. They only
+  remove provenance-specific TUI details.
 
 ## Manually Configured Models
 

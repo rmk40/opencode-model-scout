@@ -2,7 +2,7 @@
 export const PLUGIN_NAME = "opencode-model-scout";
 
 /**
- * Slash command name (without leading slash). Registered in the TUI process via
+ * Slash command name (without leading slash). Registered in the TUI realm via
  * `api.command.register` (`slash.name`), so `/modelscout` opens a dialog with no
  * model turn.
  */

@@ -21,6 +21,20 @@ export default tseslint.config(
     files: ["*.config.ts", "*.config.js"],
     extends: [tseslint.configs.disableTypeChecked],
   },
+  {
+    files: ["scripts/**/*.mjs"],
+    extends: [tseslint.configs.disableTypeChecked],
+    languageOptions: {
+      globals: {
+        AbortSignal: "readonly",
+        clearTimeout: "readonly",
+        console: "readonly",
+        fetch: "readonly",
+        process: "readonly",
+        setTimeout: "readonly",
+      },
+    },
+  },
   // Global rule customization
   {
     rules: {

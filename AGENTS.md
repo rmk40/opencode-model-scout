@@ -7,7 +7,11 @@ opencode plugin: auto-discovers models from OpenAI-compatible providers, enriche
 ```
 src/index.ts       → Server plugin entry, config hook with AbortSignal.timeout(5s)
 src/tui.ts         → TUI plugin entry (TuiPluginModule): /modelscout slash command + dialog
-src/tui-models.ts  → TUI data layer: SDK provider/model → display rows (collectModelGroups)
+src/tui-browser.ts → Interactive browser state, facets, search, and details
+src/tui-models.ts  → Host/snapshot reconciliation and core metadata coverage
+src/tui-renderer.ts → Typed imperative OpenTUI reconciler adapter
+src/tui-client-adapter.ts → Pinned SDK server-correlation boundary
+src/catalog-snapshot.ts → Evidence schema and atomic server/TUI snapshot bridge
 src/discover.ts    → Pipeline orchestrator, per-provider isolation, DiscoverySnapshot table formatter
 src/models-dev.ts  → models.dev fallback (reads XDG cache file directly)
 src/format.ts      → Pure formatters (model names, numbers/compact, bytes)
@@ -30,7 +34,9 @@ import.
 
 - **Server vs TUI plugin config split**: opencode loads **server** plugins (`./server`) from the `plugin` array in `opencode.json`, but **TUI** plugins (`./tui`) from a _separate_ `plugin` array in `tui.json`. Listing the package only in `opencode.json` runs discovery but the `/modelscout` command never appears. `opencode plugin …` patches both files; manual installs must add both.
 - **Shipped runtime uses `api.command.register`, not `api.keymap.registerLayer`**: 1.17.7 only surfaces third-party plugin slash commands via the (deprecated-typed but wired) `api.command.register(cb)` with `{ slash: { name }, onSelect }`. `api.keymap.registerLayer` exists in the types but is not wired for external plugins (see issues #10262/#5305).
-- **TUI dialog layout**: `api.ui.dialog.replace(render)` content is wrapped by the host's centered, fixed-width `Dialog` panel. Return a _content-sized_ box (no `flexGrow`/`minHeight`) or it bleeds off-center; bound the scroll area with `maxHeight` from `api.renderer.terminalHeight`. `replace()` resets size to `"medium"`, so call `setSize("xlarge")` _after_ `replace`. Omit the stack entry `onClose` (the host pops the stack on esc; calling `clear()` from `onClose` recurses).
+- **TUI dialog layout.** `api.ui.dialog.replace(render)` content is wrapped by the host's centered, fixed-width `Dialog` panel. Return a _content-sized_ box (no `flexGrow`/`minHeight`) or it bleeds off-center; bound the browser from `api.renderer.terminalHeight`. Use one grouped list with selectable provider headers and indented model rows. `enter` replaces the list with details, and `backspace` restores the preserved list state. OpenTUI widths are content-box widths, so subtract explicit padding from the root width and reserve columns for Select's gutter and scrollbar. Theme normal, focused, and selected Select surfaces explicitly or the widget defaults render as a black inset panel. `replace()` resets size to `"medium"`, so call `setSize("xlarge")` _after_ `replace`. An `onClose` callback may dispose key listeners but must never call `clear()` (that recurses while the host pops the stack).
+- **TUI focus is explicit.** OpenTUI 0.3.4 does not cycle plugin focus on Tab. The browser listens through `api.renderer.keyInput`, focuses the unified result list on open, routes `/` to search and arrows back to results, consumes only its own keys, and disposes the listener when the dialog closes. Do not add a top-level Models/Providers switch; provider diagnostics are opened from provider header rows.
+- **Provenance can cross a runtime boundary.** The public provider state drops probe-only diagnostics and negative evidence. The server writes a bounded, owner-only XDG cache snapshot keyed by hashed worktree and server identities. The payload also carries a runtime hash derived from `process.pid`. The TUI accepts it only after exact runtime, server, worktree, provider, schema, and startup-window correlation. `http://opencode.internal` and HTTP loopback URLs at any port share one internal server key. Missing or invalid snapshots must degrade to host-only rows.
 - **Config hook deadlock**: `client.provider.list()` cannot be called during the config hook — it routes through opencode's in-process Hono server to `Provider.list()` which depends on `InstanceState` that blocks on config hook completion. Circular dependency. Read `$XDG_CACHE_HOME/opencode/models.json` directly instead (see `src/models-dev.ts`).
 - **Config is immutable after init**: No hot-reload. The config hook is the one shot to add models.
 - **`options.probe` not top-level**: opencode's `Config.Provider` uses `.strict()` (rejects unknown fields) but `options` uses `.catchall(z.any())`. Probe config must be inside `options`.
@@ -40,11 +46,12 @@ import.
 ## Signal/Timeout Flow
 
 ```
-index.ts: AbortSignal.timeout(5000)
+index.ts: hard 5s default budget (OPENCODE_MODEL_SCOUT_TIMEOUT_MS: 10-60000ms)
   → discoverModels(signal) — breaks loop if aborted
     → fetchModels(signal) via probeFetch(timeoutMs: 3000)
     → resolveProbe(signal) → fingerprint(signal) via probeFetch(timeoutMs: 1000)
-    → individual probes: no global signal, bounded by probeFetch 2s default
+    → Atlas probe observes the global signal for every detail request
+    → legacy probes rely on local probeFetch/body-read bounds
 ```
 
 ## Commands
