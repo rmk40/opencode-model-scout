@@ -34,7 +34,7 @@ export const probeKoboldcpp: ProviderProbe = async (
     const modelId = context?.modelsResponse?.[0]?.id;
     if (!modelId) return EMPTY_RESULT;
 
-    const headers = buildHeaders(apiKey);
+    const headers = buildHeaders(apiKey, context?.headers);
 
     const meta: ProbeModelMeta = {};
 

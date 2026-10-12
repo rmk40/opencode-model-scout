@@ -26,7 +26,7 @@ export const probeSglang: ProviderProbe = async (
   context?: ProbeContext,
 ): Promise<ProbeResult> => {
   try {
-    const headers = buildHeaders(apiKey);
+    const headers = buildHeaders(apiKey, context?.headers);
 
     const info = await probeFetchJson<SglangModelInfoResponse>(
       `${baseURL}/model_info`,

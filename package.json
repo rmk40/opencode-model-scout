@@ -1,22 +1,26 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-model-scout",
-  "version": "1.7.0",
-  "description": "opencode plugin that auto-discovers models from OpenAI-compatible providers and enriches them with context window sizes, capability flags, and model metadata. Supports Atlas, Ollama, oMLX, vLLM, TGI, SGLang, LM Studio, KoboldCpp, llama.cpp, and LocalAI.",
+  "version": "2.0.0",
+  "description": "opencode plugin that auto-discovers models from OpenAI-compatible providers and enriches them with context window sizes, capability flags, and model metadata. Supports Actualyze, Ollama, oMLX, vLLM, TGI, SGLang, LM Studio, KoboldCpp, llama.cpp, and LocalAI.",
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./dist/server.js",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
     },
     "./server": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
     },
     "./tui": {
       "types": "./dist/tui.d.ts",
       "import": "./dist/tui.js"
+    },
+    "./rpc": {
+      "types": "./dist/rpc.d.ts",
+      "import": "./dist/rpc.js"
     }
   },
   "files": [
@@ -31,11 +35,14 @@
     "format:check": "prettier . --check",
     "test": "vitest",
     "test:run": "vitest run",
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "test:coverage": "vitest run --coverage",
-    "check": "npm run typecheck && npm run lint && npm run format:check && npm run test:run",
+    "check": "npm run typecheck && npm run lint && npm run format:check && npm run test:run && npm run test:e2e && npm run compile && npm run check:dist",
     "fix": "npm run lint:fix && npm run format",
-    "compile": "tsup src/index.ts src/tui.ts --format esm --dts --out-dir dist --clean --external @opentui/core --external @opentui/keymap --external @opentui/solid",
-    "build": "npm run check && npm run compile",
+    "compile": "tsup --dts",
+    "compile:dev": "tsup",
+    "check:dist": "node scripts/check-dist.mjs",
+    "build": "npm run check",
     "prepack": "npm run compile"
   },
   "lint-staged": {
@@ -87,19 +94,14 @@
     "url": "git+https://github.com/rmk40/opencode-model-scout.git"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.17.7",
     "string-width": "7.2.0"
   },
   "peerDependencies": {
-    "@opentui/core": "0.3.4",
-    "@opentui/keymap": "0.3.4",
-    "@opentui/solid": "0.3.4"
+    "@opentui/core": "0.5.17",
+    "@opentui/solid": "0.5.17"
   },
   "peerDependenciesMeta": {
     "@opentui/core": {
-      "optional": true
-    },
-    "@opentui/keymap": {
       "optional": true
     },
     "@opentui/solid": {
@@ -108,9 +110,11 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
-    "@opentui/core": "0.3.4",
-    "@opentui/keymap": "0.3.4",
-    "@opentui/solid": "0.3.4",
+    "@opencode/plugin": "2.0.26",
+    "@opencode/sdk": "2.0.26",
+    "@opencode/theme": "2.0.26",
+    "@opentui/core": "0.5.17",
+    "@opentui/solid": "0.5.17",
     "@types/node": "^25.0.3",
     "@vitest/coverage-v8": "^4.0.16",
     "eslint": "^9.39.2",
@@ -118,9 +122,13 @@
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
     "prettier": "^3.8.2",
+    "solid-js": "1.9.12",
     "tsup": "^8.5.1",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.58.1",
     "vitest": "^4.0.16"
+  },
+  "engines": {
+    "node": "^22.18.0 || >=24.0.0"
   }
 }

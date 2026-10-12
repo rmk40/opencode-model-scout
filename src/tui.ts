@@ -1,115 +1,205 @@
-import type {
-  TuiPlugin,
-  TuiPluginApi,
-  TuiPluginModule,
-  TuiCommand,
-  TuiDialogStack,
-} from "@opencode-ai/plugin/tui";
+import type { Plugin } from "@opencode/plugin/tui";
 import type { BaseRenderable, RGBA } from "@opentui/core";
-import { COMMAND_NAME, PLUGIN_NAME } from "./constants";
-import { formatBytes, compactCount } from "./format";
-import { buildBrowserView, type BrowserView } from "./tui-browser";
+import {
+  validateCatalogPayload,
+  type CatalogPayload,
+} from "./catalog-evidence";
+import { COMMAND_NAME, PLUGIN_ID } from "./constants";
+import { compactCount, formatBytes } from "./format";
+import { ModelScoutRpc } from "./rpc";
+import {
+  buildBrowserView,
+  type BrowserTheme,
+  type BrowserView,
+} from "./tui-browser";
 import {
   collectModelGroups,
-  hostProviderFingerprint,
+  isDiscoveryStarting,
+  type HostCatalog,
   type ModelRow,
   type ProviderGroup,
-  type SdkProviderView,
 } from "./tui-models";
 import { TuiRenderer, type ReconcilerBridge } from "./tui-renderer";
-import {
-  createRuntimeKey,
-  createWorktreeKey,
-  resolveExactCatalogSnapshot,
-  type CatalogCorrelation,
-  type ExactCatalogSnapshot,
-} from "./catalog-snapshot";
-import { serverKeyFromPinnedClient } from "./tui-client-adapter";
 
-/** Slash command that opens the dialog. */
-const SHOW_SLASH = COMMAND_NAME;
+type Context = Plugin.Context;
 
-/** Flags worth showing, in display order. "Temp" is omitted as near-universal. */
-const DISPLAY_FLAGS = ["Vision", "Tools", "Reasoning"] as const;
-const TUI_PROCESS_STARTED_AT_MS = Date.now() - process.uptime() * 1000;
-// The server config hook completes before opencode starts the TUI plugin worker.
-// Allow that short handoff while server/worktree/fingerprint keys provide the
-// exact correlation; this is not a standalone TTL-based identity check.
-const SNAPSHOT_HANDOFF_TOLERANCE_MS = 5_000;
-const SNAPSHOT_STARTUP_WINDOW_MS = 60_000;
-
-/** Keep the SDK structural cast at one boundary. */
-function providerViews(api: TuiPluginApi): readonly SdkProviderView[] {
-  return (api.state.provider ?? []) as unknown as readonly SdkProviderView[];
+/** The location query every request of one dialog shares. */
+interface LocationQuery {
+  readonly directory: string;
 }
 
-function catalogCorrelation(
-  api: TuiPluginApi,
-  providers: readonly SdkProviderView[],
-): CatalogCorrelation | undefined {
-  const serverKey = serverKeyFromPinnedClient(api.client);
-  const worktree = api.state.path?.worktree;
-  if (!serverKey || typeof worktree !== "string" || worktree.length === 0)
-    return undefined;
+const SHOW_COMMAND_ID = `${COMMAND_NAME}.show`;
+const HOST_TIMEOUT_MS = 10_000;
+const CATALOG_TIMEOUT_MS = 3_000;
+const REFRESH_TIMEOUT_MS = 5_000;
+/** Width of OpenCode's `xlarge` dialog panel. */
+const XLARGE_DIALOG_COLUMNS = 116;
+
+/** Flags worth showing, in display order. "Temp" is omitted as near-universal. */
+const DISPLAY_FLAGS = ["Image", "Tools", "Reasoning"] as const;
+
+interface ScoutTheme extends BrowserTheme {
+  error: RGBA;
+}
+
+/**
+ * Map the host's dialog surface onto the browser's color roles, matching the
+ * host's own select dialog. Read on every render: `context.theme` follows the
+ * active theme.
+ */
+function scoutTheme(context: Context): ScoutTheme {
+  const tokens = context.theme.surface("dialog");
   return {
-    serverKey,
-    worktreeKey: createWorktreeKey(worktree),
-    runtimeKey: createRuntimeKey(),
-    providerFingerprint: hostProviderFingerprint(providers),
-    diskNotBeforeMs: TUI_PROCESS_STARTED_AT_MS - SNAPSHOT_HANDOFF_TOLERANCE_MS,
-    diskNotAfterMs: TUI_PROCESS_STARTED_AT_MS + SNAPSHOT_STARTUP_WINDOW_MS,
+    text: tokens.text.base,
+    textMuted: tokens.text.muted,
+    error: tokens.text.feedback.error.base,
+    primary: tokens.background.action.primary.focused,
+    accent: tokens.hue.accent[200],
+    backgroundPanel: tokens.background.base,
+    backgroundElement: tokens.background.raised.high,
+    selectedListItemText: tokens.text.action.primary.focused,
   };
 }
 
 /**
- * The subset of the @opentui/solid reconciler used by the typed renderer.
- * Loaded lazily (see `loadRenderer`) so that importing this module never
- * forces a top-level dependency on @opentui — command registration must
- * succeed even if the rendering layer is unavailable.
+ * Loaded lazily so command registration never depends on OpenTUI; the host
+ * injects its own `@opentui/solid` for this specifier at runtime.
  */
 async function loadRenderer(): Promise<TuiRenderer> {
   const mod = (await import("@opentui/solid")) as unknown as ReconcilerBridge;
   return new TuiRenderer(mod);
 }
 
-/** Read the discoverable provider/model groups from the TUI's merged state. */
-function readGroups(
-  api: TuiPluginApi,
-  exact?: ExactCatalogSnapshot,
-): ProviderGroup[] {
-  // `api.state.provider` is the server's merged provider list (includes the
-  // models the server plugin injected at startup). Treated as a structural
-  // view so this module never hard-depends on the SDK types.
-  return collectModelGroups(providerViews(api), exact);
+function finitePositive(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : undefined;
 }
 
 /** Total content rows available inside the host's dialog chrome. */
-function contentHeight(api: TuiPluginApi): number {
-  const term = api.renderer?.terminalHeight;
-  const rows =
-    typeof term === "number" && Number.isFinite(term) && term > 0
-      ? Math.floor(term)
-      : 24;
-  // Short terminals need most of their dialog area covered; tall terminals need
-  // a cap so plugin content stays above the host status line.
+function contentHeight(context: Context): number {
+  const rows = finitePositive(context.renderer.terminalHeight) ?? 24;
+  // The host places dialogs a quarter of the screen down; this keeps the
+  // content above the status line on short terminals and caps it on tall ones.
   return Math.min(25, Math.max(1, rows - 12));
 }
 
-/** Bounded columns for row clipping inside the host's xlarge dialog. */
-function contentWidth(api: TuiPluginApi): number {
-  const columns = api.renderer?.terminalWidth;
-  if (typeof columns !== "number" || !Number.isFinite(columns) || columns <= 0)
-    return 80;
-  return Math.max(1, Math.min(120, Math.floor(columns) - 8));
+/** Outer content columns: the xlarge panel, narrowed on small terminals. */
+function contentWidth(context: Context): number {
+  const columns = finitePositive(context.renderer.terminalWidth);
+  if (columns === undefined) return 80;
+  return Math.max(1, Math.min(XLARGE_DIALOG_COLUMNS, columns - 2));
 }
+
+// ── Data ────────────────────────────────────────────────────────────────
+
+interface Snapshot {
+  groups: ProviderGroup[];
+  notice?: string;
+}
+
+interface Evidence {
+  payload?: CatalogPayload;
+  notice?: string;
+}
+
+/** RPC calls reject with plain `{ type, message }` objects, not errors. */
+interface RpcFailure {
+  type: string;
+  message: string;
+}
+
+function isRpcFailure(value: unknown): value is RpcFailure {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as { type?: unknown }).type === "string"
+  );
+}
+
+function describeRpcFailure(error: unknown): string {
+  if (isRpcFailure(error))
+    return error.type === "rpc.unavailable"
+      ? "server plugin unavailable"
+      : `server error (${error.type})`;
+  if (
+    error instanceof Error &&
+    (error.name === "TimeoutError" || error.name === "AbortError")
+  )
+    return "server timed out";
+  return "server unreachable";
+}
+
+/** Pending payloads re-render through the `updated` event once targets resolve. */
+function catalogNotice(payload: CatalogPayload): string | undefined {
+  if (payload.status === "running") return "discovery running";
+  if (isDiscoveryStarting(payload)) return "discovery starting";
+  if (payload.status === "pending") return "discovery pending";
+  return undefined;
+}
+
+function refreshSkippedNotice(reason: unknown): string {
+  if (reason === "throttled")
+    return "refresh skipped: the last one was under a minute ago";
+  if (reason === "no-targets")
+    return "refresh skipped: no providers to discover";
+  return "refresh skipped";
+}
+
+async function readHost(
+  context: Context,
+  location: LocationQuery,
+): Promise<HostCatalog> {
+  const signal = AbortSignal.timeout(HOST_TIMEOUT_MS);
+  const [providers, models] = await Promise.all([
+    context.client.provider.list({ location }, { signal }),
+    context.client.model.list({ location }, { signal }),
+  ]);
+  return { providers: providers.data, models: models.data };
+}
+
+/** Discovery evidence, or a notice saying why only host rows are shown. */
+async function readEvidence(
+  context: Context,
+  location: LocationQuery,
+): Promise<Evidence> {
+  try {
+    const output: unknown = await context.client
+      .rpc(ModelScoutRpc)
+      .catalog(
+        {},
+        { location, signal: AbortSignal.timeout(CATALOG_TIMEOUT_MS) },
+      );
+    const payload = validateCatalogPayload(output);
+    if (!payload) return { notice: "host state only: invalid server evidence" };
+    return { payload, notice: catalogNotice(payload) };
+  } catch (error) {
+    return { notice: `host state only: ${describeRpcFailure(error)}` };
+  }
+}
+
+async function loadSnapshot(
+  context: Context,
+  location: LocationQuery,
+): Promise<Snapshot> {
+  const [host, evidence] = await Promise.all([
+    readHost(context, location),
+    readEvidence(context, location),
+  ]);
+  return {
+    groups: collectModelGroups(host, evidence.payload),
+    notice: evidence.notice,
+  };
+}
+
+// ── Fallback content ────────────────────────────────────────────────────
 
 /**
  * The fallback text block is newline-structured, so provider/model controlled
  * strings must not smuggle their own line or paragraph breaks (or bidi
- * embedding/isolate controls) into it. Same threat model as the interactive
- * browser: C0/C1 controls, line/paragraph separators, and bidi controls are
- * replaced with spaces while ZWJ, variation selectors, and other joiners that
- * legitimate names rely on pass through.
+ * embedding/isolate controls) into it. C0/C1 controls, line/paragraph
+ * separators, and bidi controls become spaces; joiners and variation
+ * selectors that legitimate names rely on pass through.
  */
 function sanitizeFallbackValue(value: string): string {
   return value.replace(
@@ -118,7 +208,10 @@ function sanitizeFallbackValue(value: string): string {
   );
 }
 
-/** Single-space-joined detail segment for a model's metadata line. */
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function modelDetail(model: ModelRow): string {
   const parts: string[] = [];
   if (model.type) parts.push(sanitizeFallbackValue(model.type));
@@ -127,42 +220,28 @@ function modelDetail(model: ModelRow): string {
   if (model.output !== undefined)
     parts.push(`out ${compactCount(model.output)}`);
   if (model.sizeBytes !== undefined) parts.push(formatBytes(model.sizeBytes));
-
-  const flags = DISPLAY_FLAGS.filter((f) => model.flags.includes(f));
-  if (flags.length > 0) parts.push(sanitizeFallbackValue(flags.join(" ")));
-
+  const flags = DISPLAY_FLAGS.filter((flag) => model.flags.includes(flag));
+  if (flags.length > 0) parts.push(flags.join(" "));
   const provenance = [model.family, model.parameterSize, model.quantization]
-    .filter((v): v is string => Boolean(v))
+    .filter((value): value is string => Boolean(value))
     .map(sanitizeFallbackValue)
     .join(" ");
   if (provenance) parts.push(provenance);
-
+  if (!model.enabled) parts.push("disabled");
   return parts.join("  ·  ");
 }
 
-/**
- * Build the whole table as a single plain-text block. Each model is two lines:
- *
- *   gemma-4-26b-a4b-it-4bit
- *     vlm  ·  ctx 262K  ·  out 32K  ·  19.2 GB  ·  Vision Tools  ·  gemma
- *
- * Rendering as one `<text content=…>` (rather than per-line elements or spans)
- * is the only structure that renders reliably in the host: text nodes take
- * their text from `content`, and spans/boxes have repeatedly collapsed or
- * thrown opentui "orphan text" errors.
- */
+/** The whole catalog as one text block, two lines per model. */
 function buildTableText(groups: readonly ProviderGroup[]): string {
-  if (groups.length === 0) {
-    return "No models discovered.\n\nLocal providers may be offline, or no OpenAI-compatible provider is configured.";
-  }
-
+  if (groups.length === 0)
+    return "No models discovered.\n\nNo OpenAI-compatible provider is configured, or discovery has not reported yet. To use Actualyze, add its API key with /connect.";
   const lines: string[] = [];
   for (const [index, group] of groups.entries()) {
     if (index > 0) lines.push("");
     const count = group.models.length;
-    const provider = sanitizeFallbackValue(group.provider);
-    lines.push(`${provider} — ${count} model${count !== 1 ? "s" : ""}`);
-
+    lines.push(
+      `${sanitizeFallbackValue(group.provider)} — ${count} model${count === 1 ? "" : "s"}`,
+    );
     for (const model of group.models) {
       lines.push(`  ${sanitizeFallbackValue(model.id)}`);
       const detail = modelDetail(model);
@@ -173,48 +252,23 @@ function buildTableText(groups: readonly ProviderGroup[]): string {
 }
 
 /**
- * Build the legacy flat-text content. This remains a runtime fallback for an
- * interactive construction failure; normal dialog opens use buildBrowserView.
+ * Flat, scrollable text shown when the interactive browser cannot be built.
+ * One `<text content>` node renders reliably where nested spans do not.
  */
 function buildFallbackContent(
   renderer: TuiRenderer,
-  api: TuiPluginApi,
-  constructionError: unknown,
-  exact?: ExactCatalogSnapshot,
+  context: Context,
+  groups: readonly ProviderGroup[],
+  error: unknown,
 ): BaseRenderable {
-  const theme = api.theme.current;
-  const maxHeight = contentHeight(api);
+  const theme = scoutTheme(context);
+  const maxHeight = contentHeight(context);
   const bodyHeight = Math.max(1, maxHeight - 4);
-
-  let groups: ProviderGroup[] = [];
-  let errorMessage: string | undefined;
-  try {
-    groups = readGroups(api, exact);
-  } catch (err) {
-    errorMessage = err instanceof Error ? err.message : String(err);
-  }
-
-  if (!errorMessage) {
-    errorMessage =
-      constructionError instanceof Error
-        ? constructionError.message
-        : String(constructionError);
-  }
-
-  // Content-sized column: the host wraps this in its centered, fixed-width
-  // dialog panel, so we must NOT use flexGrow/minHeight (that would fill the
-  // whole screen and break centering). The scroll area is bounded by maxHeight.
   const header = renderer.create(
     "box",
     { flexShrink: 0, paddingBottom: 1 },
     renderer.create("text", { fg: theme.text, content: "Model Scout" }),
   );
-
-  // Error messages can carry externally derived text (endpoint responses,
-  // filesystem paths); keep them to their single header line.
-  const content = `(interactive browser unavailable) ${sanitizeFallbackValue(errorMessage)}\n\n${buildTableText(groups)}`;
-  const color: RGBA = theme.error;
-
   const body = renderer.create(
     "scrollbox",
     {
@@ -223,15 +277,16 @@ function buildFallbackContent(
       maxHeight: bodyHeight,
       scrollbarOptions: { visible: false },
     },
-    renderer.create("text", { fg: color, content }),
+    renderer.create("text", {
+      fg: theme.error,
+      content: `(interactive browser unavailable) ${sanitizeFallbackValue(errorText(error))}\n\n${buildTableText(groups)}`,
+    }),
   );
-
   const footer = renderer.create(
     "box",
     { flexShrink: 0, paddingTop: 1 },
     renderer.create("text", { fg: theme.textMuted, content: "esc close" }),
   );
-
   return renderer.raw(
     renderer.create(
       "box",
@@ -251,122 +306,267 @@ function buildFallbackContent(
   );
 }
 
-/** Build the interactive browser from the TUI's effective provider state. */
-function buildContent(
-  renderer: TuiRenderer,
-  api: TuiPluginApi,
-  exact?: ExactCatalogSnapshot,
-): BrowserView {
-  return buildBrowserView(renderer, {
-    groups: readGroups(api, exact),
-    theme: api.theme.current,
-    maxHeight: contentHeight(api),
-    width: contentWidth(api),
-    keyInput: api.renderer.keyInput,
-  });
-}
+// ── Dialog session ──────────────────────────────────────────────────────
 
-/** Surface an error as a toast, never throwing further. */
-function showError(api: TuiPluginApi, err: unknown): void {
+function showError(context: Context, error: unknown): void {
   try {
-    const message = err instanceof Error ? err.message : String(err);
-    api.ui.toast({ variant: "error", title: "Model Scout", message });
-  } catch {
-    // Even the toast failed — swallow rather than escape.
-  }
-}
-
-/**
- * Open the Model Scout dialog. The host dialog stack supplies the surrounding
- * `Dialog` chrome (backdrop, sizing, esc handling) for whatever `replace`
- * returns, so we return the content box directly. Lazily loads the @opentui
- * reconciler; any failure surfaces as a toast and never escapes the runner.
- */
-async function openDialog(
-  api: TuiPluginApi,
-  exact?: ExactCatalogSnapshot,
-): Promise<void> {
-  try {
-    const renderer = await loadRenderer();
-    let disposeBrowser = (): void => {};
-    const disposeDialogBrowser = (): void => {
-      const dispose = disposeBrowser;
-      disposeBrowser = (): void => {};
-      dispose();
-    };
-    try {
-      // The browser root is the reconciler's concrete `Renderable`, which the
-      // host's `JSX.Element`-typed render slot accepts at runtime.
-      // `@opentui/solid`'s `JSX.Element` is effectively `any`, so `as never`
-      // is the narrowest cast that bridges the two without tripping eslint's
-      // no-unsafe-return on that `any`.
-      api.ui.dialog.replace(() => {
-        disposeDialogBrowser();
-        try {
-          const view = buildContent(renderer, api, exact);
-          disposeBrowser = view.dispose;
-          return renderer.raw(view.root) as never;
-        } catch (err) {
-          showError(api, err);
-          return buildFallbackContent(renderer, api, err, exact) as never;
-        }
-      }, disposeDialogBrowser);
-      // Must come AFTER replace: the host's replace() resets the dialog size
-      // to "medium", so setting xlarge first would be overwritten.
-      api.ui.dialog.setSize("xlarge");
-    } catch (err) {
-      disposeDialogBrowser();
-      showError(api, err);
-    }
-  } catch (err) {
-    showError(api, err);
-  }
-}
-
-/**
- * Build the legacy `TuiCommand` list. The verified opencode 1.18.6 runtime surfaces
- * third-party plugin slash commands through `api.command.register` (the
- * `slash.name` field); the newer `api.keymap.registerLayer` path is not yet
- * wired for external plugins. `onSelect` receives the dialog stack but we use
- * the closed-over `api.ui.dialog` for clarity.
- */
-function buildCommands(api: TuiPluginApi): TuiCommand[] {
-  return [
-    {
+    context.ui.toast.show({
+      variant: "error",
       title: "Model Scout",
-      value: `${COMMAND_NAME}.show`,
-      category: "Model Scout",
-      description: "Show discovered models with metadata",
-      slash: { name: SHOW_SLASH },
-      onSelect: async (_dialog?: TuiDialogStack) => {
-        try {
-          const providers = providerViews(api);
-          const correlation = catalogCorrelation(api, providers);
-          const exact = correlation
-            ? await resolveExactCatalogSnapshot(correlation)
-            : undefined;
-          await openDialog(api, exact);
-        } catch (err) {
-          showError(api, err);
-        }
-      },
-    },
-  ];
+      message: errorText(error),
+    });
+  } catch {
+    // A failing toast must not escape the command runner.
+  }
 }
 
-const tui: TuiPlugin = (api) => {
-  // `api.command` remains the wired 1.18.6 registration surface
-  // for third-party plugin slash commands. Guard it so the plugin degrades
-  // gracefully on hosts that drop the shim.
-  if (!api.command) return Promise.resolve();
-  const dispose = api.command.register(() => buildCommands(api));
-  api.lifecycle.onDispose(dispose);
-  return Promise.resolve();
-};
+/**
+ * Update events for one location. Subscribed before the first reads, so an
+ * update that lands while they run is remembered and replayed once a
+ * listener attaches.
+ */
+interface UpdateFeed {
+  /** Route updates to `listener`, first replaying one if any arrived before. */
+  attach(listener: () => void): void;
+  stop(): void;
+}
 
-const plugin: TuiPluginModule & { id: string } = {
-  id: `${PLUGIN_NAME}:tui`,
-  tui,
-};
+function subscribeUpdates(
+  context: Context,
+  location: LocationQuery,
+): UpdateFeed {
+  let listener: (() => void) | undefined;
+  let missed = false;
+  let stopped = false;
+  const stops: Array<() => void> = [];
+  const notify = (eventLocation: { directory: string } | undefined): void => {
+    if (stopped || eventLocation?.directory !== location.directory) return;
+    if (listener) listener();
+    else missed = true;
+  };
+  try {
+    stops.push(
+      context.client
+        .rpc(ModelScoutRpc)
+        .events.on("updated", (event) => notify(event.location)),
+    );
+    stops.push(
+      context.data.on("model.updated", (event) => notify(event.location)),
+    );
+  } catch {
+    // Live updates are optional; the dialog stays usable without them.
+  }
+  return {
+    attach(next) {
+      listener = next;
+      if (missed) {
+        missed = false;
+        next();
+      }
+    },
+    stop() {
+      stopped = true;
+      listener = undefined;
+      for (const stop of stops.splice(0)) stop();
+    },
+  };
+}
+
+interface Session {
+  close(): void;
+}
+
+/**
+ * One open dialog bound to one location. Host and evidence reloads, the
+ * refresh request, and both event filters all use that location, because
+ * RPC calls without one fall back to the server's own directory and event
+ * subscriptions filter by type only.
+ */
+function startSession(
+  context: Context,
+  renderer: TuiRenderer,
+  location: LocationQuery,
+  initial: Snapshot,
+  updates: UpdateFeed,
+): Session {
+  let groups = initial.groups;
+  let notice = initial.notice;
+  let view: BrowserView | undefined;
+  let closed = false;
+  const stops: Array<() => void> = [() => updates.stop()];
+
+  const disposeView = (): void => {
+    const current = view;
+    view = undefined;
+    current?.dispose();
+  };
+
+  const setNotice = (next: string | undefined): void => {
+    notice = next;
+    view?.setNotice(next);
+  };
+
+  let reloading = false;
+  let reloadAgain = false;
+  const reloadOnce = async (): Promise<void> => {
+    try {
+      const next = await loadSnapshot(context, location);
+      if (closed) return;
+      groups = next.groups;
+      notice = next.notice;
+      view?.update(groups, notice);
+    } catch {
+      if (!closed) setNotice("update failed; showing the last result");
+    }
+  };
+  /** Coalesce bursts of events into at most one queued reload. */
+  const scheduleReload = (): void => {
+    if (closed) return;
+    if (reloading) {
+      reloadAgain = true;
+      return;
+    }
+    reloading = true;
+    void (async () => {
+      try {
+        do {
+          reloadAgain = false;
+          await reloadOnce();
+        } while (reloadAgain && !closed);
+      } finally {
+        reloading = false;
+      }
+    })();
+  };
+
+  const requestRefresh = async (): Promise<void> => {
+    if (closed) return;
+    setNotice("refresh requested");
+    try {
+      const result: unknown = await context.client
+        .rpc(ModelScoutRpc)
+        .refresh(
+          {},
+          { location, signal: AbortSignal.timeout(REFRESH_TIMEOUT_MS) },
+        );
+      if (closed) return;
+      const output =
+        typeof result === "object" && result !== null
+          ? (result as { accepted?: unknown; reason?: unknown })
+          : {};
+      if (output.accepted === true) {
+        setNotice("refreshing");
+        scheduleReload();
+      } else {
+        setNotice(refreshSkippedNotice(output.reason));
+      }
+    } catch (error) {
+      if (!closed) setNotice(`refresh failed: ${describeRpcFailure(error)}`);
+    }
+  };
+
+  const render = (): never => {
+    disposeView();
+    try {
+      view = buildBrowserView(renderer, {
+        groups,
+        notice,
+        theme: scoutTheme(context),
+        maxHeight: contentHeight(context),
+        width: contentWidth(context),
+        keyInput: context.renderer.keyInput,
+        onRefresh: () => void requestRefresh(),
+      });
+      // The host's render slot is typed as Solid's JSX.Element, which is
+      // effectively `any`; the reconciler's renderable is what it renders.
+      return renderer.raw(view.root) as never;
+    } catch (error) {
+      showError(context, error);
+      return buildFallbackContent(renderer, context, groups, error) as never;
+    }
+  };
+
+  /** Runs from the host's onClose, including when another dialog replaces ours. */
+  const end = (): void => {
+    if (closed) return;
+    closed = true;
+    for (const stop of stops.splice(0)) stop();
+    disposeView();
+  };
+
+  try {
+    context.ui.dialog.show(render, end);
+    // `show` resets the size to medium, so the size is set afterwards.
+    context.ui.dialog.set({ size: "xlarge" });
+  } catch (error) {
+    end();
+    throw error;
+  }
+
+  updates.attach(scheduleReload);
+
+  return {
+    close: () => {
+      if (closed) return;
+      context.ui.dialog.clear();
+      end();
+    },
+  };
+}
+
+// ── Plugin ──────────────────────────────────────────────────────────────
+
+function setup(context: Context): Plugin.Cleanup {
+  let active = true;
+  let session: Session | undefined;
+
+  const open = async (): Promise<void> => {
+    let updates: UpdateFeed | undefined;
+    try {
+      const ref = context.location ?? context.data.location.default();
+      const location: LocationQuery = { directory: ref.directory };
+      updates = subscribeUpdates(context, location);
+      const [renderer, snapshot] = await Promise.all([
+        loadRenderer(),
+        loadSnapshot(context, location),
+      ]);
+      if (!active) {
+        updates.stop();
+        return;
+      }
+      const feed = updates;
+      // The session owns the feed from here and stops it when it ends.
+      updates = undefined;
+      session = startSession(context, renderer, location, snapshot, feed);
+    } catch (error) {
+      updates?.stop();
+      showError(context, error);
+    }
+  };
+
+  context.keymap.layer(() => ({
+    mode: "global",
+    commands: [
+      {
+        id: SHOW_COMMAND_ID,
+        title: "Model Scout",
+        description: "Show discovered models and the evidence behind them",
+        slash: { name: COMMAND_NAME },
+        palette: true,
+        run: open,
+      },
+    ],
+  }));
+
+  // A plugin reload would otherwise leave the old dialog on screen.
+  return () => {
+    active = false;
+    const current = session;
+    session = undefined;
+    current?.close();
+  };
+}
+
+const plugin: Plugin.Definition = { id: PLUGIN_ID, setup };
 
 export default plugin;

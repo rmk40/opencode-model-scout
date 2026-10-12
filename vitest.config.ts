@@ -5,6 +5,8 @@ export default defineConfig({
     globals: true,
     environment: "node",
     setupFiles: ["test/setup.ts"],
+    // The embedded-host lane runs separately (vitest.e2e.config.ts).
+    exclude: ["**/node_modules/**", "test/e2e/**"],
     coverage: {
       provider: "v8",
       reporter: ["text", "json", "html"],

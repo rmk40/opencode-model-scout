@@ -8,7 +8,7 @@ import type {
 } from "@opentui/core";
 import type { JSX } from "@opentui/solid";
 
-/** Intrinsics used by Model Scout, all declared by @opentui/solid 0.3.4. */
+/** Intrinsics used by Model Scout, all declared by @opentui/solid. */
 export type TuiTag = "box" | "text" | "scrollbox" | "input" | "select";
 
 type PropsByTag = {
@@ -46,6 +46,10 @@ export interface ReconcilerBridge {
  * property mutation, and child insertion out of the browser's state logic.
  * Children must be renderables, so callers cannot accidentally insert orphaned
  * string nodes under boxes; text is always supplied through `<text content>`.
+ *
+ * `create` must run inside a dialog render callback: the reconciler's
+ * `createElement` reads the renderer from the Solid owner and throws outside
+ * one. `set` only mutates an existing node and works anywhere.
  */
 export class TuiRenderer {
   readonly #bridge: ReconcilerBridge;

@@ -1,4 +1,9 @@
-import type { ProbeModelMeta, ProbeResult, ProviderProbe } from "./types";
+import type {
+  ProbeContext,
+  ProbeModelMeta,
+  ProbeResult,
+  ProviderProbe,
+} from "./types";
 import {
   buildHeaders,
   probeFetch,
@@ -6,6 +11,7 @@ import {
   readJson,
   EMPTY_RESULT,
   isFiniteNumber,
+  setHeader,
 } from "./util";
 
 /** A single model entry from Ollama's GET /api/tags response. */
@@ -57,9 +63,10 @@ function extractContextLength(
 export const probeOllama: ProviderProbe = async (
   baseURL: string,
   apiKey?: string,
+  context?: ProbeContext,
 ): Promise<ProbeResult> => {
   try {
-    const headers = buildHeaders(apiKey);
+    const headers = buildHeaders(apiKey, context?.headers);
 
     // Step 1: List all models (GET — no Content-Type needed)
     const tagsData = await probeFetchJson<OllamaTagsResponse>(
@@ -90,7 +97,11 @@ export const probeOllama: ProviderProbe = async (
     }
 
     // Step 2: Get detailed info per model in parallel (POST — needs Content-Type)
-    const postHeaders = { ...headers, "Content-Type": "application/json" };
+    const postHeaders = setHeader(
+      { ...headers },
+      "Content-Type",
+      "application/json",
+    );
     const showResults = await Promise.allSettled(
       tagModels.map(async (tag) => {
         const res = await probeFetch(`${baseURL}/api/show`, {

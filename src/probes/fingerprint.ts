@@ -1,9 +1,10 @@
 import type { OpenAIModelEntry } from "./types";
 import type { ProbeKey } from "./index";
+import { isActualyzeOwner } from "./actualyze";
 import { buildHeaders, probeFetch, readBody, readJson } from "./util";
 
 export type DetectedServer =
-  | "atlas"
+  | "actualyze"
   | "ollama"
   | "llamacpp"
   | "omlx"
@@ -14,7 +15,7 @@ export type DetectedServer =
   | "koboldcpp";
 
 export const PROBE_MAP: Record<DetectedServer, ProbeKey> = {
-  atlas: "atlas",
+  actualyze: "actualyze",
   ollama: "ollama",
   llamacpp: "ollama",
   omlx: "omlx",
@@ -25,9 +26,11 @@ export const PROBE_MAP: Record<DetectedServer, ProbeKey> = {
   koboldcpp: "koboldcpp",
 };
 
-/** owned_by values that uniquely identify a server. */
+/**
+ * owned_by values that identify a server when every model reports the same
+ * one. Actualyze owners are matched per entry by `isActualyzeOwner` instead.
+ */
 const OWNED_BY_MAP: Record<string, DetectedServer> = {
-  atlas: "atlas",
   omlx: "omlx",
   vllm: "vllm",
   sglang: "sglang",
@@ -51,6 +54,7 @@ export async function fingerprint(
   apiKey?: string,
   modelsResponse?: OpenAIModelEntry[],
   signal?: AbortSignal,
+  providerHeaders?: Readonly<Record<string, string>>,
 ): Promise<DetectedServer | undefined> {
   try {
     // ── Tier 1 — owned_by check (free, no HTTP) ──────────────────────
@@ -66,9 +70,10 @@ export async function fingerprint(
           .filter((owner): owner is string => typeof owner === "string"),
       );
 
-      // Atlas is authoritative per entry and may appear in mixed catalogs.
-      if (ownedByValues.has("atlas")) {
-        return "atlas";
+      // An Actualyze owner is authoritative per entry, so a mixed catalog
+      // that contains one still selects the Actualyze probe.
+      if ([...ownedByValues].some(isActualyzeOwner)) {
+        return "actualyze";
       }
 
       // Only use ownership when every model reports the same string owner.
@@ -100,7 +105,7 @@ export async function fingerprint(
 
     // ── Tier 2 — endpoint probes (sequential, global 2s timeout) ─────
 
-    const headers = buildHeaders(apiKey);
+    const headers = buildHeaders(apiKey, providerHeaders);
     const globalController = new AbortController();
     const globalTimeout = setTimeout(() => globalController.abort(), 2000);
 

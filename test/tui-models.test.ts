@@ -1,77 +1,97 @@
-import { describe, it, expect } from "vitest";
+import { describe, expect, it } from "vitest";
+import { preExistingRecord, toModelInfo } from "../src/discover";
+import { EMPTY_INDEX } from "../src/models-dev-index";
 import {
   collectModelGroups,
   coreMetadataCoverage,
   toModelRow,
+  type HostModel,
+  type HostProvider,
   type ModelRow,
-  type SdkProviderView,
 } from "../src/tui-models";
 
-describe("toModelRow", () => {
-  it("maps SDK capabilities and limits into a display row", () => {
-    const row = toModelRow("qwen3-30b", {
-      id: "qwen3-30b",
+function hostModel(overrides: Partial<HostModel> = {}): HostModel {
+  return {
+    id: "qwen3-30b",
+    providerID: "omlx",
+    name: "Qwen3 30B",
+    family: "qwen3",
+    enabled: true,
+    capabilities: { tools: true, input: ["text"], output: ["text"] },
+    variants: [],
+    cost: [],
+    limit: { context: 131_072, output: 32_768 },
+    ...overrides,
+  };
+}
+
+function hostProvider(overrides: Partial<HostProvider> = {}): HostProvider {
+  return {
+    id: "omlx",
+    name: "oMLX",
+    package: "@opencode/ai/providers/openai-compatible",
+    settings: { baseURL: "http://localhost:8000/v1" },
+    ...overrides,
+  };
+}
+
+describe("toModelRow from host rows only", () => {
+  it("maps name, limits, family, and host capabilities into a display row", () => {
+    const row = toModelRow(
+      "qwen3-30b",
+      hostModel({ variants: [{ id: "high" }] }),
+    );
+
+    expect(row).toMatchObject({
       name: "Qwen3 30B",
+      context: 131_072,
+      output: 32_768,
       family: "qwen3",
-      limit: { context: 131072, output: 32768 },
-      capabilities: {
-        temperature: true,
-        reasoning: true,
-        attachment: false,
-        toolcall: true,
-        input: { image: false },
-        output: { text: true },
-      },
+      type: "llm",
+      enabled: true,
     });
-
-    expect(row.name).toBe("Qwen3 30B");
-    expect(row.context).toBe(131072);
-    expect(row.output).toBe(32768);
-    expect(row.type).toBe("llm");
-    expect(row.flags).toEqual(["Tools", "Reasoning", "Temp"]);
-    expect(row.family).toBe("qwen3");
+    expect(row.flags).toEqual(["Tools", "Reasoning"]);
+    expect(row.provenance?.context).toMatchObject({ source: "unmatched-host" });
   });
 
-  it("classifies a vision model as vlm and adds the Vision flag", () => {
-    const row = toModelRow("gemma3-12b", {
-      id: "gemma3-12b",
-      capabilities: {
-        attachment: true,
-        input: { image: true },
-        output: { text: true },
-      },
-    });
+  it("classifies image input as vlm and maps every listed input modality", () => {
+    const row = toModelRow(
+      "gemma3",
+      hostModel({
+        capabilities: {
+          tools: true,
+          input: ["text", "image", "pdf"],
+          output: ["text"],
+        },
+      }),
+    );
 
     expect(row.type).toBe("vlm");
-    expect(row.flags).toContain("Vision");
-  });
-
-  it("classifies attachment support as vlm without nested image input", () => {
-    const row = toModelRow("atlas-vision", {
-      id: "atlas-vision",
-      capabilities: { attachment: true, output: { text: true } },
+    expect(row.flags).toContain("Image");
+    expect(row.inputModalities?.pdf).toMatchObject({
+      state: "supported",
+      source: "unmatched-host",
     });
-
-    expect(row.type).toBe("vlm");
-    expect(row.flags).toContain("Vision");
+    expect(row.inputModalities?.audio.state).toBe("unknown");
   });
 
-  it("falls back to the id when name is missing", () => {
-    const row = toModelRow("local-model", { id: "local-model" });
-    expect(row.name).toBe("local-model");
+  it("treats host tools false as no claim rather than an unsupported fact", () => {
+    const row = toModelRow(
+      "m",
+      hostModel({
+        capabilities: { tools: false, input: ["text"], output: ["text"] },
+      }),
+    );
+    expect(row.capabilities?.toolCall.state).toBe("unknown");
+    expect(row.flags).not.toContain("Tools");
+  });
+
+  it("leaves type unknown when the host lists no text output", () => {
+    const row = toModelRow(
+      "m",
+      hostModel({ capabilities: { tools: true, input: [], output: [] } }),
+    );
     expect(row.type).toBeUndefined();
-    expect(row.flags).toEqual([]);
-  });
-
-  it("ignores non-finite numeric fields", () => {
-    const row = toModelRow("m", {
-      id: "m",
-      limit: { context: Number.NaN, output: Number.POSITIVE_INFINITY },
-      sizeBytes: Number.NaN as unknown as number,
-    });
-    expect(row.context).toBeUndefined();
-    expect(row.output).toBeUndefined();
-    expect(row.sizeBytes).toBeUndefined();
   });
 
   it.each([
@@ -79,272 +99,181 @@ describe("toModelRow", () => {
     ["negative", -1],
     ["fractional", 4096.5],
     ["unsafe", Number.MAX_SAFE_INTEGER + 2],
-  ])("treats %s host limits as absent, not known metadata", (_label, limit) => {
-    // The host normalizes omitted limits to 0; such values must never render
-    // as "ctx 0" or count toward known core metadata.
-    const row = toModelRow("m", {
-      id: "m",
-      limit: { context: limit, output: limit },
-    });
+  ])("treats %s host limits as absent", (_label, limit) => {
+    const row = toModelRow(
+      "m",
+      hostModel({ limit: { context: limit, output: limit } }),
+    );
     expect(row.context).toBeUndefined();
     expect(row.output).toBeUndefined();
     expect(row.provenance?.context).toBeUndefined();
-    expect(row.provenance?.output).toBeUndefined();
   });
 
-  it("keeps zero for general numeric metadata outside limits", () => {
-    const row = toModelRow("m", { id: "m", sizeBytes: 0 });
-    expect(row.sizeBytes).toBe(0);
-  });
-
-  it("retains positive snapshot capability evidence when the host is silent", () => {
-    // A host that omits capability booleans is silent, not conflicting:
-    // supported exact evidence must survive with its flags.
-    const row = toModelRow(
-      "atlas-model",
-      { id: "atlas-model" },
-      {
-        id: "atlas-model",
-        origin: "discovered",
-        identity: {
-          state: "known",
-          value: "atlas-model",
-          source: "server-list",
-          strength: "reported",
-        },
-        name: { state: "unknown" },
-        modelType: {
-          state: "known",
-          value: "llm",
-          source: "provider-probe",
-          strength: "authoritative",
-        },
-        context: { state: "unknown" },
-        output: { state: "unknown" },
-        family: {
-          state: "known",
-          value: "atlas",
-          source: "models.dev",
-          strength: "inferred",
-        },
-        organizationOwner: { state: "unknown" },
-        parameterSize: { state: "unknown" },
-        quantization: { state: "unknown" },
-        sizeBytes: { state: "unknown" },
-        probeIdentity: { state: "unknown" },
-        capabilities: {
-          vision: {
-            state: "supported",
-            source: "provider-probe",
-            strength: "authoritative",
-          },
-          toolCall: {
-            state: "supported",
-            source: "provider-probe",
-            strength: "authoritative",
-          },
-          reasoning: { state: "unknown" },
-          temperature: {
-            state: "supported",
-            source: "policy-default",
-            strength: "assumed",
-          },
-        },
-      },
+  it("maps the first host cost tier and leaves an empty cost unknown", () => {
+    const priced = toModelRow(
+      "m",
+      hostModel({
+        cost: [{ input: 1, output: 2, cache: { read: 0.5, write: 0 } }],
+      }),
     );
-    expect(row.capabilities?.vision).toMatchObject({
-      state: "supported",
-      source: "provider-probe",
+    expect(priced.cost?.input).toMatchObject({
+      state: "known",
+      value: 1,
+      source: "unmatched-host",
     });
-    expect(row.capabilities?.toolCall.state).toBe("supported");
-    expect(row.capabilities?.temperature).toMatchObject({
-      state: "supported",
-      source: "policy-default",
+    expect(priced.cost?.cacheWrite).toMatchObject({ state: "known", value: 0 });
+
+    const free = toModelRow("m", hostModel());
+    expect(free.cost).toEqual({
+      input: { state: "unknown" },
+      output: { state: "unknown" },
+      cacheRead: { state: "unknown" },
+      cacheWrite: { state: "unknown" },
     });
-    expect(row.capabilities?.reasoning.state).toBe("unknown");
-    expect(row.flags).toEqual(["Vision", "Tools", "Temp"]);
-    expect(row.family).toBe("atlas");
-    expect(row.provenance?.family).toMatchObject({ source: "models.dev" });
   });
 
-  it("surfaces probe-injected metadata fields", () => {
-    const row = toModelRow("q", {
-      id: "q",
-      parameterSize: "0.6B",
-      quantization: "Q4_K_M",
-      sizeBytes: 480500000,
+  describe("prices next to discovery evidence", () => {
+    const priced = hostModel({
+      cost: [{ input: 1, output: 2, cache: { read: 0.5, write: 0 } }],
     });
-    expect(row.parameterSize).toBe("0.6B");
-    expect(row.quantization).toBe("Q4_K_M");
-    expect(row.sizeBytes).toBe(480500000);
+
+    it("keeps the host's prices for a model declared in config", () => {
+      const row = toModelRow(
+        "qwen3-30b",
+        priced,
+        preExistingRecord("qwen3-30b"),
+      );
+      expect(row.cost?.input).toMatchObject({ state: "known", value: 1 });
+      expect(row.cost?.cacheRead).toMatchObject({ state: "known", value: 0.5 });
+    });
+
+    it("uses the evidence prices for a discovered model, unknown cache prices included", () => {
+      const [mapped] = toModelInfo(
+        {
+          modelListAttempt: "ready",
+          probeAttempt: "complete",
+          resolvedProbe: "actualyze",
+          models: [
+            { id: "qwen3-30b", meta: { cost: { input: 3, output: 4 } } },
+          ],
+          completedAt: "2026-01-01T00:00:00.000Z",
+        },
+        EMPTY_INDEX,
+        { reasoningVariants: true },
+      );
+      const row = toModelRow("qwen3-30b", priced, mapped.evidence);
+      expect(row.cost?.input).toMatchObject({ state: "known", value: 3 });
+      expect(row.cost?.cacheRead.state).toBe("unknown");
+    });
+  });
+
+  it("falls back to the ID when the host name is empty", () => {
+    expect(toModelRow("local-model", hostModel({ name: "" })).name).toBe(
+      "local-model",
+    );
   });
 });
 
-describe("collectModelGroups", () => {
-  const local: SdkProviderView = {
-    id: "omlx",
-    name: "oMLX",
-    options: { baseURL: "http://localhost:8000/v1" },
-    models: {
-      "b-model": { id: "b-model", name: "B Model" },
-      "a-model": { id: "a-model", name: "A Model" },
-    },
-  };
+describe("collectModelGroups without discovery evidence", () => {
+  const models = [
+    hostModel({ id: "b-model", name: "B Model" }),
+    hostModel({ id: "a-model", name: "A Model" }),
+  ];
 
-  it("includes OpenAI-compatible providers via baseURL /v1", () => {
-    const groups = collectModelGroups([local]);
+  it("groups host models by provider and warns that evidence is missing", () => {
+    const groups = collectModelGroups({
+      providers: [hostProvider()],
+      models: [...models, hostModel({ id: "other", providerID: "elsewhere" })],
+    });
     expect(groups).toHaveLength(1);
-    expect(groups[0]?.id).toBe("omlx");
-    expect(groups[0]?.provider).toBe("oMLX");
-    expect(groups[0]?.endpoint).toBe("http://localhost:8000");
+    expect(groups[0]).toMatchObject({
+      id: "omlx",
+      provider: "oMLX",
+      endpoint: "http://localhost:8000",
+      hasEvidence: false,
+      warnings: ["evidence unavailable; showing host state only"],
+    });
+    expect(groups[0]?.models.map((model) => model.id)).toEqual([
+      "a-model",
+      "b-model",
+    ]);
   });
 
-  it("excludes built-in cloud providers that lack options.baseURL", () => {
-    // Regression: opencode's built-in cloud providers (OpenCode Zen/Go) are
-    // served via @ai-sdk/openai-compatible and carry their endpoint on
-    // model.api.url, but have NO options.baseURL. They must not appear.
-    const groups = collectModelGroups([
-      {
-        id: "opencode",
-        name: "OpenCode Zen",
-        source: "custom",
-        options: { apiKey: "public" },
-        models: {
-          "mimo-v2.5-free": {
-            id: "mimo-v2.5-free",
-            api: {
-              npm: "@ai-sdk/openai-compatible",
-              url: "https://opencode.ai/zen/v1",
-            },
+  it.each([
+    ["the openai-compatible package", hostProvider()],
+    [
+      "the AI SDK openai-compatible package",
+      hostProvider({ package: "aisdk:@ai-sdk/openai-compatible" }),
+    ],
+    [
+      "an explicit probe on any package",
+      hostProvider({
+        package: "@opencode/ai/providers/anthropic",
+        canonical: "anthropic",
+        settings: { baseURL: "https://gateway.test/v1", probe: "auto" },
+      }),
+    ],
+  ])("includes a provider with a base URL and %s", (_label, provider) => {
+    expect(
+      collectModelGroups({ providers: [provider], models: [] }),
+    ).toHaveLength(1);
+  });
+
+  it.each([
+    ["has no base URL", hostProvider({ settings: { apiKey: "public" } })],
+    [
+      "is an alias of a catalog provider",
+      hostProvider({ canonical: "openai" }),
+    ],
+    [
+      "uses another package without a probe",
+      hostProvider({ package: "@opencode/ai/providers/anthropic" }),
+    ],
+    [
+      "is a built-in local discovery provider",
+      hostProvider({
+        id: "ollama",
+        settings: { baseURL: "http://x/v1", probe: "auto" },
+      }),
+    ],
+    ["is the hosted OpenCode catalog", hostProvider({ id: "opencode" })],
+  ])("excludes a provider that %s", (_label, provider) => {
+    expect(collectModelGroups({ providers: [provider], models: [] })).toEqual(
+      [],
+    );
+  });
+
+  it("keeps providers with no models and sorts groups by display name", () => {
+    const groups = collectModelGroups({
+      providers: [
+        hostProvider(),
+        hostProvider({ id: "vllm-box", name: "Aardvark" }),
+      ],
+      models,
+    });
+    expect(groups.map((group) => group.provider)).toEqual(["Aardvark", "oMLX"]);
+    expect(groups[0]?.models).toEqual([]);
+  });
+
+  it("keeps only a sanitized endpoint origin and omits invalid URLs", () => {
+    const [secret] = collectModelGroups({
+      providers: [
+        hostProvider({
+          settings: {
+            baseURL:
+              "https://user:secret@atlas.test:8443/v1/private?token=secret#models",
           },
-        },
-      },
-      {
-        id: "opencode-go",
-        name: "OpenCode Go",
-        source: "api",
-        options: { apiKey: "dummy" },
-        models: {
-          "deepseek-v4-flash": {
-            id: "deepseek-v4-flash",
-            api: {
-              npm: "@ai-sdk/openai-compatible",
-              url: "https://opencode.ai/zen/go/v1",
-            },
-          },
-        },
-      },
-    ]);
-    expect(groups).toHaveLength(0);
-  });
+        }),
+      ],
+      models: [],
+    });
+    expect(secret?.endpoint).toBe("https://atlas.test:8443");
 
-  it("includes a configured openai-compatible provider whose baseURL lacks /v1", () => {
-    // Matches the server's `canDiscover` npm branch: a local provider with
-    // options.baseURL and openai-compatible models is discovered even when the
-    // baseURL has no "/v1" (the server appends "/v1/models" itself).
-    const groups = collectModelGroups([
-      {
-        id: "local-oai",
-        name: "Local OAI",
-        source: "config",
-        options: { baseURL: "http://localhost:9000" },
-        models: {
-          m: { id: "m", api: { npm: "@ai-sdk/openai-compatible" } },
-        },
-      },
-    ]);
-    expect(groups).toHaveLength(1);
-    expect(groups[0]?.provider).toBe("Local OAI");
-  });
-
-  it("excludes providers that are not OpenAI-compatible", () => {
-    const groups = collectModelGroups([
-      {
-        id: "anthropic",
-        name: "Anthropic",
-        source: "custom",
-        options: { apiKey: "" },
-        models: { "claude-x": { id: "claude-x" } },
-      },
-    ]);
-    expect(groups).toHaveLength(0);
-  });
-
-  it("excludes a non-openai-compatible provider even if it has a baseURL without /v1", () => {
-    const groups = collectModelGroups([
-      {
-        id: "weird",
-        name: "Weird",
-        options: { baseURL: "http://localhost:7000" },
-        models: { m: { id: "m", api: { npm: "@ai-sdk/anthropic" } } },
-      },
-    ]);
-    expect(groups).toHaveLength(0);
-  });
-
-  it("keeps discoverable providers with no models for provider status views", () => {
-    const groups = collectModelGroups([
-      { id: "empty", options: { baseURL: "http://x/v1" }, models: {} },
-    ]);
-    expect(groups).toHaveLength(1);
-    expect(groups[0]).toMatchObject({ id: "empty", models: [] });
-  });
-
-  it("sorts models within a group and providers across groups", () => {
-    const second: SdkProviderView = {
-      id: "vllm",
-      name: "Aardvark",
-      options: { baseURL: "http://localhost:9000/v1" },
-      models: { z: { id: "z" } },
-    };
-    const groups = collectModelGroups([local, second]);
-    expect(groups.map((g) => g.provider)).toEqual(["Aardvark", "oMLX"]);
-    expect(groups[1]?.models.map((m) => m.id)).toEqual(["a-model", "b-model"]);
-  });
-
-  it("falls back to provider id when name is missing", () => {
-    const groups = collectModelGroups([
-      {
-        id: "raw-id",
-        options: { baseURL: "http://x/v1" },
-        models: { m: { id: "m" } },
-      },
-    ]);
-    expect(groups[0]?.provider).toBe("raw-id");
-  });
-
-  it("keeps only a sanitized endpoint origin", () => {
-    const groups = collectModelGroups([
-      {
-        id: "atlas-public",
-        name: "Atlas",
-        options: {
-          baseURL:
-            "https://user:secret@atlas.test:8443/v1/private?token=secret#models",
-        },
-        models: { atlas: { id: "atlas" } },
-      },
-    ]);
-
-    expect(groups[0]?.endpoint).toBe("https://atlas.test:8443");
-  });
-
-  it("omits invalid endpoint URLs", () => {
-    const groups = collectModelGroups([
-      {
-        id: "atlas-public",
-        name: "Atlas",
-        options: { baseURL: "/v1/not-a-url" },
-        models: {
-          atlas: {
-            id: "atlas",
-            api: { npm: "@ai-sdk/openai-compatible" },
-          },
-        },
-      },
-    ]);
-
-    expect(groups[0]?.endpoint).toBeUndefined();
+    const [relative] = collectModelGroups({
+      providers: [hostProvider({ settings: { baseURL: "/v1/not-a-url" } })],
+      models: [],
+    });
+    expect(relative?.endpoint).toBeUndefined();
   });
 });
 
@@ -355,16 +284,24 @@ describe("core metadata coverage", () => {
     strength: "unmatched" as const,
   };
   const unknown = { state: "unknown" as const };
+  const inputs = (image: typeof supported | typeof unknown) => ({
+    text: supported,
+    image,
+    pdf: unknown,
+    audio: unknown,
+    video: unknown,
+  });
   const row = (overrides: Partial<ModelRow>): ModelRow => ({
     id: "atlas-model",
     name: "Atlas Model",
+    enabled: true,
     flags: [],
     capabilities: {
-      vision: supported,
       toolCall: supported,
       reasoning: supported,
       temperature: supported,
     },
+    inputModalities: inputs(supported),
     ...overrides,
   });
 
@@ -377,31 +314,62 @@ describe("core metadata coverage", () => {
     },
   );
 
-  it("reports unknown chat evidence as expected missing metadata", () => {
+  it("reports unknown chat evidence as missing metadata", () => {
+    expect(
+      coreMetadataCoverage(
+        row({
+          type: "vlm",
+          context: 8192,
+          inputModalities: inputs(unknown),
+          capabilities: {
+            toolCall: unknown,
+            reasoning: unknown,
+            temperature: supported,
+          },
+        }),
+      ),
+    ).toEqual({
+      known: 3,
+      total: 7,
+      missing: ["output", "image", "tools", "reasoning"],
+      complete: false,
+    });
+  });
+
+  it("counts a limit marked as the host default as missing", () => {
     const coverage = coreMetadataCoverage(
       row({
-        type: "vlm",
-        context: 8192,
-        capabilities: {
-          vision: supported,
-          toolCall: unknown,
-          reasoning: unknown,
-          temperature: supported,
+        type: "llm",
+        context: 200_000,
+        output: 32_000,
+        provenance: {
+          context: {
+            state: "known",
+            value: 200_000,
+            source: "host-default",
+            strength: "assumed",
+          },
+          output: {
+            state: "known",
+            value: 32_000,
+            source: "provider-probe",
+            strength: "authoritative",
+          },
         },
       }),
     );
-    expect(coverage).toEqual({
-      known: 4,
-      total: 7,
-      missing: ["output", "tools", "reasoning"],
-      complete: false,
-    });
+    expect(coverage.missing).toEqual(["context"]);
   });
 
   it("treats chat capabilities as inapplicable to embeddings", () => {
     expect(
       coreMetadataCoverage(
-        row({ type: "embedding", context: 2048, capabilities: undefined }),
+        row({
+          type: "embedding",
+          context: 2048,
+          capabilities: undefined,
+          inputModalities: undefined,
+        }),
       ),
     ).toEqual({ known: 2, total: 2, missing: [], complete: true });
   });

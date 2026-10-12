@@ -18,6 +18,11 @@ import {
   resolveSelection,
   summarizeProvider,
 } from "../src/tui-browser";
+import type {
+  CapabilityEvidence,
+  InputModalityEvidence,
+  ProviderFailureKind,
+} from "../src/catalog-evidence";
 import type { ModelRow, ProviderGroup } from "../src/tui-models";
 import { TuiRenderer, type ReconcilerBridge } from "../src/tui-renderer";
 
@@ -38,10 +43,21 @@ const defaultSupported = {
   strength: "assumed" as const,
 };
 
+function inputs(image: CapabilityEvidence): InputModalityEvidence {
+  return {
+    text: supported,
+    image,
+    pdf: unknown,
+    audio: unknown,
+    video: unknown,
+  };
+}
+
 function model(overrides: Partial<ModelRow> = {}): ModelRow {
   return {
     id: "atlas-chat",
     name: "Atlas Chat",
+    enabled: true,
     type: "llm",
     flags: ["Tools", "Reasoning"],
     family: "atlas-family",
@@ -51,11 +67,11 @@ function model(overrides: Partial<ModelRow> = {}): ModelRow {
     output: 8_192,
     origin: "discovered",
     capabilities: {
-      vision: unsupported,
       toolCall: supported,
       reasoning: supported,
       temperature: defaultSupported,
     },
+    inputModalities: inputs(unsupported),
     provenance: {
       identity: {
         state: "known",
@@ -91,12 +107,13 @@ const groups: ProviderGroup[] = [
     id: "atlas-primary",
     provider: "Atlas",
     endpoint: "https://atlas.test",
-    exactProvenance: true,
-    status: "ready",
+    hasEvidence: true,
+    lastGoodAt: "2026-10-11T08:00:00.000Z",
+    failure: null,
     modelListAttempt: "ready",
     probeAttempt: "complete",
     configuredProbe: "auto",
-    resolvedProbe: "atlas",
+    resolvedProbe: "actualyze",
     models: [
       model(),
       model({
@@ -106,11 +123,11 @@ const groups: ProviderGroup[] = [
         output: undefined,
         origin: "pre-existing",
         capabilities: {
-          vision: supported,
           toolCall: unknown,
           reasoning: unknown,
           temperature: defaultSupported,
         },
+        inputModalities: inputs(supported),
       }),
     ],
   },
@@ -118,8 +135,9 @@ const groups: ProviderGroup[] = [
     id: "atlas-edge",
     provider: "Atlas Edge",
     endpoint: "https://atlas.test",
-    exactProvenance: true,
-    status: "empty",
+    hasEvidence: true,
+    lastGoodAt: "2026-10-11T08:00:00.000Z",
+    failure: null,
     modelListAttempt: "empty",
     probeAttempt: "not-requested",
     models: [
@@ -137,8 +155,8 @@ const groups: ProviderGroup[] = [
         context: undefined,
         output: undefined,
         origin: undefined,
+        inputModalities: inputs(unknown),
         capabilities: {
-          vision: unknown,
           toolCall: unknown,
           reasoning: unknown,
           temperature: unknown,
@@ -174,6 +192,8 @@ function browserHarness(options?: {
   height?: number;
   width?: number;
   groups?: readonly ProviderGroup[];
+  notice?: string;
+  onRefresh?: () => void;
 }) {
   const nodes: FakeNode[] = [];
   const keyListeners = new Set<(key: KeyEvent) => void>();
@@ -229,6 +249,8 @@ function browserHarness(options?: {
     maxHeight: options?.height,
     width: options?.width,
     keyInput: keyInput as unknown as Pick<KeyHandler, "on" | "off">,
+    notice: options?.notice,
+    onRefresh: options?.onRefresh,
   });
   const findById = (id: string): FakeNode | undefined =>
     nodes.find((candidate) => candidate.props.id === id);
@@ -356,8 +378,8 @@ describe("unified browser projection", () => {
     const unreachable: ProviderGroup = {
       id: "atlas-down",
       provider: "Atlas Down",
-      exactProvenance: false,
-      status: "unreachable",
+      hasEvidence: false,
+      modelListAttempt: "unreachable",
       models: [],
     };
     const catalog = [...groups, unreachable];
@@ -469,20 +491,19 @@ describe("unified browser projection", () => {
   });
 
   it("keeps the full core column inside Select chrome at 80-column runtime width", () => {
-    // An 80-column terminal reaches the browser as width 72 (tui.ts subtracts
-    // 8 dialog columns) → text width 64 → 60-column option rows. Before the
-    // 4-column Select chrome reserve, rows were budgeted to the full 64 and
-    // the Select gutter/padding/scrollbar clipped the trailing `k/n` value
-    // (rendering `… ctx 131K core`). Every model row must now carry its
+    // An 80-column terminal reaches the browser as width 78 (the host dialog
+    // keeps one column free on each side) → text width 70 → 66-column option
+    // rows. The Select gutter, padding, and scrollbar would clip a row
+    // budgeted to the full 70 columns, so every model row must carry its
     // complete `core k/n` cell within the reserved row budget.
-    const harness = browserHarness({ width: 72 });
+    const harness = browserHarness({ width: 78 });
     const options = harness.byId("modelscout-results").props
       .options as SelectOption[];
     const modelRows = options.filter((option) => option.name.startsWith("  "));
     expect(modelRows.length).toBeGreaterThan(0);
     for (const row of modelRows) {
       expect(row.name).toMatch(/core \d\/\d$/);
-      expect(stringWidth(row.name)).toBeLessThanOrEqual(60);
+      expect(stringWidth(row.name)).toBeLessThanOrEqual(66);
     }
     const chat = modelRows.find((row) => row.name.includes("Atlas Chat"));
     expect(chat?.name).toContain("ctx 131K");
@@ -576,7 +597,37 @@ describe("unified browser projection", () => {
     );
     expect(item?.detail).toContain("Discovery");
     expect(item?.detail).toContain("Capabilities");
-    expect(item?.detail).toContain("Evidence: correlated server snapshot");
+    expect(item?.detail).toContain("Evidence: server discovery catalog");
+  });
+
+  it("labels a failed latest attempt in headers and details, keeping the last good time", () => {
+    const failing: ProviderGroup = {
+      ...groups[0],
+      failure: { kind: "timeout", at: "2026-10-11T09:00:00.000Z" },
+    };
+    const item = projectBrowser([failing], "").items[0];
+    expect(item?.displayRow).toContain("discovery failed (timeout)");
+    expect(item?.detail).toContain(
+      "Last good inventory: 2026-10-11T08:00:00.000Z",
+    );
+    expect(item?.detail).toContain(
+      "Latest attempt failed: timeout at 2026-10-11T09:00:00.000Z",
+    );
+
+    const firstRun = projectBrowser(
+      [{ ...failing, lastGoodAt: null, models: [] }],
+      "",
+    ).items[0];
+    expect(firstRun?.detail).toContain("Last good inventory: none yet");
+  });
+
+  it("omits discovery times for providers without evidence", () => {
+    const detail = projectBrowser(
+      [{ ...groups[0], hasEvidence: false, lastGoodAt: undefined }],
+      "",
+    ).items[0]?.detail;
+    expect(detail).not.toContain("Last good inventory");
+    expect(detail).toContain("Evidence: host state only");
   });
 
   it("prefixes every provider header row with the ▸ marker", () => {
@@ -643,14 +694,14 @@ describe("unified browser projection", () => {
           ...INITIAL_BROWSER_FACETS,
           provider: "atlas-primary",
           type: "vlm",
-          capability: "vision",
+          capability: "image",
           capabilityState: "supported",
           metadata: "missing-core",
           origin: "pre-existing",
         },
         true,
       ),
-    ).toContain("provider atlas-primary · type vlm · capability vision");
+    ).toContain("provider atlas-primary · type vlm · capability image");
   });
 
   it("groups compact evidence without repeating raw source-strength pairs", () => {
@@ -666,6 +717,88 @@ describe("unified browser projection", () => {
     expect(detail).toContain("Sources: probe · config · server");
     expect(detail).not.toContain("provider-probe");
     expect(detail).not.toContain("authoritative");
+  });
+
+  it("shows input modalities and per-price cost evidence in model details", () => {
+    const priced = model({
+      inputModalities: {
+        ...inputs(supported),
+        pdf: supported,
+        audio: unsupported,
+      },
+      cost: {
+        input: {
+          state: "known",
+          value: 3,
+          source: "provider-probe",
+          strength: "reported",
+        },
+        output: {
+          state: "known",
+          value: 15,
+          source: "provider-probe",
+          strength: "reported",
+        },
+        cacheRead: {
+          state: "known",
+          value: 0.3,
+          source: "provider-probe",
+          strength: "reported",
+        },
+        cacheWrite: { state: "unknown" },
+      },
+    });
+    const detail = projectBrowser([{ ...groups[0], models: [priced] }], "")
+      .items[1]?.detail;
+    expect(detail).toContain(
+      "Image input: supported [probe] · PDF input: supported [probe]",
+    );
+    expect(detail).toContain(
+      "Audio input: unsupported [probe] · Video input: unknown",
+    );
+    expect(detail).toContain("Input: $3 [probe] · Output: $15 [probe]");
+    expect(detail).toContain("Cache read: $0.3 [probe] · Cache write: unknown");
+  });
+
+  it("reports unknown prices as one line and labels host-default limits", () => {
+    const defaulted = model({
+      context: 200_000,
+      provenance: {
+        context: {
+          state: "known",
+          value: 200_000,
+          source: "host-default",
+          strength: "assumed",
+        },
+      },
+    });
+    const items = projectBrowser(
+      [{ ...groups[0], models: [defaulted] }],
+      "",
+    ).items;
+    expect(items[1]?.detail).toContain("Prices: unknown");
+    expect(items[1]?.detail).toContain("Context: 200K [host default]");
+    expect(items[1]?.detail).toContain("Missing core: context");
+    expect(items[1]?.displayRow).toContain("core 6/7");
+  });
+
+  it("marks disabled models in rows, details, and search", () => {
+    const disabled = model({
+      id: "atlas-embed",
+      name: "Atlas Embed",
+      type: "embedding",
+      enabled: false,
+      capabilities: undefined,
+    });
+    const catalog = [{ ...groups[0], models: [model(), disabled] }];
+    const row = projectBrowser(catalog, "").items.find(
+      (item) => item.name === "Atlas Embed",
+    );
+    expect(row?.displayRow).toMatch(/core 2\/2 {2}disabled$/);
+    expect(row?.detail).toContain("Enabled: no (hidden from the model picker)");
+    expect(
+      projectBrowser(catalog, "disabled").items.map((item) => item.name),
+    ).toEqual(["Atlas", "Atlas Embed"]);
   });
 
   it("keeps externally supplied model detail values on their structured lines", () => {
@@ -684,7 +817,7 @@ describe("unified browser projection", () => {
           family: "atlas-family\u202eForged Model Heading",
           parameterSize: "8B\u001bForged Model Heading",
           quantization: "Q4\u2028Forged Model Heading",
-          probeIdentity: "atlas\u2069Forged Model Heading",
+          probeIdentity: "actualyze\u2069Forged Model Heading",
           capabilities: undefined,
           warnings: ["model warning\nForged Model Heading"],
         }),
@@ -708,13 +841,17 @@ describe("unified browser projection", () => {
       id: "atlas-primary\nForged Provider Heading",
       provider: "Atlas\u2028Forged Provider Heading",
       endpoint: "https://atlas.test\u2029Forged Provider Heading",
-      status: "ready\u202aForged Provider Heading" as ProviderGroup["status"],
+      failure: {
+        kind: "timeout\u202aForged Provider Heading" as ProviderFailureKind,
+        at: "2026-10-11T09:00:00.000Z\nForged Provider Heading",
+      },
+      lastGoodAt: "2026-10-11T08:00:00.000Z\u2028Forged Provider Heading",
       modelListAttempt:
         "ready\u2066Forged Provider Heading" as ProviderGroup["modelListAttempt"],
       probeAttempt:
         "complete\u202eForged Provider Heading" as ProviderGroup["probeAttempt"],
       configuredProbe: "auto\u0007Forged Provider Heading",
-      resolvedProbe: "atlas\u2069Forged Provider Heading",
+      resolvedProbe: "actualyze\u2069Forged Provider Heading",
       warnings: ["provider warning\nForged Provider Heading"],
       models: [
         model({
@@ -751,7 +888,7 @@ describe("unified browser projection", () => {
     expect(names({ type: "embedding" })).toEqual(["Atlas Edge", "Atlas Embed"]);
     expect(names({ type: "unknown" })).toEqual(["Atlas Edge", "Atlas Unknown"]);
     expect(
-      names({ capability: "vision", capabilityState: "unsupported" }),
+      names({ capability: "image", capabilityState: "unsupported" }),
     ).toEqual(["Atlas", "Atlas Chat"]);
     expect(names({ metadata: "complete-core" })).toEqual([
       "Atlas",
@@ -811,7 +948,7 @@ describe("unified browser projection", () => {
 
     const hostOnly = groups.map((group) => ({
       ...group,
-      exactProvenance: false,
+      hasEvidence: false,
       models: group.models.map((item) => ({ ...item, origin: undefined })),
     }));
     const projection = projectBrowser(hostOnly, "", {
@@ -826,7 +963,9 @@ describe("unified browser projection", () => {
   it("distinguishes filtered-empty from catalog-empty results", () => {
     const filtered = projectBrowser(groups, "missing");
     expect(filtered.emptyMessage).toContain("No matches.");
-    expect(projectBrowser([], "").emptyMessage).toBe("No models available.");
+    expect(projectBrowser([], "").emptyMessage).toBe(
+      "No models available yet. To use Actualyze, add its API key with /connect.",
+    );
   });
 
   it("aggregates provider origins, core coverage, and capability states", () => {
@@ -837,7 +976,7 @@ describe("unified browser projection", () => {
       completeCore: 1,
       missingCore: 1,
     });
-    expect(summary.capabilities.vision).toEqual({
+    expect(summary.capabilities.image).toEqual({
       applicable: 2,
       supported: 1,
       unsupported: 1,
@@ -1107,12 +1246,12 @@ describe("unified browser interactions", () => {
     },
   );
 
-  it("fits the medium footer variant in the 64-column budget of an 80-column terminal", () => {
-    // An 80-column terminal reaches the browser as width 72 → text width 64.
-    const harness = browserHarness({ width: 72 });
+  it("fits the medium footer variant in the 70-column budget of an 80-column terminal", () => {
+    // An 80-column terminal reaches the browser as width 78 → text width 70.
+    const harness = browserHarness({ width: 78 });
     const footer = harness.byId("modelscout-footer-text");
     const listFooter = footer.props.content as string;
-    expect(stringWidth(listFooter)).toBeLessThanOrEqual(64);
+    expect(stringWidth(listFooter)).toBeLessThanOrEqual(70);
     expect(listFooter).toContain("p/t/c/s/m/o");
     expect(listFooter).toContain("r reset");
     expect(listFooter).toContain("esc close");
@@ -1121,7 +1260,7 @@ describe("unified browser interactions", () => {
     const results = harness.byId("modelscout-results");
     (results.props.onSelect as (index: number) => void)(0);
     const detailFooter = footer.props.content as string;
-    expect(stringWidth(detailFooter)).toBeLessThanOrEqual(64);
+    expect(stringWidth(detailFooter)).toBeLessThanOrEqual(70);
     expect(detailFooter).toContain("↑/↓ scroll");
     expect(detailFooter).toContain("p/t/c/s/m/o");
     expect(detailFooter).toContain("r reset");
@@ -1251,7 +1390,7 @@ describe("unified browser interactions", () => {
     expect(consumed.preventDefault).toHaveBeenCalledOnce();
 
     const hostOnly = browserHarness({
-      groups: groups.map((group) => ({ ...group, exactProvenance: false })),
+      groups: groups.map((group) => ({ ...group, hasEvidence: false })),
     });
     const ignored = hostOnly.press({ name: "o", sequence: "o" });
     expect(hostOnly.view.state().facets).toEqual(INITIAL_BROWSER_FACETS);
@@ -1271,7 +1410,7 @@ describe("unified browser interactions", () => {
     expect(applied.preventDefault).toHaveBeenCalledOnce();
 
     const hostOnly = browserHarness({
-      groups: groups.map((group) => ({ ...group, exactProvenance: false })),
+      groups: groups.map((group) => ({ ...group, hasEvidence: false })),
     });
     const hostResults = hostOnly.byId("modelscout-results");
     (hostResults.props.onSelect as (index: number) => void)(0);
@@ -1589,7 +1728,7 @@ describe("unified browser interactions", () => {
   it("omits the o facet key from footers when exact origin evidence is unavailable", () => {
     const hostOnly = groups.map((group) => ({
       ...group,
-      exactProvenance: false,
+      hasEvidence: false,
     }));
     const multi = browserHarness({ width: 100, groups: hostOnly });
     const multiFooter = multi.byId("modelscout-footer-text").props
@@ -1599,7 +1738,7 @@ describe("unified browser interactions", () => {
 
     const single = browserHarness({
       width: 100,
-      groups: [{ ...groups[0], exactProvenance: false }],
+      groups: [{ ...groups[0], hasEvidence: false }],
     });
     const singleFooter = single.byId("modelscout-footer-text").props
       .content as string;
@@ -1708,5 +1847,155 @@ describe("unified browser interactions", () => {
       expect(node.children.every((child) => typeof child === "object")).toBe(
         true,
       );
+  });
+});
+
+describe("refresh key and notices", () => {
+  it("calls onRefresh for Shift+R outside search and leaves r as reset", () => {
+    const onRefresh = vi.fn();
+    const harness = browserHarness({ onRefresh });
+    harness.press({ name: "t", sequence: "t" });
+
+    const refresh = harness.press({ name: "r", sequence: "R", shift: true });
+    expect(onRefresh).toHaveBeenCalledOnce();
+    expect(refresh.preventDefault).toHaveBeenCalledOnce();
+    expect(harness.view.state().facets.type).toBe("llm");
+
+    harness.press({ name: "r", sequence: "r" });
+    expect(onRefresh).toHaveBeenCalledOnce();
+    expect(harness.view.state().facets).toEqual(INITIAL_BROWSER_FACETS);
+  });
+
+  it("lets Shift+R type into search and passes it through without a handler", () => {
+    const onRefresh = vi.fn();
+    const searching = browserHarness({ onRefresh });
+    searching.press({ name: "/", sequence: "/" });
+    const typed = searching.press({ name: "r", sequence: "R", shift: true });
+    expect(onRefresh).not.toHaveBeenCalled();
+    expect(typed.preventDefault).not.toHaveBeenCalled();
+
+    const without = browserHarness();
+    const passed = without.press({ name: "r", sequence: "R", shift: true });
+    expect(passed.preventDefault).not.toHaveBeenCalled();
+    expect(without.view.state().facets).toEqual(INITIAL_BROWSER_FACETS);
+  });
+
+  it("advertises R refresh only when a handler exists and the footer has room", () => {
+    const wide = browserHarness({ width: 120, onRefresh: vi.fn() });
+    expect(wide.byId("modelscout-footer-text").props.content).toContain(
+      "R refresh",
+    );
+    const narrow = browserHarness({ width: 78, onRefresh: vi.fn() });
+    expect(narrow.byId("modelscout-footer-text").props.content).not.toContain(
+      "R refresh",
+    );
+    const without = browserHarness({ width: 120 });
+    expect(without.byId("modelscout-footer-text").props.content).not.toContain(
+      "R refresh",
+    );
+  });
+
+  it("leads the summary row with the notice and replaces it in place", () => {
+    const harness = browserHarness({ notice: "discovery running" });
+    const summary = harness.byId("modelscout-summary");
+    expect(summary.props.content).toMatch(
+      /^Model Scout · discovery running · 4\/4 models/,
+    );
+    harness.view.setNotice(undefined);
+    expect(summary.props.content).toMatch(/^Model Scout · 4\/4 models/);
+  });
+});
+
+describe("in-place updates", () => {
+  const renamed: ProviderGroup[] = [
+    {
+      ...groups[0],
+      models: [
+        ...groups[0].models,
+        model({ id: "atlas-new", name: "Atlas New" }),
+      ],
+    },
+    groups[1],
+  ];
+
+  it("keeps query, facets, and the selected row while replacing rows", () => {
+    const harness = browserHarness();
+    const results = harness.byId("modelscout-results");
+    const search = harness.byId("modelscout-search");
+    (search.props.onInput as (query: string) => void)("atlas");
+    harness.press({ name: "t", sequence: "t" });
+    (results.props.onChange as (index: number) => void)(1);
+    const before = harness.view.state();
+
+    harness.view.update(renamed, "discovery running");
+
+    expect(harness.view.state()).toMatchObject({
+      query: before.query,
+      facets: before.facets,
+      selected: before.selected,
+    });
+    const names = (results.props.options as SelectOption[]).map(
+      (option) => option.name,
+    );
+    expect(names.some((name) => name.includes("Atlas New"))).toBe(true);
+    expect(harness.byId("modelscout-summary").props.content).toContain(
+      "discovery running",
+    );
+  });
+
+  it("refreshes an open detail with the updated record", () => {
+    const harness = browserHarness();
+    const results = harness.byId("modelscout-results");
+    (results.props.onSelect as (index: number) => void)(1);
+    const updated = [
+      {
+        ...groups[0],
+        models: [model({ family: "atlas-family-2" }), groups[0].models[1]],
+      },
+      groups[1],
+    ];
+
+    harness.view.update(updated);
+
+    expect(harness.view.state().screen).toBe("detail");
+    expect(harness.byId("modelscout-detail-text").props.content).toContain(
+      "Family atlas-family-2",
+    );
+  });
+
+  it("returns to the list when the open detail's row disappears", () => {
+    const harness = browserHarness();
+    const results = harness.byId("modelscout-results");
+    (results.props.onSelect as (index: number) => void)(1);
+
+    harness.view.update([{ ...groups[0], models: [groups[0].models[1]] }]);
+
+    expect(harness.view.state().screen).toBe("list");
+    expect(harness.byId("modelscout-detail-screen").props.visible).toBe(false);
+    expect(harness.byId("modelscout-list-screen").props.visible).toBe(true);
+  });
+
+  it("drops a provider facet whose provider disappeared", () => {
+    const harness = browserHarness();
+    harness.press({ name: "p", sequence: "p" });
+    harness.press({ name: "p", sequence: "p" });
+    expect(harness.view.state().facets.provider).toBe("atlas-edge");
+
+    harness.view.update([groups[0]]);
+
+    expect(harness.view.state().facets.provider).toBe("all");
+    expect(harness.byId("modelscout-results").props.visible).toBe(true);
+  });
+
+  it("ignores updates and notices after dispose", () => {
+    const harness = browserHarness();
+    const summary = harness.byId("modelscout-summary");
+    const content = summary.props.content;
+    harness.view.dispose();
+
+    harness.view.update([], "late");
+    harness.view.setNotice("late");
+
+    expect(summary.props.content).toBe(content);
   });
 });

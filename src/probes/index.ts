@@ -6,21 +6,22 @@ import { probeTgi } from "./tgi";
 import { probeSglang } from "./sglang";
 import { probeLmstudio } from "./lmstudio";
 import { probeKoboldcpp } from "./koboldcpp";
-import { probeAtlas } from "./atlas";
+import { probeActualyze } from "./actualyze";
 import { fingerprint, PROBE_MAP } from "./fingerprint";
 import type { DetectedServer } from "./fingerprint";
+import { PROBE_ID_ALIASES } from "../constants";
 
 /**
  * Registry of provider-specific metadata probes.
  *
- * Activated via the `"probe"` field inside a provider's `options` in opencode.json:
+ * Activated via `settings.probe` on an OpenCode 2 provider:
  *
  * ```json
  * {
- *   "provider": {
+ *   "providers": {
  *     "my-omlx": {
- *       "npm": "@ai-sdk/openai-compatible",
- *       "options": {
+ *       "package": "aisdk:@ai-sdk/openai-compatible",
+ *       "settings": {
  *         "baseURL": "http://localhost:8000/v1",
  *         "probe": "omlx"
  *       }
@@ -29,12 +30,11 @@ import type { DetectedServer } from "./fingerprint";
  * }
  * ```
  *
- * The field MUST be inside `options` (not at the provider top level) because
- * opencode's `Config.Provider` schema uses `.strict()` and rejects unknown
- * top-level fields, while `options` uses `.catchall(z.any())`.
+ * Deprecated IDs in `PROBE_ID_ALIASES` (for example `atlas`) resolve to
+ * their current probe.
  */
 const PROBES = {
-  atlas: probeAtlas,
+  actualyze: probeActualyze,
   omlx: probeOmlx,
   ollama: probeOllama,
   vllm: probeVllm,
@@ -50,12 +50,33 @@ export type ProbeKey = keyof typeof PROBES;
 /** Result of resolving a probe, including optional auto-detection info. */
 export interface ResolvedProbe {
   probe: ProviderProbe | undefined;
+  /** Canonical registry key of `probe` (aliases already resolved). */
+  key?: ProbeKey;
   detectedServer?: DetectedServer;
+}
+
+function isProbeKey(value: string): value is ProbeKey {
+  return Object.hasOwn(PROBES, value);
+}
+
+/**
+ * Map a configured probe ID to its canonical registry key. Resolves
+ * deprecated aliases; returns undefined for `auto` and unknown IDs.
+ */
+export function canonicalProbeKey(
+  type: string | undefined,
+): ProbeKey | undefined {
+  if (!type) return undefined;
+  const id = Object.hasOwn(PROBE_ID_ALIASES, type)
+    ? PROBE_ID_ALIASES[type]
+    : type;
+  return isProbeKey(id) ? id : undefined;
 }
 
 /**
  * Resolve a probe by type. Supports:
- * - Explicit probe names (e.g., "omlx", "ollama")
+ * - Explicit probe names (e.g., "omlx", "ollama") and deprecated aliases
+ *   (e.g., "atlas" → "actualyze")
  * - "auto" — fingerprint the server and map to a probe
  * - undefined — return no probe
  */
@@ -73,21 +94,26 @@ export async function resolveProbe(
       apiKey,
       context?.modelsResponse,
       signal,
+      context?.headers,
     );
     if (!detected) return { probe: undefined };
     const probeKey = PROBE_MAP[detected];
-    return { probe: PROBES[probeKey], detectedServer: detected };
+    return {
+      probe: PROBES[probeKey],
+      key: probeKey,
+      detectedServer: detected,
+    };
   }
-  if (Object.hasOwn(PROBES, type)) {
-    return { probe: PROBES[type as ProbeKey] };
-  }
-  return { probe: undefined };
+  const key = canonicalProbeKey(type);
+  return key ? { probe: PROBES[key], key } : { probe: undefined };
 }
 
 export type {
   ProviderProbe,
   ProbeResult,
   ProbeModelMeta,
+  ProbeModelCost,
+  ProbeInputModality,
   ProbeContext,
   OpenAIModelEntry,
 } from "./types";

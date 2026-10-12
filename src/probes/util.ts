@@ -1,12 +1,40 @@
 import type { ProbeResult } from "./types";
 
 /**
- * Build request headers, adding Authorization if apiKey is provided.
+ * Set a header, replacing any existing entry whose name differs only in case.
+ * HTTP header names are case-insensitive, and a plain-object init that holds
+ * both spellings would send the values joined into one header.
+ */
+export function setHeader(
+  headers: Record<string, string>,
+  name: string,
+  value: string,
+): Record<string, string> {
+  const lowerName = name.toLowerCase();
+  for (const existing of Object.keys(headers)) {
+    if (existing.toLowerCase() === lowerName) delete headers[existing];
+  }
+  headers[name] = value;
+  return headers;
+}
+
+/**
+ * Build request headers: `Authorization: Bearer <apiKey>` when an API key is
+ * set, then the provider's headers on top, so an explicit provider
+ * `Authorization` replaces the derived one.
  * Does NOT include Content-Type — add locally when needed (e.g., Ollama POST).
  */
-export function buildHeaders(apiKey?: string): Record<string, string> {
+export function buildHeaders(
+  apiKey?: string,
+  providerHeaders?: Readonly<Record<string, string>>,
+): Record<string, string> {
   const headers: Record<string, string> = {};
   if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+  if (providerHeaders) {
+    for (const [name, value] of Object.entries(providerHeaders)) {
+      if (typeof value === "string") setHeader(headers, name, value);
+    }
+  }
   return headers;
 }
 

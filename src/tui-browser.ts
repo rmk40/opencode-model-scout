@@ -7,9 +7,10 @@ import type {
 import stringWidth from "string-width";
 import type {
   CapabilityEvidence,
+  CostEvidence,
   MetadataSource,
   ScalarEvidence,
-} from "./catalog-snapshot";
+} from "./catalog-evidence";
 import { compactCount, formatBytes } from "./format";
 import {
   coreMetadataCoverage,
@@ -25,7 +26,7 @@ export type FocusTarget = "search" | "list" | "detail";
 export type ModelTypeFacet = "all" | "llm" | "vlm" | "embedding" | "unknown";
 export type CapabilityNameFacet =
   | "any"
-  | "vision"
+  | "image"
   | "tools"
   | "reasoning"
   | "temperature";
@@ -125,6 +126,7 @@ function modelSearchFields(group: ProviderGroup, model: ModelRow): string[] {
     model.family,
     model.parameterSize,
     model.quantization,
+    model.enabled ? undefined : "disabled",
     ...model.flags,
   ].filter((field): field is string => Boolean(field));
 }
@@ -202,6 +204,7 @@ const EVIDENCE_LABELS: Record<MetadataSource, string> = {
   "models.dev": "models.dev",
   heuristic: "heuristic",
   "policy-default": "default",
+  "host-default": "host default",
   "unmatched-host": "host",
 };
 
@@ -248,12 +251,16 @@ function modelDisplayRow(
   coverage: CoreMetadataCoverage,
   width: number,
 ): string {
+  const tail = [
+    `core ${coverage.known}/${coverage.total}`,
+    ...(model.enabled ? [] : ["disabled"]),
+  ];
   const fixedColumns =
     MODEL_ROW_INDENT.length +
-    MODEL_COLUMN_GAP.length * 3 +
+    MODEL_COLUMN_GAP.length * (2 + tail.length) +
     MODEL_TYPE_COLUMNS +
     MODEL_CONTEXT_COLUMNS +
-    stringWidth(`core ${coverage.known}/${coverage.total}`);
+    stringWidth(tail.join(""));
   const nameColumns = Math.min(
     MODEL_NAME_MAX_COLUMNS,
     Math.max(MODEL_NAME_MIN_COLUMNS, width - fixedColumns),
@@ -267,7 +274,7 @@ function modelDisplayRow(
         : `ctx ${compactCount(model.context)}`,
       MODEL_CONTEXT_COLUMNS,
     ),
-    `core ${coverage.known}/${coverage.total}`,
+    ...tail,
   ].join(MODEL_COLUMN_GAP);
   return bounded(row, width).trimEnd();
 }
@@ -284,6 +291,7 @@ function modelDetail(group: ProviderGroup, model: ModelRow): string {
       : `out ${compactCount(model.output)}`,
     `core ${coverage.known}/${coverage.total}`,
     model.origin ? sanitizeInlineValue(model.origin) : undefined,
+    model.enabled ? undefined : "disabled",
   ].filter((part): part is string => Boolean(part));
   const lines = [
     sanitizeInlineValue(model.name),
@@ -293,22 +301,29 @@ function modelDetail(group: ProviderGroup, model: ModelRow): string {
     "Capabilities",
   ];
 
+  const unknownState: CapabilityEvidence = { state: "unknown" };
   if (model.type === "embedding") {
     lines.push("Chat capabilities: not applicable");
   } else if (model.capabilities) {
     lines.push(
-      `Vision: ${capabilityValue(model.capabilities.vision)} · Tools: ${capabilityValue(model.capabilities.toolCall)}`,
-      `Reasoning: ${capabilityValue(model.capabilities.reasoning)} · Temperature: ${capabilityValue(model.capabilities.temperature)}`,
+      `Tools: ${capabilityValue(model.capabilities.toolCall)} · Reasoning: ${capabilityValue(model.capabilities.reasoning)}`,
+      `Temperature: ${capabilityValue(model.capabilities.temperature)}`,
     );
   } else if (model.flags.length > 0) {
     lines.push(model.flags.map(sanitizeInlineValue).join(" · "));
   } else {
-    lines.push(
-      "Vision: unknown · Tools: unknown · Reasoning: unknown · Temperature: unknown",
-    );
+    lines.push("Tools: unknown · Reasoning: unknown · Temperature: unknown");
   }
+  const input = model.inputModalities;
+  lines.push(
+    `Image input: ${capabilityValue(input?.image ?? unknownState)} · PDF input: ${capabilityValue(input?.pdf ?? unknownState)}`,
+    `Audio input: ${capabilityValue(input?.audio ?? unknownState)} · Video input: ${capabilityValue(input?.video ?? unknownState)}`,
+  );
+
+  lines.push("", "Cost (USD per 1M tokens)", ...costLines(model.cost));
 
   lines.push("", "Metadata");
+  if (!model.enabled) lines.push("Enabled: no (hidden from the model picker)");
   if (model.type)
     lines.push(`Type: ${evidencedValue(model.type, model.provenance?.type)}`);
   if (model.context !== undefined)
@@ -356,9 +371,31 @@ function modelDetail(group: ProviderGroup, model: ModelRow): string {
   }
   lines.push(
     "",
-    "Sources: probe · config · server · models.dev · heuristic · default · host",
+    "Sources: probe · config · server · models.dev · heuristic · default · host default · host",
   );
   return lines.join("\n");
+}
+
+function priceValue(evidence: ScalarEvidence<number>): string {
+  if (evidence.state === "unknown") return "unknown";
+  return evidencedValue(
+    `$${Number(evidence.value.toFixed(6)).toString()}`,
+    evidence,
+  );
+}
+
+function costLines(cost: CostEvidence | undefined): string[] {
+  if (
+    !cost ||
+    Object.values(cost).every(
+      (price: ScalarEvidence<number>) => price.state === "unknown",
+    )
+  )
+    return ["Prices: unknown"];
+  return [
+    `Input: ${priceValue(cost.input)} · Output: ${priceValue(cost.output)}`,
+    `Cache read: ${priceValue(cost.cacheRead)} · Cache write: ${priceValue(cost.cacheWrite)}`,
+  ];
 }
 
 function capabilityEvidence(
@@ -366,23 +403,22 @@ function capabilityEvidence(
   facet: CapabilityNameFacet,
 ): CapabilityEvidence[] {
   if (model.type === "embedding") return [];
-  if (!model.capabilities) return [{ state: "unknown" }];
+  const unknownState: CapabilityEvidence = { state: "unknown" };
+  const image = model.inputModalities?.image ?? unknownState;
+  const toolCall = model.capabilities?.toolCall ?? unknownState;
+  const reasoning = model.capabilities?.reasoning ?? unknownState;
+  const temperature = model.capabilities?.temperature ?? unknownState;
   switch (facet) {
-    case "vision":
-      return [model.capabilities.vision];
+    case "image":
+      return [image];
     case "tools":
-      return [model.capabilities.toolCall];
+      return [toolCall];
     case "reasoning":
-      return [model.capabilities.reasoning];
+      return [reasoning];
     case "temperature":
-      return [model.capabilities.temperature];
+      return [temperature];
     case "any":
-      return [
-        model.capabilities.vision,
-        model.capabilities.toolCall,
-        model.capabilities.reasoning,
-        model.capabilities.temperature,
-      ];
+      return [image, toolCall, reasoning, temperature];
   }
 }
 
@@ -421,7 +457,7 @@ export interface ProviderSummary {
 }
 
 const CAPABILITY_NAMES = [
-  "vision",
+  "image",
   "tools",
   "reasoning",
   "temperature",
@@ -502,10 +538,16 @@ function providerDisplayRow(
         group.provider,
         countCell,
         `core ${counts.completeVisible}/${counts.visibleModels}`,
-        `discovery ${group.status ?? "unknown"}`,
+        `discovery ${discoveryStatus(group)}`,
       ].join(" · "),
     width,
   );
+}
+
+/** Latest attempt outcome: its failure kind, else the model list result. */
+function discoveryStatus(group: ProviderGroup): string {
+  if (group.failure) return `failed (${group.failure.kind})`;
+  return group.modelListAttempt ?? "unknown";
 }
 
 function providerDetail(
@@ -523,11 +565,19 @@ function providerDetail(
   const lines = [
     sanitizeInlineValue(group.provider),
     `Provider ID: ${sanitizeInlineValue(group.id)}`,
-    `${plural(summary.modelCount, "model")} · core ${summary.completeCore}/${summary.modelCount} · ${group.status ? sanitizeInlineValue(group.status) : "status unknown"}`,
+    `${plural(summary.modelCount, "model")} · core ${summary.completeCore}/${summary.modelCount} · discovery ${sanitizeInlineValue(discoveryStatus(group))}`,
     "",
     "Discovery",
     `Model list: ${group.modelListAttempt ? sanitizeInlineValue(group.modelListAttempt) : "unknown"} · Probe: ${group.probeAttempt ? sanitizeInlineValue(group.probeAttempt) : "unknown"}`,
   ];
+  if (group.hasEvidence)
+    lines.push(
+      `Last good inventory: ${group.lastGoodAt ? sanitizeInlineValue(group.lastGoodAt) : "none yet"}`,
+    );
+  if (group.failure)
+    lines.push(
+      `Latest attempt failed: ${sanitizeInlineValue(group.failure.kind)} at ${sanitizeInlineValue(group.failure.at)}`,
+    );
   if (group.configuredProbe || group.resolvedProbe)
     lines.push(
       `Probe selection: ${group.configuredProbe ? sanitizeInlineValue(group.configuredProbe) : "auto"} → ${group.resolvedProbe ? sanitizeInlineValue(group.resolvedProbe) : "unresolved"}`,
@@ -568,7 +618,7 @@ function providerDetail(
   }
   lines.push(
     "",
-    `Evidence: ${group.exactProvenance ? "correlated server snapshot plus host state" : "host state only"}`,
+    `Evidence: ${group.hasEvidence ? "server discovery catalog plus host state" : "host state only"}`,
   );
   return lines.join("\n");
 }
@@ -582,7 +632,7 @@ const TYPE_CYCLE: readonly ModelTypeFacet[] = [
 ];
 const CAPABILITY_CYCLE: readonly CapabilityNameFacet[] = [
   "any",
-  "vision",
+  "image",
   "tools",
   "reasoning",
   "temperature",
@@ -694,7 +744,7 @@ function buildBrowserIndex(
   return {
     providers,
     totalModels,
-    originFilterAvailable: groups.some((group) => group.exactProvenance),
+    originFilterAvailable: groups.some((group) => group.hasEvidence),
     textWidth,
   };
 }
@@ -784,7 +834,7 @@ function modelFacetsAtDefault(facets: BrowserFacets): boolean {
 }
 
 /**
- * Project host-derived groups into one unified, searchable grouped list: a
+ * Project reconciled groups into one unified, searchable grouped list: a
  * selectable header row per visible provider followed by its matching models.
  */
 export function projectBrowser(
@@ -861,7 +911,7 @@ export function projectBrowser(
     items,
     emptyMessage:
       groups.length === 0
-        ? "No models available."
+        ? "No models available yet. To use Actualyze, add its API key with /connect."
         : filtered
           ? `No matches. ${filterSummary}`
           : "No models available.",
@@ -926,11 +976,21 @@ export interface BrowserViewOptions {
   /** Bounded content columns available inside the host dialog. */
   width?: number;
   keyInput: Pick<KeyHandler, "on" | "off">;
+  /** Status shown right after the title, before the summary counts. */
+  notice?: string;
+  /** Called on Shift+R outside the search input; enables the hint. */
+  onRefresh?: () => void;
 }
 
 export interface BrowserView {
   root: TuiNode<"box">;
   state: () => BrowserState;
+  /**
+   * Replace the rows in place, keeping query, facets, selection, and screen.
+   * Only mutates existing nodes, so it is safe outside the render scope.
+   */
+  update: (groups: readonly ProviderGroup[], notice?: string) => void;
+  setNotice: (notice: string | undefined) => void;
   dispose: () => void;
 }
 
@@ -946,8 +1006,10 @@ export interface FooterContext {
   hasItems: boolean;
   /** The zero-item list remains a valid recovery focus target (facet-empty). */
   listRecoverable: boolean;
-  /** Exact origin evidence exists, so the `o` facet key does something. */
+  /** Discovery evidence exists, so the `o` facet key does something. */
   originFilterAvailable: boolean;
+  /** Shift+R requests a server refresh. */
+  refreshAvailable?: boolean;
 }
 
 /**
@@ -956,10 +1018,11 @@ export interface FooterContext {
  * - Search focus advertises only the actions the search input honors,
  *   including the enter/arrow exit to a zero-item but recoverable list.
  * - Facet keys advertise `p` only for multi-provider catalogs and `o` only
- *   when exact origin evidence is available.
+ *   when discovery evidence supplies model origins.
  * - List and detail footers degrade full → medium → compact; the medium
- *   variant fits the 64-column text budget of an 80-column terminal while
- *   still exposing the facet shortcuts and reset.
+ *   variant fits the 70-column text budget of an 80-column terminal while
+ *   still exposing the facet shortcuts and reset. The refresh hint appears
+ *   only in the full variant.
  */
 export function footerContent(context: FooterContext): string {
   const {
@@ -970,6 +1033,7 @@ export function footerContent(context: FooterContext): string {
     hasItems,
     listRecoverable,
     originFilterAvailable,
+    refreshAvailable = false,
   } = context;
   if (focus === "search") {
     const hint = hasItems
@@ -990,6 +1054,9 @@ export function footerContent(context: FooterContext): string {
   if (screen === "list" && !hasItems) {
     // Facet-empty recovery: only facet cycling, reset, search, and close work.
     const variants = [
+      ...(refreshAvailable
+        ? [`/ search · ${facetKeys} filters · r reset · R refresh · esc close`]
+        : []),
       `/ search · ${facetKeys} filters · r reset · esc close`,
       `/ search · ${facetKeys} · r reset · esc close`,
       "r reset · esc close",
@@ -1000,11 +1067,21 @@ export function footerContent(context: FooterContext): string {
   const variants =
     screen === "list"
       ? [
+          ...(refreshAvailable
+            ? [
+                `↑/↓ navigate · enter open · / search · ${facetKeys} filters · r reset · R refresh · esc close`,
+              ]
+            : []),
           `↑/↓ navigate · enter open · / search · ${facetKeys} filters · r reset · esc close`,
           `↑/↓ · enter open · / search · ${facetKeys} · r reset · esc close`,
           "↑/↓ move · enter open · / search · esc close",
         ]
       : [
+          ...(refreshAvailable
+            ? [
+                `↑/↓ scroll · backspace list · / search · ${facetKeys} filters · r reset · R refresh · esc close`,
+              ]
+            : []),
           `↑/↓ scroll · backspace list · / search · ${facetKeys} filters · r reset · esc close`,
           `↑/↓ scroll · backspace · / search · ${facetKeys} · r reset · esc`,
           "↑/↓ scroll · backspace list · / search · esc close",
@@ -1073,17 +1150,19 @@ function hasCommandModifier(key: KeyEvent): boolean {
   return Boolean(key.ctrl || key.meta || key.option || key.super || key.hyper);
 }
 
-/** Build the unified grouped list/detail browser from host-derived rows. */
+/** Build the unified grouped list/detail browser from reconciled rows. */
 export function buildBrowserView(
   renderer: TuiRenderer,
   options: BrowserViewOptions,
 ): BrowserView {
-  const { groups, theme, keyInput } = options;
+  const { theme, keyInput, onRefresh } = options;
   const layout = browserLayoutBudget(options.maxHeight);
   const contentWidth = browserContentWidth(options.width);
   const textWidth = Math.max(1, contentWidth - 8);
-  const browserIndex = buildBrowserIndex(groups, textWidth);
-  const multiProvider = groups.length > 1;
+  let groups = options.groups;
+  let notice = options.notice;
+  let browserIndex = buildBrowserIndex(groups, textWidth);
+  let multiProvider = groups.length > 1;
   let state = INITIAL_BROWSER_STATE;
   let projection = projectBrowser(
     groups,
@@ -1152,6 +1231,7 @@ export function buildBrowserView(
         hasItems: projection.items.length > 0,
         listRecoverable: canRecoverFacetEmptyList(),
         originFilterAvailable: projection.originFilterAvailable,
+        refreshAvailable: onRefresh !== undefined,
       }),
     );
   }
@@ -1389,7 +1469,6 @@ export function buildBrowserView(
         key: selection.item.key,
       });
     }
-    const summary = projection.summary;
     renderer.set(list, "options", asSelectOptions(projection.items));
     renderer.set(list, "selectedIndex", selection.index);
     renderer.set(list, "visible", projection.items.length > 0);
@@ -1400,17 +1479,7 @@ export function buildBrowserView(
       bounded(projection.emptyMessage, textWidth),
     );
     renderer.set(filterText, "content", projection.filterSummary);
-    const providerPart = multiProvider
-      ? ` · ${plural(summary.providerCount, "provider")}`
-      : "";
-    renderer.set(
-      summaryText,
-      "content",
-      bounded(
-        `Model Scout · ${summary.visibleModels}/${summary.totalModels} models${providerPart} · ${summary.missingCoreCount} missing core`,
-        textWidth,
-      ),
-    );
+    refreshSummary();
     if (state.screen === "list") {
       renderer.set(listScreen, "visible", true);
       renderer.set(detailPane, "visible", false);
@@ -1433,6 +1502,48 @@ export function buildBrowserView(
       );
     }
     refreshFooter();
+  }
+
+  function refreshSummary(): void {
+    const summary = projection.summary;
+    const providerPart = multiProvider
+      ? ` · ${plural(summary.providerCount, "provider")}`
+      : "";
+    const noticePart = notice ? ` · ${notice}` : "";
+    renderer.set(
+      summaryText,
+      "content",
+      bounded(
+        `Model Scout${noticePart} · ${summary.visibleModels}/${summary.totalModels} models${providerPart} · ${summary.missingCoreCount} missing core`,
+        textWidth,
+      ),
+    );
+  }
+
+  function update(next: readonly ProviderGroup[], nextNotice?: string): void {
+    groups = next;
+    notice = nextNotice;
+    browserIndex = buildBrowserIndex(groups, textWidth);
+    multiProvider = groups.length > 1;
+    if (
+      state.facets.provider !== "all" &&
+      !groups.some((group) => group.id === state.facets.provider)
+    )
+      state = reduceBrowserState(state, {
+        type: "facets",
+        facets: { ...state.facets, provider: "all" },
+      });
+    if (
+      state.screen === "detail" &&
+      !projectBrowser(
+        groups,
+        state.query,
+        state.facets,
+        browserIndex,
+      ).items.some((item) => item.key === state.selected)
+    )
+      state = reduceBrowserState(state, { type: "show", screen: "list" });
+    refresh();
   }
 
   function returnToListFocus(): void {
@@ -1498,6 +1609,12 @@ export function buildBrowserView(
     }
 
     if (state.focus === "search") return;
+    if (name === "r" && (key.shift || key.sequence === "R")) {
+      if (!onRefresh) return;
+      onRefresh();
+      consumeKey(key);
+      return;
+    }
     const shortcut: Partial<Record<string, BrowserFacetKey>> = {
       ...(multiProvider ? { p: "provider" as const } : {}),
       t: "type",
@@ -1539,6 +1656,14 @@ export function buildBrowserView(
   return {
     root,
     state: () => state,
+    update: (next, nextNotice) => {
+      if (!disposed) update(next, nextNotice);
+    },
+    setNotice: (next) => {
+      if (disposed) return;
+      notice = next;
+      refreshSummary();
+    },
     dispose: () => {
       if (disposed) return;
       disposed = true;
