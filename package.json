@@ -124,6 +124,7 @@
     "prettier": "^3.8.2",
     "solid-js": "1.9.12",
     "tsup": "^8.5.1",
+    "tuistory": "^0.10.0",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.58.1",
     "vitest": "^4.0.16"

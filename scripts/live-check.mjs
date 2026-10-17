@@ -10,6 +10,14 @@
 // hidden. The chat check sends one plain prompt to --chat-model, or else to
 // the first listed Actualyze model.
 //
+// After `start --actualyze-mock` the endpoint is the harness's Actualyze
+// mock, and the expected discovery outcome follows the synthetic key in
+// ACTUALYZE_API_KEY_FILE (ACTUALYZE_MOCK_SCENARIOS): a failing key expects
+// its failure kind and HTTP status, and no key expects the 401 the mock
+// sends without one. After `start --actualyze-refused` the expected failure
+// is `unreachable`. In both modes the config entry lists the provider even
+// without a key.
+//
 // Prints only the fields it checks and PASS/FAIL. It never prints a raw
 // model.list or provider.list response: both carry the plaintext apiKey.
 // Failures print a fixed category and, where captured, the HTTP status, never
@@ -28,20 +36,27 @@ import {
 import {
   ACTUALYZE_BASE_URL,
   ACTUALYZE_ENABLED,
+  ACTUALYZE_MOCK_SCENARIOS,
   ACTUALYZE_PROVIDER,
+  MOCK_DECLARED_MODELS,
   MOCK_MODELS,
   PROJECT,
   api,
   envArgv,
   isolatedEnv,
+  mockScenarioForKey,
   readActualyzeKey,
   readState,
 } from "./live-harness.mjs";
 
 const PLUGIN_ID = "opencode-model-scout";
 const ACTUALYZE = ACTUALYZE_PROVIDER;
-const ACTUALYZE_ENDPOINT = ACTUALYZE_BASE_URL ?? BUILT_IN_BASE_URL;
 const MOCK = "mock-compat";
+const HOST_DEFAULT_CONTEXT = 200_000;
+/** One-minute refresh floor per store key (src/store.ts). */
+const REFRESH_FLOOR_MS = 60_000;
+/** Slack for comparing server timestamps with values derived from headers. */
+const TIME_SLACK_MS = 5_000;
 
 const args = process.argv.slice(2);
 const skipChat = args.includes("--skip-chat");
@@ -57,7 +72,7 @@ async function fetchActualyzeList() {
   if (!key) return { failure: "key file unreadable or empty" };
   let response;
   try {
-    response = await fetch(`${ACTUALYZE_ENDPOINT}/models`, {
+    response = await fetch(`${actualyzeEndpoint}/models`, {
       headers: { authorization: `Bearer ${key}` },
       signal: AbortSignal.timeout(30_000),
     });
@@ -107,10 +122,15 @@ function sorted(values) {
   return Array.isArray(values) ? [...values].sort() : values;
 }
 
+function isPositiveInteger(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
 /**
  * Expected `Model.Info` fields for a model discovered from an Actualyze list
  * entry. No effort variants: the Actualyze chat endpoint ignores
- * `reasoning_effort`.
+ * `reasoning_effort`. An unreported context is the host default, and an
+ * unreported output limit is 0 ("fit to the remaining context").
  */
 function expectedFromActualyze(entry) {
   const capabilities = entry.capabilities ?? {};
@@ -119,10 +139,15 @@ function expectedFromActualyze(entry) {
     : capabilities.vision === true
       ? ["text", "image"]
       : ["text"];
+  const context = isPositiveInteger(entry.context_window)
+    ? entry.context_window
+    : HOST_DEFAULT_CONTEXT;
   return {
     limit: {
-      context: entry.context_window,
-      output: entry.max_output_tokens,
+      context,
+      output: isPositiveInteger(entry.max_output_tokens)
+        ? Math.min(entry.max_output_tokens, context)
+        : 0,
     },
     tools: capabilities.tool_use === false ? false : true,
     input: sorted(input),
@@ -143,6 +168,21 @@ function expectedFromActualyze(entry) {
     released: typeof entry.created === "number" ? entry.created * 1000 : 0,
     enabled: true,
   };
+}
+
+function isEmbeddingId(id) {
+  return id.includes("embed");
+}
+
+/** Cost entries with a fixed key order, so equal tiers compare equal. */
+function canonicalCosts(costs) {
+  if (!Array.isArray(costs)) return costs;
+  return costs.map((cost) => ({
+    tier: cost.tier ? { type: cost.tier.type, size: cost.tier.size } : null,
+    input: cost.input,
+    output: cost.output,
+    cache: { read: cost.cache?.read ?? 0, write: cost.cache?.write ?? 0 },
+  }));
 }
 
 function actualFields(model) {
@@ -189,9 +229,10 @@ async function checkPlugins(state) {
 }
 
 /**
- * The built-in provider is listed only with a key. With one, its key must
- * come from the integration (no `settings.apiKey`), and the endpoint is the
- * configured override or the built-in one.
+ * The built-in provider is listed only with a key or a config entry (the
+ * mock modes write one). When listed, its key must come from the integration
+ * (no `settings.apiKey`), and the endpoint is the configured one or the
+ * built-in one.
  */
 async function checkActualyzeProvider(state) {
   console.log("== provider.list");
@@ -201,7 +242,7 @@ async function checkActualyzeProvider(state) {
   const provider = (Array.isArray(json?.data) ? json.data : []).find(
     (entry) => entry?.id === ACTUALYZE,
   );
-  if (!ACTUALYZE_ENABLED) {
+  if (!ACTUALYZE_ENABLED && mode === "default") {
     check(`${ACTUALYZE} hidden without a key`, provider === undefined);
     return;
   }
@@ -214,7 +255,7 @@ async function checkActualyzeProvider(state) {
   equalField(
     `${ACTUALYZE} settings.baseURL`,
     provider.settings?.baseURL,
-    ACTUALYZE_ENDPOINT,
+    actualyzeEndpoint,
   );
   equalField(
     `${ACTUALYZE} settings.probe`,
@@ -268,6 +309,13 @@ async function checkModels(state) {
   for (const entry of listed) {
     const key = `${ACTUALYZE}/${entry.id}`;
     const model = byKey.get(key);
+    if (isEmbeddingId(entry.id)) {
+      check(
+        `${key} not offered as a chat model`,
+        model === undefined || model.enabled === false,
+      );
+      continue;
+    }
     if (!check(`${key} listed`, model !== undefined)) continue;
     const expected = expectedFromActualyze(entry);
     const actual = actualFields(model);
@@ -283,12 +331,31 @@ async function checkModels(state) {
     equalField(`${ACTUALYZE} has no unexpected models`, extra, []);
   } else if (!ACTUALYZE_ENABLED) {
     equalField(`${ACTUALYZE} has no models without a key`, extra, []);
+  } else if (expectedFailure) {
+    equalField(`${ACTUALYZE} has no models after a failure`, extra, []);
   }
 
   for (const entry of MOCK_MODELS) {
     const key = `${MOCK}/${entry.id}`;
     const model = byKey.get(key);
-    if (entry.id.includes("embed")) {
+    const declared = MOCK_DECLARED_MODELS[entry.id];
+    if (declared) {
+      // Scout never patches a declared model: every value is the config's.
+      if (!check(`${key} listed`, model !== undefined)) continue;
+      equalField(`${key} name`, model.name, declared.name);
+      equalField(
+        `${key} limit`,
+        { context: model.limit?.context, output: model.limit?.output },
+        declared.limit,
+      );
+      equalField(
+        `${key} cost tiers`,
+        canonicalCosts(model.cost),
+        canonicalCosts(declared.cost),
+      );
+      continue;
+    }
+    if (isEmbeddingId(entry.id)) {
       check(
         `${key} not offered as a chat model`,
         model === undefined || model.enabled === false,
@@ -351,7 +418,8 @@ async function checkRpc(state) {
   )
     return;
   const payload = validateCatalogPayload(json?.output);
-  if (!check("catalog payload passes the strict v4 validator", payload)) return;
+  if (!check("catalog payload passes the strict v5 validator", payload)) return;
+  equalField("catalog builtIn.actualyze", payload.builtIn.actualyze, "managed");
   for (const [id, count] of [
     ...(actualyzeList ? [[ACTUALYZE, actualyzeList.length]] : []),
     [MOCK, MOCK_MODELS.length],
@@ -362,19 +430,115 @@ async function checkRpc(state) {
     check(`${id} lastGoodAt set`, provider.lastGoodAt !== null);
     equalField(`${id} failure`, provider.failure, null);
     equalField(`${id} model evidence count`, provider.models.length, count);
+    checkSettledRecord(id, provider);
+  }
+  const mockRecord = payload.providers.find((entry) => entry.id === MOCK);
+  if (mockRecord) {
+    equalField(
+      `${MOCK} credentialSource`,
+      mockRecord.credentialSource,
+      "settings",
+    );
+    for (const id of Object.keys(MOCK_DECLARED_MODELS)) {
+      equalField(
+        `${MOCK}/${id} evidence origin`,
+        mockRecord.models.find((model) => model.id === id)?.origin,
+        "pre-existing",
+      );
+    }
   }
   const actualyze = payload.providers.find((entry) => entry.id === ACTUALYZE);
-  if (!ACTUALYZE_ENABLED)
+  if (!ACTUALYZE_ENABLED && mode === "default")
     check(`catalog has no evidence for ${ACTUALYZE}`, actualyze === undefined);
   if (actualyze) {
+    const probeValue = (evidence) =>
+      evidence.state === "known" ? evidence.value : "unknown";
     equalField(
-      `${ACTUALYZE} resolvedProbe`,
-      actualyze.resolvedProbe.state === "known"
-        ? actualyze.resolvedProbe.value
-        : "unknown",
+      `${ACTUALYZE} configuredProbe`,
+      probeValue(actualyze.configuredProbe),
       "actualyze",
     );
+    // The probe resolves only after a non-empty model list arrives.
+    if (!expectedFailure && (actualyzeList?.length ?? 0) > 0)
+      equalField(
+        `${ACTUALYZE} resolvedProbe`,
+        probeValue(actualyze.resolvedProbe),
+        "actualyze",
+      );
+    equalField(
+      `${ACTUALYZE} credentialSource`,
+      actualyze.credentialSource,
+      ACTUALYZE_ENABLED ? "connection" : "none",
+    );
+    if (expectedFailure) checkFailureRecord(actualyze, payload.generatedAt);
+  } else if (expectedFailure) {
+    check(`catalog has evidence for ${ACTUALYZE}`, false);
   }
+}
+
+/** A record whose job settled: not discovering, and its result is current. */
+function checkSettledRecord(id, record) {
+  equalField(`${id} discovering`, record.discovering, false);
+  check(`${id} lastAttemptAt set`, record.lastAttemptAt !== null);
+  equalField(
+    `${id} resultEpoch equals credentialEpoch`,
+    record.resultEpoch,
+    record.credentialEpoch,
+  );
+}
+
+/**
+ * The `actualyze` record after a failing discovery: the expected kind and
+ * HTTP status, no models, and for a 429 a `retryAt` from `Retry-After` with
+ * `nextRefreshAt` at the later of it and the one-minute floor.
+ */
+function checkFailureRecord(record, generatedAtIso) {
+  const { kind, httpStatus } = expectedFailure;
+  checkSettledRecord(ACTUALYZE, record);
+  equalField(`${ACTUALYZE} failure kind`, record.failure?.kind, kind);
+  equalField(
+    `${ACTUALYZE} failure httpStatus`,
+    record.failure?.httpStatus,
+    httpStatus,
+  );
+  equalField(`${ACTUALYZE} lastGoodAt`, record.lastGoodAt, null);
+  equalField(`${ACTUALYZE} model evidence count`, record.models.length, 0);
+  const retryAfterSeconds = mockScenario
+    ? ACTUALYZE_MOCK_SCENARIOS[mockScenario].retryAfterSeconds
+    : undefined;
+  if (retryAfterSeconds === undefined) {
+    equalField(
+      `${ACTUALYZE} failure retryAt`,
+      record.failure?.retryAt,
+      undefined,
+    );
+    return;
+  }
+  const at = Date.parse(record.failure?.at ?? "");
+  const retryAt = Date.parse(record.failure?.retryAt ?? "");
+  const expectedRetryAt = at + retryAfterSeconds * 1000;
+  check(
+    `${ACTUALYZE} retryAt is Retry-After (${retryAfterSeconds} s) after the attempt`,
+    Math.abs(retryAt - expectedRetryAt) <= TIME_SLACK_MS,
+    `(retryAt ${show(record.failure?.retryAt)}, at ${show(record.failure?.at)})`,
+  );
+  const lastAttempt = Date.parse(record.lastAttemptAt ?? "");
+  const expectedNext = Math.max(lastAttempt + REFRESH_FLOOR_MS, retryAt);
+  const generatedAt = Date.parse(generatedAtIso);
+  if (expectedNext <= generatedAt) {
+    equalField(
+      `${ACTUALYZE} nextRefreshAt after it passed`,
+      record.nextRefreshAt,
+      null,
+    );
+    return;
+  }
+  check(
+    `${ACTUALYZE} nextRefreshAt is max(lastAttemptAt + 60 s, retryAt)`,
+    Math.abs(Date.parse(record.nextRefreshAt ?? "") - expectedNext) <=
+      TIME_SLACK_MS,
+    `(nextRefreshAt ${show(record.nextRefreshAt)}, lastAttemptAt ${show(record.lastAttemptAt)})`,
+  );
 }
 
 function runChat(state, model) {
@@ -428,12 +592,16 @@ async function checkChat(state) {
     return;
   }
   const { code, signal, errorTypes } = await runChat(state, model);
-  const ok = code === 0 && errorTypes.length === 0;
+  const succeeded = code === 0 && errorTypes.length === 0;
+  // A read-only key lists models, but every inference call gets a 403.
+  const expectSuccess =
+    chatModelArg !== undefined ||
+    ACTUALYZE_MOCK_SCENARIOS[mockScenario]?.chatStatus === undefined;
   check(
-    `chat ${model}`,
-    ok,
-    ok
-      ? ""
+    expectSuccess ? `chat ${model}` : `chat ${model} is refused`,
+    succeeded === expectSuccess,
+    succeeded
+      ? "(succeeded)"
       : `(exit ${code ?? signal}${errorTypes.length ? `, errors ${show(errorTypes)}` : ""})`,
   );
 }
@@ -445,12 +613,31 @@ if (!state) {
   );
   process.exit(1);
 }
+/** `default`, or the harness's own Actualyze endpoint: `mock` or `refused`. */
+const mode = state.actualyze?.mode ?? "default";
+const actualyzeEndpoint =
+  state.actualyze?.baseURL ?? ACTUALYZE_BASE_URL ?? BUILT_IN_BASE_URL;
+const actualyzeKey = await readActualyzeKey();
+const mockScenario =
+  mode === "mock" ? mockScenarioForKey(actualyzeKey) : undefined;
+/** The failure discovery must record for `actualyze`, or null for none. */
+const expectedFailure =
+  mode === "refused"
+    ? { kind: "unreachable" }
+    : mode === "mock"
+      ? mockScenario
+        ? ACTUALYZE_MOCK_SCENARIOS[mockScenario].failure
+        : { kind: "unauthorized", httpStatus: 401 }
+      : null;
+console.log(
+  `note: actualyze endpoint ${mode === "default" ? "default" : `${mode} ${actualyzeEndpoint}`}${mockScenario ? `, mock key "${mockScenario}"` : ""}`,
+);
 let actualyzeList;
-if (ACTUALYZE_ENABLED) {
+if (ACTUALYZE_ENABLED && !expectedFailure) {
   const { list, failure } = await fetchActualyzeList();
   if (check("fetch Actualyze /models", failure === undefined, `(${failure})`))
     actualyzeList = list;
-} else {
+} else if (!ACTUALYZE_ENABLED && mode === "default") {
   console.log(
     "note: ACTUALYZE_API_KEY_FILE not set; checking that Actualyze stays hidden",
   );
