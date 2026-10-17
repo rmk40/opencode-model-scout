@@ -138,14 +138,42 @@ const ACRONYMS = new Set([
  * Format model ID for display.
  * Turns "qwen/qwen3-30b-a3b" into "Qwen3 30B A3B".
  */
+const SHORT_NUMBER = /^\d{1,2}$/;
+
+/**
+ * Join a pair of short numeric tokens into one version ("4", "5" → "4.5"),
+ * so "claude-sonnet-4-5" reads "Claude Sonnet 4.5". Runs that follow another
+ * number or continue past two parts (dates such as "2024-08-06") stay apart.
+ */
+function joinVersionParts(tokens: readonly string[]): string[] {
+  const result: string[] = [];
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    const next = tokens[index + 1];
+    const previous = tokens[index - 1];
+    const after = tokens[index + 2];
+    if (
+      SHORT_NUMBER.test(token) &&
+      next !== undefined &&
+      SHORT_NUMBER.test(next) &&
+      (previous === undefined || !/^\d+$/.test(previous)) &&
+      (after === undefined || !/^\d+$/.test(after))
+    ) {
+      result.push(`${token}.${next}`);
+      index += 1;
+      continue;
+    }
+    result.push(token);
+  }
+  return result;
+}
+
 export function formatModelName(id: string): string {
   // Extract part after slash (if any)
   const slash = id.indexOf("/");
   const modelPart = slash > 0 ? id.slice(slash + 1) : id;
 
-  return modelPart
-    .split(/[-_:]/)
-    .filter(Boolean)
+  return joinVersionParts(modelPart.split(/[-_:]/).filter(Boolean))
     .map((token) => {
       const lower = token.toLowerCase();
       if (ACRONYMS.has(lower)) return token.toUpperCase();
