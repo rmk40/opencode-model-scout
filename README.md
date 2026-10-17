@@ -11,7 +11,7 @@ reasoning-effort variants, and prices where the server reports them. It has
 probes for Actualyze, Ollama, oMLX, vLLM, TGI, SGLang, LM Studio, KoboldCpp,
 llama.cpp, and LocalAI.
 
-Version 2 is for OpenCode 2 and is tested against OpenCode 2.0.26. If you are
+Version 2 is for OpenCode 2 and is tested against OpenCode 2.0.32. If you are
 still on OpenCode 1, see [Using OpenCode 1](#using-opencode-1).
 
 ## Quick Start
@@ -29,7 +29,8 @@ has your API key.
    ```
 
 2. Add your Actualyze API key in one of these ways:
-   - In the TUI, run `/connect` and pick **Actualyze**.
+   - In the TUI, run `/actualyze`, press `k`, and paste the key. You can also
+     run `/connect` and pick **Actualyze**.
    - From a shell, run `opencode auth login actualyze`.
    - Set `ACTUALYZE_API_KEY` on the background service and restart it:
 
@@ -42,7 +43,9 @@ has your API key.
      [The background service](#the-background-service-and-environment-variables)).
 
 3. The Actualyze models appear in the model picker once discovery finishes.
-   See [Actualyze](#actualyze) for other environments and details.
+   `/actualyze` shows whether the catalog answered for your key and, if it
+   did not, what to do next. See [Actualyze](#actualyze) for other
+   environments and details.
 
 ### With another OpenAI-compatible server
 
@@ -86,7 +89,10 @@ served model to the catalog.
 ## How It Works
 
 The plugin has two halves. The server half runs inside OpenCode's background
-service and does the discovery. The TUI half adds the `/modelscout` browser.
+service and does the discovery. The TUI half adds two commands:
+[`/modelscout`](#modelscout-command), a browser of every discovered model,
+and [`/actualyze`](#actualyze-command), which connects an Actualyze key and
+explains the state of its catalog.
 
 For each provider it targets (see
 [Which providers are discovered](#which-providers-are-discovered)), the server
@@ -144,7 +150,7 @@ To pass [plugin options](#plugin-options), use the object form:
 
 The package contains a server plugin and a TUI plugin. OpenCode loads the TUI
 half automatically together with the server half, so there is nothing else to
-add for `/modelscout`.
+add for `/modelscout` and `/actualyze`.
 
 ### Running from a checkout
 
@@ -330,11 +336,12 @@ provider. For each one it writes:
 | `variants`            | `low`, `medium`, and `high`, each setting `reasoningEffort`, for reasoning models on the openai-compatible package. Reasoning comes from the probe or from a models.dev match that has effort variants. Actualyze models get none. |
 | `cost`                | Prices the probe reports, in USD per million tokens. A missing cache price becomes `0`. Without reported prices, `cost` is empty.                                                                                                  |
 | `time.released`       | The Actualyze `created` time; `0` for other servers.                                                                                                                                                                               |
-| `enabled`             | `false` for embedding models, which keeps them out of the picker. `/modelscout` still lists them.                                                                                                                                  |
+| `enabled`             | `false` for embedding models, which keeps them out of the picker. `/modelscout` lists them when its type filter includes embeddings.                                                                                               |
 
 A model counts as an embedding model when the probe says so or, without probe
-data, when its ID contains `embed`. Parameter size, quantization, file size,
-and temperature support have no OpenCode field; `/modelscout` shows them.
+data, when its ID contains `embed`. Scout does not set parameter size,
+quantization, file size, or temperature support on the model;
+`/modelscout` shows them in its details.
 
 ### Declared models are never modified
 
@@ -363,8 +370,8 @@ exactly as it is. Scout adds the other served models around it.
 ```
 
 Here `qwen3:30b` keeps your name and limits, and every other model the server
-serves is added with discovered metadata. `/modelscout` lists `qwen3:30b` with
-the origin `configured`.
+serves is added with discovered metadata. In `/modelscout`, the Evidence
+screen for `qwen3:30b` gives its origin as declared in your config.
 
 ## Supported Servers
 
@@ -447,9 +454,9 @@ key handling stay as they are:
 
 Any `providers.actualyze` entry in your config makes OpenCode list the
 provider even without a key. Discovery then runs without credentials, and
-`/modelscout` shows the endpoint's error until you add one. Add the key with
-`/connect` or `opencode auth login actualyze` as usual: the entry does not
-create a second Actualyze integration. A `settings.apiKey` in the entry also
+`/modelscout` and `/actualyze` show the endpoint's error until you add one.
+Add the key with `/actualyze`, `/connect`, or `opencode auth login actualyze`
+as usual: the entry does not create a second Actualyze integration. A `settings.apiKey` in the entry also
 works, without connecting the integration. A connected key takes precedence
 over `settings.apiKey` for both discovery and chat, so the two always use the
 same key.
@@ -492,74 +499,319 @@ its ID is one OpenCode already knows; add `"probe": "actualyze"` to its
 ## `/modelscout` Command
 
 Type `/modelscout`, or pick **Model Scout** from the command palette. It opens
-a browser of every discovered provider and model without sending anything to
-a model.
+a browser of the models scout's providers serve, without sending anything to
+a model. The dialog appears at once and fills in when OpenCode's model lists
+and scout's discovery catalog arrive. It updates in place when a discovery
+run starts or settles and when OpenCode's model catalog changes.
 
-The list groups models under their provider. Each provider header shows the
-model count (as `visible/total` while search or filters hide some), how many
-models have complete core metadata, and the latest discovery status. Press
-`enter` on a model to see its metadata, or on a provider header to see that
-provider's discovery details. `backspace` returns to the list with search,
-filters, and selection unchanged.
+The list covers every provider scout discovers, plus any OpenCode provider
+that looks like a discovery target: one with `settings.baseURL` and either
+`settings.probe` or the openai-compatible package. Providers are sorted by
+name, and models within each provider by name until you change the sort.
 
-| Key               | Action                                                                                                        |
-| ----------------- | ------------------------------------------------------------------------------------------------------------- |
-| `↑` / `↓`         | Move through the list, or scroll the details                                                                  |
-| `enter`           | Open details; from the search box, move to the results                                                        |
-| `/`               | Focus the search box (from details, return to the list first)                                                 |
-| `backspace`       | Return from details to the list                                                                               |
-| `p`               | Cycle the provider filter (only with more than one provider)                                                  |
-| `t`               | Cycle the model type filter                                                                                   |
-| `c`               | Cycle the capability filter                                                                                   |
-| `s`               | Cycle the capability evidence state filter                                                                    |
-| `m`               | Cycle complete or missing core metadata                                                                       |
-| `o`               | Cycle discovered or configured origin (only when the server's discovery data is available)                    |
-| `r`               | Reset all filters                                                                                             |
-| `R` (`Shift`+`r`) | Ask the server to rediscover every provider; a provider whose discovery started under a minute ago is skipped |
-| `esc`             | Close the browser                                                                                             |
+### Reading the list
 
-While the search box has focus, letters go to the search; press `enter` or an
-arrow key to get back to the list and its shortcuts. The footer lists only the
-keys that work in the current view.
+```
+ ▾ Actualyze                             4 models  ● ready
+   Claude Haiku 4.5           200K  T I R            $1/$5
+▌● Claude Sonnet 4.5          200K  T I R           $3/$15
+   GPT OSS 120B               131K  T · R       $0.15/$0.6
+ ▾ Studio oMLX                           2 models  ● ready
+   Gemma 3 12B               ~200K  · I ·
+   Qwen3 Coder 30B            262K  t · ·
+ ▸ Team gateway                   3 models  ▲ key rejected
+```
 
-### What the details show
+- **Provider headers** show the model count, as `visible/total` while search
+  or filters hide some, and the discovery status: `● ready`, `○ checking`
+  while discovery runs, `○ resolving` while scout looks up which key to use,
+  `○ waiting` until discovery has a result for the current key, or a failure
+  such as `▲ key rejected`, `▲ rate limited`, or `▲ unreachable`. A failing
+  provider keeps the models from its last good discovery.
+- **`●`** before a model name marks the model the prompt uses now. `▌` marks
+  the selected row.
+- **Context** is the context window. `~200K`, dimmed, means no source
+  reported one and OpenCode uses its default of 200,000 tokens.
+- **`T I R`** stand for tool calls, image input, and reasoning. An uppercase
+  letter is reported by the server, your config, or OpenCode. A lowercase
+  letter is assumed from an OpenCode default or inferred from models.dev or
+  the model name. `·` means not reported or not supported.
+- **Prices** are USD per million tokens, input/output, and `?` marks an
+  unknown side. A trailing `+` means the price rises above a context size;
+  the details list every tier.
 
-Each known value carries a source label:
+The title line counts providers and models and says how many providers need
+attention. Embedding models are hidden by default, and the filter line says
+how many, for example `1 embedding hidden`.
 
-| Label          | Source                                       |
-| -------------- | -------------------------------------------- |
-| `probe`        | The server's probe                           |
-| `config`       | Your configuration or the models.dev entry   |
-| `server`       | The server's model list                      |
-| `models.dev`   | A models.dev match                           |
-| `heuristic`    | Inferred from the model ID                   |
-| `default`      | Scout's default, such as text input          |
-| `host default` | OpenCode's default value, not an observation |
-| `host`         | OpenCode's model list without discovery data |
+At 120 columns and wider, the details of the selected row sit in a pane
+beside the list. In a narrower terminal, a one-line summary of the selected
+model sits under the list, and `enter` opens the details on their own
+screen. Resizing the terminal switches between the two layouts without
+closing the dialog.
 
-Capabilities and input modalities show one of three states: `supported`,
-`unsupported` (a source said no), or `unknown` (nothing reported, which is
-common). Model details also cover prices, type, limits, size, family,
-parameter count, quantization, and which core fields are missing.
+The first open selects the prompt's current model, or the first chat model
+when the current one is not listed. Search, filters, sort, collapsed
+providers, and the selection are kept for each project and command until the
+TUI exits.
 
-Provider details show the model-list result, the probe attempt, the probe
-that was configured and the one that ran, the time of the last good
-inventory, the latest failure if any, and the endpoint origin. Endpoint
-origins never include credentials, paths, or query strings.
+### Keys
 
-The browser updates in place when a discovery run completes or OpenCode's
-model catalog changes.
+| Key                                | Action                                                                                        |
+| ---------------------------------- | --------------------------------------------------------------------------------------------- |
+| `↑` `↓` `pgup` `pgdn` `home` `end` | Move through the list, or scroll the details                                                  |
+| `enter`                            | Open the details of the selected model or provider; in the wide layout, focus moves into them |
+| `backspace`                        | Go back from details, Evidence, the filter screen, or the key list                            |
+| `←` / `→`                          | Collapse or expand the selected provider                                                      |
+| `/`                                | Search; `enter` or `↓` returns to the list                                                    |
+| `f`                                | Open the filter screen                                                                        |
+| `x`                                | Clear search and filters                                                                      |
+| `s`                                | Change the sort order                                                                         |
+| `d`                                | Open [Evidence](#evidence) for the selected model or provider                                 |
+| `m`                                | Open OpenCode's model picker (see [Choosing a model](#choosing-a-model))                      |
+| `y`                                | Copy `provider/model`; on a provider header, the provider ID                                  |
+| `Y` (`Shift`+`y`)                  | Copy the raw model ID                                                                         |
+| `r`                                | Refresh the selected provider's discovery                                                     |
+| `R` (`Shift`+`r`)                  | Refresh every provider                                                                        |
+| `a`                                | Open [`/actualyze`](#actualyze-command)                                                       |
+| `?`                                | List the keys of the current view; `backspace` or `?` returns                                 |
+| `esc`                              | Close the browser                                                                             |
 
-### When the server half is unavailable
+`f`, `x`, `s`, `←`, and `→` work in the list. The other keys also work in the
+details. Evidence takes the movement keys, `y`, `Y`, `/`, and `backspace`.
+While the search box has focus, every key you type goes into the search.
+Keys held with `ctrl`, `alt`, or `cmd` always go to OpenCode.
 
-- If `/modelscout` cannot reach the server half, or the request times out, it
-  shows OpenCode's own model list with a notice such as
-  `host state only: server plugin unavailable`. Origin filtering, failure
-  details, and probe-only metadata are missing in that mode.
-- If the server half fails to load, OpenCode does not load the TUI half
-  either, so `/modelscout` does not appear.
-- If the interactive browser cannot be built, the command shows a plain,
-  scrollable list of the same models and reports the error in a toast.
+The footer shows the keys of the current view and dims the ones that do not
+apply to the selection. In a narrow dialog it drops hints from the right,
+but `keys ?` and `close esc` always stay.
+
+### Search, filters, and sort
+
+Search ignores case, and every word you type must appear in the model's
+name or ID, the provider's name or ID, the family, or the quantization:
+`qwen q4` finds Qwen models with a Q4 quantization. Collapsed providers open
+while a search is active.
+
+`f` opens the filter screen. Filters apply as you change them: `↑` and `↓`
+choose a filter, `←`, `→`, `enter`, or `space` change it, `x` clears
+everything, and `backspace` or `f` returns to the list.
+
+| Filter                                     | Effect                                                                                                                                   |
+| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Provider                                   | All providers, or one                                                                                                                    |
+| Type                                       | Chat (the default), Embedding, or All types                                                                                              |
+| Needs tools, Needs images, Needs reasoning | Only models with that capability                                                                                                         |
+| Priced only                                | Only models with a known input or output price                                                                                           |
+| Include assumed or inferred                | Let assumed and inferred capabilities (the lowercase letters) satisfy the needs filters. Off by default, so only reported support counts |
+
+`s` cycles the sort through name, context (largest first), input price, and
+output price (lowest first). Models without a value sort last, and an assumed
+`~200K` context counts as no value.
+
+### Details
+
+Model details give the limits, the prices per million tokens (with cache
+prices and every context tier), and the capabilities, grouped as supported,
+assumed, inferred, not supported, and not reported. Then come the provider
+and its endpoint, the family, parameter count, quantization, and size. A
+value no source reported says so in words: "Not reported; OpenCode uses
+200,000" for the context, and "Not reported; OpenCode fits output to the
+remaining context" for the output limit.
+
+Provider details give the discovery status and when it was last checked,
+and after a failure what went wrong and what to do about it. They also show
+the server type (the probe, or that it was detected automatically), the
+number of chat and embedding models, how many models your config declares
+and scout leaves unchanged, which key discovery uses (a connected key,
+`settings.apiKey`, the provider's headers, or none), and when `r` can run
+again.
+
+### Evidence
+
+`d` shows where each value comes from. For a model it is a table of every
+field with its value and source, followed by the model's origin (discovered
+by scout, declared in your config, or known to OpenCode only), the
+configured and resolved probe, the endpoint origin, and any conflicts
+between sources. For a provider it lists the model-list and probe attempts,
+the probe, the endpoint, the key source, the last good and last attempted
+discovery, the next allowed refresh, and the latest failure with its HTTP
+status and retry time.
+
+| Source             | Meaning                                                 |
+| ------------------ | ------------------------------------------------------- |
+| `probe`            | The server's probe                                      |
+| `your config`      | Your config, or the provider's models.dev entry         |
+| `server list`      | The server's model list                                 |
+| `models.dev`       | A models.dev match                                      |
+| `heuristic`        | Inferred from the model ID                              |
+| `scout default`    | Scout's default, such as text input                     |
+| `OpenCode default` | OpenCode's default value, not an observation            |
+| `OpenCode`         | OpenCode's model list, for a provider without discovery |
+
+Endpoint origins never include credentials, paths, or query strings.
+
+### Choosing a model
+
+`m` opens OpenCode's model picker in place of the browser, and you pick the
+model there. It is unavailable on a provider header, for embedding models,
+for a model OpenCode does not list yet, and for a model hidden from the
+picker; the details say which applies. There is no key that switches the
+model directly, because a model chosen in the prompt can override a plugin's
+switch on the next message.
+
+### Copying
+
+`y` copies `provider/model`, the form `opencode run --model` takes, and `Y`
+copies the raw model ID. The text goes to the terminal through the OSC 52
+escape sequence, and the notice line says `Copy sent to terminal`. Terminals
+do not confirm OSC 52, and some ignore it or need it turned on. When OpenCode
+reports that the terminal does not support OSC 52, the browser shows the text
+in full under the notice for 30 seconds instead, so you can select it.
+
+### Refreshing
+
+`r` asks scout's server half to rediscover the selected provider, and `R`
+every provider. Discovery for one provider and key starts at most once a
+minute, and never before a time the server asked for with `Retry-After` or
+`X-RateLimit-Reset` (at most one hour ahead). A refresh inside that window
+is skipped with a countdown, for example
+`Refresh skipped: Actualyze was checked recently. Try again in 42 s.`, and
+the provider's details show the same wait.
+
+### Other states
+
+- **Loading.** The dialog says it is reading models from OpenCode and scout.
+- **OpenCode's lists did not load.** The error is shown, and `r` reads them
+  again.
+- **No providers.** A card explains how to connect Actualyze (`a`) or add
+  another OpenAI-compatible server.
+- **No matches.** `x` clears search and filters, and `f` changes the
+  filters.
+- **A provider without models.** A note under its header says whether
+  discovery is still checking, the model list failed, the server returned no
+  models (`r` refreshes), or only hidden embedding models matched.
+- **Scout's server half does not answer.** If the catalog request fails or
+  times out after 3 seconds, the browser shows OpenCode's own model list
+  with a notice such as
+  `▲ Discovery details unavailable: scout's server half did not answer.`
+  Discovery status, failure details, evidence sources, and refresh are
+  missing in that mode.
+- **The server half fails to load.** OpenCode does not load the TUI half
+  either, so neither command appears.
+- **The browser cannot be built.** The command shows a plain, scrollable list
+  of the same models and reports the error in a toast.
+
+## `/actualyze` Command
+
+`/actualyze` takes you from no key to a working Actualyze catalog without
+leaving OpenCode. Open it with `/actualyze`, pick **Actualyze** from the
+command palette, or press `a` in `/modelscout`.
+
+The header shows the Actualyze wordmark and the endpoint's host,
+`app.actualyze.ai` for the built-in provider. When
+`providers.actualyze.settings.baseURL` points anywhere else, the header adds
+a `custom endpoint` badge, and every app link uses that endpoint's origin.
+The line under the header says where things stand, and names the key in
+use: the connection's label in quotes, `ACTUALYZE_API_KEY` for the
+environment variable, or `settings.apiKey`.
+
+An Actualyze inference key can read the model catalog and nothing about the
+account: no identity, usage, spend, or budget. So `/actualyze` reports
+"Catalog accessible" when the model list answered for the key, and never
+claims that chat works. A read-only key, for example, lists models and is
+refused on every chat request.
+
+### States
+
+| Status line                                                         | What it means                                                                                                                             | What to do                                                                                        |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `Not connected`                                                     | OpenCode has no Actualyze key.                                                                                                            | Create a key in the app, then press `k` and paste it. The card lists the steps.                   |
+| `○ Saving key in OpenCode…`                                         | You submitted a key and OpenCode has not confirmed it yet.                                                                                | Wait. Closing the dialog does not undo a completed save.                                          |
+| `▲ OpenCode did not confirm the key was saved`                      | Saving failed or took longer than 15 seconds. OpenCode may have stored the key anyway.                                                    | Check with `c` before trying again with `k`.                                                      |
+| `○ Key saved. Checking the current connection…`                     | The key is saved and scout has no result for it yet. After 20 seconds the line reads "Still checking. The key is saved."                  | Wait. No inference request is sent.                                                               |
+| `○ Checking the connection…`                                        | A key is connected and scout is still resolving it.                                                                                       | Wait.                                                                                             |
+| `○ Loading models…`                                                 | The first model list for this key is on its way.                                                                                          | Wait.                                                                                             |
+| `● Catalog accessible · key "Work" · 11 models · checked 2 min ago` | The model list answered. The Actualyze models are listed below.                                                                           | Browse them; `m` opens the model picker.                                                          |
+| `● Catalog accessible · key "Work" · no models for this key`        | The key works, but its team has no model access yet.                                                                                      | Ask a workspace admin. `y` copies the Catalog link.                                               |
+| `▲ Key rejected (401)`                                              | Actualyze answers this way for a revoked or expired key, a key without the inference scope, and a key from another Actualyze environment. | `k` for another key, `y` to copy the API keys link, `c` for connections.                          |
+| `▲ Access denied (403)`                                             | Actualyze refused the model list request for this key.                                                                                    | Check the key's permissions and model access with your administrator, or use `k` for another key. |
+| `▲ Budget or entitlement blocked (402)`                             | Actualyze refused the catalog request. The key cannot read a balance or reset date.                                                       | `y` copies the Budgets link; that page may need an admin role.                                    |
+| `▲ Catalog rate limited · retry in 42 s`                            | The model list is rate limited. This is a catalog limit, not an inference quota.                                                          | Scout checks again when the countdown ends.                                                       |
+| `▲ Can't reach app.actualyze.ai`                                    | The connection failed.                                                                                                                    | Check the network, VPN, proxy, and `settings.baseURL`, then press `r`.                            |
+| `▲ app.actualyze.ai did not answer in time`                         | The model list timed out.                                                                                                                 | Check the network or the endpoint, then press `r`.                                                |
+| `▲ Actualyze server error (503)`                                    | Actualyze failed to list its models.                                                                                                      | Try again later with `r`.                                                                         |
+| `▲ No model list at this endpoint (404)`                            | The base URL points at the wrong path.                                                                                                    | Make `settings.baseURL` end in `/openai/v1`.                                                      |
+| `▲ Unexpected answer (…)`                                           | Another HTTP status, or an answer that is not a model list.                                                                               | Check `settings.baseURL`.                                                                         |
+| `▲ Discovery was interrupted` or `▲ Discovery failed`               | The check did not finish.                                                                                                                 | It runs again on the next refresh; `r` retries now.                                               |
+| `▲ Discovery status unavailable`                                    | Scout's server half did not answer, so only the connection OpenCode reports is known.                                                     | `k` and `c` still work.                                                                           |
+| `Not managed by Model Scout`                                        | Another plugin or a models.dev catalog defines the `actualyze` provider, so scout does not discover it.                                   | Add `"probe": "actualyze"` to `providers.actualyze.settings` to opt in.                           |
+
+After a failure, a key that had a good catalog before keeps it: the card sits
+above the models from the last good check. When the key comes from
+`settings.apiKey` or `ACTUALYZE_API_KEY`, the failure card says so, and adds
+that a key connected with `k` takes precedence. When the provider's `headers` carry
+the key (`Authorization` or `X-Actualyze-Api-Key`), a notice says that
+discovery uses those headers, not the connected key.
+
+### Keys in `/actualyze`
+
+| Key   | Action                                                                              |
+| ----- | ----------------------------------------------------------------------------------- |
+| `k`   | Connect a key: "connect key" without a connection, "another key" with one           |
+| `c`   | Open OpenCode's connections; pick Actualyze there to switch, rename, or remove keys |
+| `l`   | Open the [links screen](#links)                                                     |
+| `y`   | On a card, copy the link it names; in the model list, copy `provider/model`         |
+| `r`   | Check the catalog again; during a wait the hint is dimmed and reads "retry in N s"  |
+| `b`   | Open `/modelscout`                                                                  |
+| `?`   | List the keys                                                                       |
+| `esc` | Close                                                                               |
+
+While a card fills the dialog, only the keys in its footer and `?` work.
+Once the catalog is accessible, the model list works like `/modelscout`
+limited to Actualyze, without a provider header or provider filter, and the
+status line lists `c`, `b`, `l`, and `k` where they fit.
+
+`k` works only when the provider reads its key from the `actualyze`
+integration and that integration offers a plain key method. Otherwise the
+card points to `c`. Model Scout never deletes a key; removing one happens in
+OpenCode's connections.
+
+### Entering a key
+
+`k` opens OpenCode's prompt titled **Actualyze API key**. The key is visible
+while you type, because OpenCode's prompt does not mask input. Press `enter`
+to submit. Model Scout trims the key, hands it once to OpenCode to store
+under the Actualyze integration, and drops it; it never stores, logs, or
+shows the key itself. `/actualyze` then comes back, shows "Saving key in
+OpenCode…", and checks the catalog with the new key.
+
+Pressing `esc` in the prompt cancels and closes `/actualyze`. Submitting an
+empty prompt returns to `/actualyze` unchanged. If Model Scout reloads or the
+project changes while the prompt is open, the key is not saved, and a toast
+asks you to enter it again. If you close `/actualyze` while OpenCode is still
+saving and the save is never confirmed, a toast says "OpenCode did not
+confirm the Actualyze key was saved".
+
+### Links
+
+`l` lists Actualyze app pages on the provider's origin:
+
+| Link            | Path                                 |
+| --------------- | ------------------------------------ |
+| API keys        | `/account/settings?tab=security`     |
+| Catalog         | `/control/catalog?tab=consume`       |
+| Budgets         | `/management/budgets`                |
+| Usage           | `/observability?tab=inference`       |
+| Troubleshooting | `/observability?tab=troubleshooting` |
+
+`↑`, `↓`, `home`, and `end` choose a link, `enter` or `y` copies it the same
+way `/modelscout` copies (see [Copying](#copying)), and `backspace` or `l`
+returns. After a failure the matching link is selected first: API keys for
+401 and 403, Budgets for 402, and Troubleshooting for the rest. Budgets may
+need an admin role in Actualyze. Model Scout cannot open a browser, so copy
+the link and paste it into one. When `settings.baseURL` is not an http or
+https URL, there are no links, and the header says so.
 
 ## Caching and Refresh
 
@@ -575,11 +827,16 @@ model catalog changes.
   plugin loads and makes no network request.
 - **Background refresh.** Scout rediscovers when the plugin loads, when
   configuration, providers, plugins, integrations, or credentials change, on
-  the `refreshIntervalMs` schedule, and on `R` in `/modelscout`. Discovery for
-  one provider starts at most once a minute. Projects open at the same time
-  share one discovery run per identical provider and credential.
-- **Failures.** A failed run keeps the last good inventory. `/modelscout`
-  shows the failure next to it.
+  the `refreshIntervalMs` schedule, and on `r` or `R` in `/modelscout` and
+  `r` in `/actualyze`. Discovery for one provider and credential starts at
+  most once a minute. Projects open at the same time share one discovery run
+  per identical provider and credential.
+- **Retry times.** When the model list answers 429 or 503 with
+  `Retry-After`, or 429 with `X-RateLimit-Reset`, no discovery with that
+  credential starts before that time, at most one hour ahead. Another key
+  for the same provider is not held back. A successful run clears the wait.
+- **Failures.** A failed run keeps the last good inventory. `/modelscout` and
+  `/actualyze` show the failure next to it.
 - **Settings edits.** Changing only `settings.probe` keeps the current models
   until the new discovery lands. Changing `baseURL`, the API key, or headers
   removes that provider's discovered models until rediscovery finishes.
@@ -592,8 +849,13 @@ model catalog changes.
 ## Troubleshooting
 
 - **Actualyze is not in the model picker.** The built-in provider stays
-  hidden until it has a key. Run `/connect` and pick **Actualyze**, or set
-  `ACTUALYZE_API_KEY` on the background service and restart it.
+  hidden until it has a key. Run `/actualyze`: it says whether a key is
+  connected and whether the catalog answered for it, and `k` connects one.
+  `/connect` with **Actualyze**, or `ACTUALYZE_API_KEY` on the background
+  service followed by a restart, work too.
+- **Copy does nothing.** `y` sends text through OSC 52, which some terminals
+  ignore or keep turned off; inside tmux it needs `set-clipboard on`. Select
+  the text on screen instead, or turn on clipboard access in the terminal.
 - **A provider is not discovered.** Check the rules in
   [Which providers are discovered](#which-providers-are-discovered). Adding
   `"probe": "auto"` to its `settings` is the reliable opt-in, except for the
@@ -640,8 +902,8 @@ users on OpenCode 1 should install `opencode-actualyze@1.7.0` instead. The
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the architecture, the test lanes
-and live harness, and how to add a probe.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the architecture, the test lanes,
+the live harness and TUI scenarios, and how to add a probe.
 
 ## License
 

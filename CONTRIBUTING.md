@@ -6,8 +6,10 @@
   TypeScript source file directly and needs a Node version that strips types
   by default.
 - npm.
-- For the live harness only: an installed OpenCode 2 CLI (`opencode`), tested
-  with 2.0.26.
+- For the live harness and the live TUI scenarios only: an installed
+  OpenCode 2 CLI (`opencode`), tested with 2.0.32. The TUI scenarios drive it
+  through [tuistory](https://www.npmjs.com/package/tuistory), which
+  `npm install` adds as a dev dependency.
 
 ## Setup
 
@@ -45,8 +47,8 @@ npm run build         # same as check
 
 ## Testing
 
-There are two automated lanes, both part of `npm run check`, and one manual
-lane.
+There are two automated lanes, both part of `npm run check`, and two manual
+lanes: the live harness and the live TUI scenarios.
 
 ### Unit tests
 
@@ -72,32 +74,48 @@ no network access beyond localhost: `test/e2e/actualyze.e2e.test.ts` wraps
 
 `scripts/live-harness.mjs` runs the installed `opencode` against the built
 `dist/` in an isolated scratch tree. It is not shipped and not part of
-`npm run check`. Use it before a release and whenever a change touches how the
-plugin talks to the host.
+`npm run check`. Use it whenever a change touches how the plugin talks to the
+host. Before a release, run `live-check.mjs` against it and every scenario of
+[`scripts/live-tui.mjs`](#live-tui-scenarios).
 
 ```bash
 npm run compile:dev                # the harness never builds
-node scripts/live-harness.mjs start
+node scripts/live-harness.mjs start [--actualyze-mock | --actualyze-refused] [--fresh]
 node scripts/live-check.mjs
+node scripts/live-harness.mjs connect <scenario>
 node scripts/live-harness.mjs status
 node scripts/live-harness.mjs stop
 ```
 
 `start` writes a project config with `plugins: ["<repo>/dist"]` and a
 `mock-compat` provider backed by a local mock server, then starts
-`opencode serve` on `127.0.0.1`. Every OpenCode process runs with an
-environment built from scratch, with `HOME` and the four `XDG_*` variables
-pointing into the scratch tree, so your real config, data, and background
-service are never touched.
+`opencode serve` on `127.0.0.1`. `mock-compat` declares one model,
+`mock-tiered-pro`, with two context-priced cost tiers, so the tier display
+and the rule that declared models are never patched can be checked. Every
+OpenCode process runs with an environment built from scratch, with `HOME`
+and the four `XDG_*` variables pointing into the scratch tree, so your real
+config, data, and background service are never touched.
 
-| Variable                  | Purpose                                                                                                                       |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `SCOUT_HARNESS_DIR`       | Scratch tree. Defaults to `opencode-model-scout-harness` under the OS temp directory.                                         |
-| `ACTUALYZE_API_KEY_FILE`  | File holding an inference-scoped Actualyze key. Without it, the checks expect the built-in `actualyze` provider to be hidden. |
-| `ACTUALYZE_BASE_URL`      | Optional Actualyze endpoint, for example `http://localhost:3001/openai/v1`. Defaults to the built-in production endpoint.     |
-| `OPENCODE_BIN`            | The `opencode` executable. Defaults to the first `opencode` on `PATH`.                                                        |
-| `SCOUT_HARNESS_PORT`      | Port for `opencode serve`. Defaults to 47931.                                                                                 |
-| `SCOUT_HARNESS_MOCK_PORT` | Port for the mock server. Defaults to 47932.                                                                                  |
+| Option                | Effect                                                                                                                         |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `--actualyze-mock`    | Points `providers.actualyze.settings.baseURL` at the harness's Actualyze mock (`http://127.0.0.1:<mock port>/openai/v1`).      |
+| `--actualyze-refused` | Points it at a local port that refuses connections, for the `unreachable` failure.                                             |
+| `--fresh`             | Deletes the scratch `HOME` and `XDG_*` trees first, so no connection, setting, or stored binding survives from an earlier run. |
+
+Either Actualyze option writes a `providers.actualyze` config entry, which
+lists the provider in OpenCode even before a key is connected. Without
+either, the config has no such entry unless `ACTUALYZE_BASE_URL` is set
+together with a key file.
+
+| Variable                     | Purpose                                                                                                                                                                                        |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SCOUT_HARNESS_DIR`          | Scratch tree. Defaults to `opencode-model-scout-harness` under the OS temp directory.                                                                                                          |
+| `ACTUALYZE_API_KEY_FILE`     | File holding an inference-scoped Actualyze key. Without it, the checks expect the built-in `actualyze` provider to be hidden. With either Actualyze option, it must hold a synthetic mock key. |
+| `ACTUALYZE_BASE_URL`         | Optional Actualyze endpoint, for example `http://localhost:3001/openai/v1`. Defaults to the built-in production endpoint. Not allowed with either Actualyze option.                            |
+| `OPENCODE_BIN`               | The `opencode` executable. Defaults to the first `opencode` on `PATH`.                                                                                                                         |
+| `SCOUT_HARNESS_PORT`         | Port for `opencode serve`. Defaults to 47931.                                                                                                                                                  |
+| `SCOUT_HARNESS_MOCK_PORT`    | Port for the mock server. Defaults to 47932.                                                                                                                                                   |
+| `SCOUT_HARNESS_REFUSED_PORT` | Port `--actualyze-refused` points at. Defaults to 47933; `start` fails when something accepts connections on it.                                                                               |
 
 The harness tests the built-in `actualyze` provider the way a user sets it
 up. The key reaches the server only as `ACTUALYZE_API_KEY` in its
@@ -114,15 +132,151 @@ only when a key file is set, that the `actualyze` provider is listed with
 the expected endpoint and no `settings.apiKey` (or hidden, without a key
 file), that the discovered models carry the expected limits, capabilities,
 variants, and prices (Actualyze expectations come from the endpoint's own
-`/models` list),
-that the RPC catalog passes the strict validator, and that one plain chat
-request succeeds against the first model in the Actualyze list, without an
-effort variant. Pass `--skip-chat` to skip the chat request or
+`/models` list), that embedding models are not offered for chat, that the
+declared `mock-tiered-pro` keeps its configured name, limits, and cost
+tiers, that the RPC catalog passes the strict v5 validator with settled
+records (not discovering, `resultEpoch` equal to `credentialEpoch`) and the
+expected `credentialSource`, and that one plain chat request succeeds
+against the first model in the Actualyze list, without an effort variant.
+Pass `--skip-chat` to skip the chat request or
 `--chat-model <provider/model>` to pick its model.
+
+After `start --actualyze-mock`, `live-check.mjs` takes its Actualyze
+expectations from the synthetic key in `ACTUALYZE_API_KEY_FILE`: a failing
+scenario expects its failure kind, HTTP status, no models, and for 429 a
+`retryAt` from `Retry-After` and a `nextRefreshAt` at the later of that and
+the one-minute floor. Without a key file it expects the mock's 401. After
+`start --actualyze-refused` it expects `unreachable`. With the `readonly`
+key it expects the chat request to be refused.
 
 The scripts print only the fields they check. Never print a raw `model.list`
 or `provider.list` response while debugging: both contain provider settings
 with the plaintext API key.
+
+### Actualyze mock
+
+The mock server also serves an Actualyze mount under `/openai/v1`, in the
+response shapes Actualyze uses. It picks its behavior from the request's key
+(`Authorization: Bearer` or `X-Actualyze-Api-Key`), which must be
+`aai_pat_mock_<scenario>`. Any other key, or none, gets the 401 Actualyze
+sends for every rejected key. Only these synthetic keys are ever used with
+the mock; `start` refuses a real key in `ACTUALYZE_API_KEY_FILE` when an
+Actualyze option is set.
+
+| Scenario          | Model list answer                                                                                                   | Failure scout records |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------- | --------------------- |
+| `ok`              | Six models with modalities and most with prices; one is a virtual model with unknown fields, one an embedding model | none                  |
+| `empty`           | An empty list                                                                                                       | none                  |
+| `revoked`         | 401                                                                                                                 | `unauthorized`        |
+| `forbidden`       | 403                                                                                                                 | `forbidden`           |
+| `budget`          | 402 with `insufficient_quota`                                                                                       | `payment-required`    |
+| `throttled`       | 429 with `Retry-After: 90`                                                                                          | `rate-limited`        |
+| `throttled_short` | 429 with `Retry-After: 30`, so the countdown shows the one-minute floor instead                                     | `rate-limited`        |
+| `5xx`             | 503                                                                                                                 | `server-error`        |
+| `slow`            | No response headers for 12 seconds, past the 10-second list timeout                                                 | `timeout`             |
+| `slow_body`       | Headers at once, then a body that stalls for 12 seconds, past the body-read timeout                                 | `timeout`             |
+| `readonly`        | The full list; every chat request gets 403                                                                          | none                  |
+
+`connect <scenario>` connects `aai_pat_mock_<scenario>` to the `actualyze`
+integration of the running harness through the server API, the way a user
+connects a stored key. It needs a harness started with `--actualyze-mock`
+to reach the mock.
+
+### Live TUI scenarios
+
+`scripts/live-tui.mjs` drives the installed TUI (`opencode --standalone`) in
+the harness scratch tree through the tuistory library and checks what it
+shows. It manages the harness itself: each run restarts it with `--fresh`
+and the scenario's Actualyze option, and the harness is stopped at the end,
+including one that was already running.
+
+```bash
+npm run compile:dev
+node scripts/live-tui.mjs                                   # every scenario, both sizes, both themes
+node scripts/live-tui.mjs --list                            # scenario names and what each proves
+node scripts/live-tui.mjs --scenario actualyze-revoked --size 80x24 --theme light
+node scripts/live-tui.mjs --screenshots "$TMPDIR/scout-shots" # save PNG and text screenshots
+```
+
+| Option                 | Effect                                                                                        |
+| ---------------------- | --------------------------------------------------------------------------------------------- |
+| `--scenario <name>`    | Run only this scenario. Repeat it to run several.                                             |
+| `--size 120x36\|80x24` | Run at one terminal size. Repeatable. Without it, both sizes run.                             |
+| `--theme dark\|light`  | Run with one theme mode, written to the scratch `cli.json`. Repeatable. Without it, both run. |
+| `--screenshots <dir>`  | Save each `screenshot` step as a PNG and a text snapshot in `<dir>`.                          |
+| `--list`               | Print the scenarios and exit.                                                                 |
+
+Each run connects the scenario's synthetic key, if it has one, through the
+server API before the TUI starts, launches the TUI with the same isolated
+environment as the harness, checks that the chosen theme is applied, and
+runs the scenario's steps. Then it waits for the harness server's catalog
+to settle and checks it against the v5 validator and the scenario's own
+catalog checks.
+
+The runner refuses to start while `ACTUALYZE_API_KEY_FILE` or
+`ACTUALYZE_BASE_URL` is set, so only synthetic `aai_pat_mock_*` keys are ever
+in play. It checks that a key never leaks:
+
+- After a key is connected or typed, no screen the runner reads may contain
+  it.
+- A key connected before the TUI started was never typed, so the TUI's whole
+  output stream must not contain it either.
+- At the end of each run, the key must not appear in the harness server's
+  RPC catalog payload, in any server, TUI, or mock log, or in the saved
+  screenshots (PNG bytes and text snapshots).
+
+Failure output replaces every synthetic key with `[synthetic key]` before it
+prints the screen.
+
+To add a scenario, append an entry to `SCENARIOS` in `scripts/live-tui.mjs`:
+
+```js
+{
+  name: "actualyze-throttled-short",
+  description: "a 429 with Retry-After 30: the countdown starts from the one-minute floor",
+  actualyze: "mock", // harness start mode: "default", "mock", or "refused"
+  connect: "throttled_short", // optional mock scenario whose key is connected first
+  sizes: ["120x36"], // optional subset of the sizes
+  steps: [
+    { command: "/actualyze" },
+    { wait: /Catalog rate limited · retry in \d+ s/, timeout: 30_000 },
+    { expectColor: { color: "brand", text: "ACTUALYZE" } },
+    {
+      label: "the wait is longer than Retry-After",
+      run: async (ctx) => {
+        const text = await ctx.session.text();
+        const seconds = Number(/retry in (\d+) s/.exec(text)?.[1]);
+        if (!(seconds > 30)) throw new Error(`countdown ${seconds}`);
+      },
+    },
+    { screenshot: "throttled-short" },
+    { press: "esc" },
+    { waitGone: "ACTUALYZE" },
+  ],
+  catalog: (payload, ctx) => {
+    const record = payload.providers.find((item) => item.id === "actualyze");
+    ctx.check("429 recorded", record?.failure?.kind === "rate-limited");
+  },
+}
+```
+
+| Step                                      | Effect                                                                                      |
+| ----------------------------------------- | ------------------------------------------------------------------------------------------- |
+| `{ command: "/name" }`                    | Type a slash command and press `enter`                                                      |
+| `{ wait: text }`                          | Wait until a string or `RegExp` is on screen (default 15 seconds; `timeout` changes it)     |
+| `{ waitGone: text }`                      | Wait until it is gone                                                                       |
+| `{ expect: text }`, `{ expectNot: text }` | Check that it is, or is not, on the current screen                                          |
+| `{ expectColor: { color, text } }`        | Check text drawn in exactly that foreground; `"brand"` is the Actualyze purple of the theme |
+| `{ type: "abc" }`, `{ press: "esc" }`     | Type text or press a key; `press` also takes a chord such as `["ctrl", "p"]`                |
+| `{ submitKey: "ok" }`                     | Type the scenario's synthetic key and press `enter`                                         |
+| `{ resize: "across" }`                    | Resize across 120 columns; `"restore"` returns to the run's size                            |
+| `{ screenshot: "label" }`                 | Save a screenshot when `--screenshots` is set                                               |
+| `{ sleep: 500 }`                          | Pause                                                                                       |
+| `{ run: async (ctx) => {} }`              | Anything else; throw to fail the step                                                       |
+
+Every step can carry a `label` for the report. A new `connect` value must be
+a key of `ACTUALYZE_MOCK_SCENARIOS` in `scripts/live-harness.mjs`; add the
+mock behavior there first when a scenario needs a new answer.
 
 `scripts/report-actualyze-model-capabilities.mjs` is a separate developer tool
 that reports what an Actualyze endpoint advertises per model.
@@ -156,16 +310,17 @@ sequenceDiagram
     loop Each trigger (startup, events, interval, refresh RPC)
         RF->>OC: provider.list()
         RF->>ST: start or join a job per target
+        RF-->>TU: RPC event status
         ST->>DP: discoverProvider(target, signal)
         DP-->>ST: inventory or failure
         ST->>OC: persist binding in ctx.storage
         ST->>RF: binding updated
         RF->>OC: model.reload()
         OC->>TR: fold again with the new inventory
-        RF-->>TU: RPC event updated
+        RF-->>TU: RPC events status and updated
     end
-    TU->>OC: /modelscout reads model.list and provider.list
-    TU->>SV: RPC catalog for discovery evidence
+    TU->>OC: /modelscout and /actualyze read model.list and provider.list
+    TU->>SV: RPC catalog for discovery status and evidence
 ```
 
 ### Server half
@@ -203,18 +358,24 @@ sequenceDiagram
   connection, then `settings.apiKey`, then none), activates a stored binding
   for it, subscribes to the target's store entry, starts discovery for
   stale or changed targets, and reloads the catalog when a served binding
-  changes. It also builds the RPC `catalog` payload.
+  changes. It also builds the RPC `catalog` payload. It keeps one catalog
+  record per provider ID across syncs, so a record survives a credential
+  switch or a failed lookup, and counts credential changes in
+  `credentialEpoch`, so a client can tell a result for the current key
+  from one for an earlier key.
 - **`src/store.ts`** is the process-wide store on `globalThis`. It owns
   bindings and jobs keyed by the full target fingerprint plus, unless the
   target resolved to its `settings.apiKey`, the fingerprint of its resolved
-  credential. It
-  throttles starts to one per minute per target (a job aborted because its
-  last subscriber left does not count), and bumps a generation on
+  credential. It throttles starts to one per minute per key (a job aborted
+  because its last subscriber left does not count), holds a key back until
+  the `retryAt` a failed model list set, and bumps a generation on
   invalidation so stale job results are dropped.
 - **`src/discover.ts`** contains `discoverProvider()`, which fetches
-  `/v1/models`, resolves and runs the probe, and returns an inventory, and
-  `toModelInfo()`, the pure mapping from an inventory to `Model.Info` patches
-  and evidence records.
+  `/v1/models`, resolves and runs the probe, and returns an inventory or a
+  classified failure (an HTTP kind with its status, `unreachable`,
+  `timeout`, and others, with `retryAt` from `Retry-After` or
+  `X-RateLimit-Reset`), and `toModelInfo()`, the pure mapping from an
+  inventory to `Model.Info` patches and evidence records.
 
 ### Enrichment pipeline
 
@@ -298,22 +459,68 @@ because the host derives variants per provider package.
 `src/rpc.ts` defines the RPC contract as a plain object:
 
 - `catalog({})` returns the evidence payload defined in
-  `src/catalog-evidence.ts` (schema version 4): status, timestamps, and one
-  record per target provider with its endpoint origin, probe selection, last
-  good inventory time, latest failure, and per-model evidence.
+  `src/catalog-evidence.ts` (schema version 5). The payload carries the
+  catalog status and timestamps, a random `instanceID` that changes when the
+  server half reloads or restarts, the server time `generatedAt` for
+  countdowns, and `builtIn.actualyze`: `foreign` when another source defined
+  the `actualyze` provider and it is not a discovery target, otherwise
+  `managed`. Each target provider has one record with its endpoint origin,
+  probe selection, last good inventory time, and per-model evidence, plus
+  its status:
+  - `discovering`, `lastAttemptAt`, and `nextRefreshAt`, the later of the
+    last start plus one minute and the failure's `retryAt`, or null once it
+    has passed.
+  - `credentialSource`: `connection`, `settings`, `headers` (provider
+    headers replace the key), `none`, or `unresolved`.
+  - `credentialEpoch`, which goes up whenever the resolved credential
+    changes, and `resultEpoch`, the epoch the record's result belongs to.
+    A record is current when the two are equal. A record whose credential
+    changed and has no result yet carries no models and no failure.
+  - `failure`: `{ kind, at, httpStatus?, retryAt? }`. The HTTP kinds
+    (`unauthorized`, `forbidden`, `payment-required`, `rate-limited`,
+    `not-found`, `server-error`, `http-error`) carry their status; the
+    others are `unreachable`, `timeout`, `aborted`, `invalid-response`, and
+    `error`.
 - `refresh({ providerID? })` starts discovery for one target or all of them
   and returns `{ accepted, reason? }`. It joins an in-flight job and respects
-  the one-minute floor per target. When nothing starts or joins, `reason` is
+  each record's `nextRefreshAt`. When nothing starts or joins, `reason` is
   `throttled` or `no-targets`.
 - The `updated` event carries `{ completedAt }` after a discovery cycle, and
   after a sync first resolves the targets or changes the bindings they
   serve. The status is `pending` only until that first sync; with no job
   running it is `complete` as of the newest served inventory.
+- The `status` event carries `{ at }` when a record's status may have
+  changed: a job started, was joined, or settled, or credential resolution
+  changed an epoch. Changes in one turn publish one event.
 
-The TUI captures one location when the dialog opens and passes it in every
-RPC call. It validates every `catalog` response with
-`validateCatalogPayload()` before use. If the call fails, the browser falls
-back to the host's model and provider lists with a notice.
+The TUI captures one location when a dialog opens and passes it in every RPC
+call. It validates every `catalog` response with `validateCatalogPayload()`
+before use and reads the catalog again, coalesced, on either event. If the
+call fails, the browser falls back to the host's model and provider lists
+with a notice.
+
+### TUI half
+
+- **`src/tui.ts`** registers `/modelscout` and `/actualyze` in a global
+  keymap layer and closes any open dialog on cleanup.
+- **`src/tui-session.ts`** opens the browser dialog, reads OpenCode's
+  provider and model lists and the RPC catalog in parallel with timeouts,
+  reads them again on the RPC events and the host's `model.updated`, keeps
+  navigation state in `storage.memory`, and runs refresh, copy, and
+  notices.
+- **`src/tui-browser.ts`** builds the view inside the dialog render: it
+  projects provider groups into rows, picks the wide or narrow layout,
+  switches screens, and routes keys through the pure router in
+  `src/tui-keys.ts`. A caller can wrap it in a frame (a header, a status
+  line, cards, extra keys); `/actualyze` is that caller.
+- **`src/tui-detail.ts`** builds the details, Evidence, and key list as
+  lines of role-tagged segments. **`src/tui-list.ts`** paints rows as one
+  StyledText node each and fits text by terminal column.
+  **`src/tui-theme.ts`** maps the roles to dialog-surface colors.
+- **`src/tui-actualyze.ts`** holds the pure `/actualyze` logic: the state
+  table, the pending-key reducer, the endpoint origin, and the app links.
+  **`src/tui-actualyze-view.ts`** runs `/actualyze` sessions, the key flow,
+  the cards, and the links screen.
 
 ### Server auto-detection
 
@@ -530,16 +737,23 @@ opencode-model-scout/
 │   ├── models-dev-index.ts   # models.dev matcher
 │   ├── catalog-evidence.ts   # Evidence schema and validator
 │   ├── rpc.ts                # RPC contract
-│   ├── tui.ts                # TUI plugin entry and /modelscout dialog
-│   ├── tui-browser.ts        # Browser state, keys, rendering
-│   ├── tui-models.ts         # Host and evidence reconciliation
+│   ├── tui.ts                # TUI plugin entry: /modelscout and /actualyze commands
+│   ├── tui-session.ts        # Browser dialog session: reads, updates, refresh, copy
+│   ├── tui-browser.ts        # Browser state, projection, layout, screens, keys
+│   ├── tui-keys.ts           # Pure key router per screen and focus
+│   ├── tui-detail.ts         # Details, Evidence, status, and key list lines
+│   ├── tui-list.ts           # Recycled row list and column-aware text cells
+│   ├── tui-theme.ts          # Color roles mapped to dialog-surface tokens
+│   ├── tui-actualyze.ts      # /actualyze state, pending key, endpoint, links
+│   ├── tui-actualyze-view.ts # /actualyze sessions, cards, links screen, key flow
+│   ├── tui-models.ts         # Host and evidence reconciliation, certainty
 │   ├── tui-renderer.ts       # Imperative OpenTUI adapter
-│   ├── format.ts             # Name, count, and byte formatting
+│   ├── format.ts             # Name, count, price, and byte formatting
 │   ├── constants.ts          # IDs and shared constant sets
 │   └── probes/
 │       ├── AGENTS.md         # Probe rules
 │       ├── types.ts          # ProbeModelMeta, ProbeContext, ProviderProbe
-│       ├── util.ts           # probeFetch, readJson, buildHeaders, EMPTY_RESULT
+│       ├── util.ts           # probeFetch, readJson, buildHeaders, EMPTY_RESULT; typed list fetch helpers
 │       ├── index.ts          # Registry and resolveProbe
 │       ├── fingerprint.ts    # Auto-detection
 │       ├── actualyze.ts
@@ -557,8 +771,9 @@ opencode-model-scout/
 │   └── *.test.ts             # Server, transform, store, TUI, and format tests
 ├── scripts/
 │   ├── check-dist.mjs
-│   ├── live-harness.mjs
-│   ├── live-check.mjs
+│   ├── live-harness.mjs      # Scratch-tree server, mock-compat and Actualyze mocks
+│   ├── live-check.mjs        # Checks against the running harness
+│   ├── live-tui.mjs          # TUI scenarios through tuistory
 │   └── report-actualyze-model-capabilities.mjs
 ├── tsup.config.ts            # Builds a flat dist/ (server.js, tui.js, rpc.js)
 ├── vitest.config.ts          # Unit lane
@@ -586,6 +801,7 @@ test: cover an empty model list
 
 ## Pull Requests
 
-Run `npm run check` before opening a pull request. For
-changes to discovery, the transforms, or the TUI, also run the live harness
-and say in the pull request which checks you ran.
+Run `npm run check` before opening a pull request. For changes to discovery
+or the transforms, also run the live harness and `live-check.mjs`; for
+changes to the TUI, run `scripts/live-tui.mjs`. Say in the pull request which
+checks you ran.

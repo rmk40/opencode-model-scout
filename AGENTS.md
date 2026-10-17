@@ -1,6 +1,6 @@
 # Agent Instructions
 
-OpenCode 2 plugin: discovers the models served by OpenAI-compatible providers, enriches them with limits, capabilities, input modalities, effort variants, and prices, and adds them to the model catalog through a model transform. A TUI half adds the `/modelscout` browser.
+OpenCode 2 plugin: discovers the models served by OpenAI-compatible providers, enriches them with limits, capabilities, input modalities, effort variants, and prices, and adds them to the model catalog through a model transform. A TUI half adds the `/modelscout` browser and the Actualyze-branded `/actualyze` dialog.
 
 ## Architecture
 
@@ -14,22 +14,30 @@ src/discover.ts         → discoverProvider (network I/O for one target) and to
 src/models-dev-index.ts → models.dev matcher built from the host's provider source records
 src/catalog-evidence.ts → Evidence schema (version 5) and strict validator shared by server and TUI
 src/rpc.ts              → Plugin RPC contract: catalog, refresh, `updated` and `status` events
-src/tui.ts              → TUI entry ({ id, setup }): /modelscout command, dialog session, RPC reads, fallback view
-src/tui-browser.ts      → Browser state, facets, search, keys, list and detail rendering
-src/tui-models.ts       → Reconciles host model/provider rows with RPC evidence; core metadata coverage
-src/tui-renderer.ts     → Typed imperative adapter over the host's @opentui/solid reconciler
-src/format.ts           → Pure formatters (model names, compact counts, bytes)
-src/constants.ts        → Plugin ID, command name, Actualyze provider constants, probe ID aliases, never-probed provider IDs, openai-compatible packages
+src/tui.ts              → TUI entry ({ id, setup }): registers /modelscout and /actualyze in a global keymap layer; cleanup closes both dialogs
+src/tui-session.ts      → Browser dialog session: show/set, host and RPC reads, update feed, coalesced reloads, nav memory, refresh, copy, notices, untracked render, theme effect, fallback view
+src/tui-browser.ts      → Browser view: filters, search, sort, row projection, layout, screens, footer, key handling, frame hooks for /actualyze
+src/tui-keys.ts         → Pure key router: screen + focus + KeyEvent fields → browser action
+src/tui-detail.ts       → Model and provider details, Evidence, provider status and failure copy, key list lines
+src/tui-list.ts         → Recycled row list (one StyledText node per row), column-aware text cells, selection and scroll
+src/tui-theme.ts        → Color roles mapped to dialog-surface tokens; Actualyze brand color by theme mode
+src/tui-actualyze.ts    → Pure /actualyze logic: endpoint origin and custom flag, app links, connection facts, pending-key reducer, state table, session tracker
+src/tui-actualyze-view.ts → /actualyze sessions, header, status line, cards, links screen, key flow (a frame around the browser)
+src/tui-models.ts       → Reconciles host model/provider rows with RPC evidence; certainty, price tiers, host temperature
+src/tui-renderer.ts     → Typed imperative adapter over the host's @opentui/solid reconciler, plus setStyledText
+src/format.ts           → Pure formatters (model names, compact counts, list and detail prices, bytes)
+src/constants.ts        → Plugin ID, command names, Actualyze provider constants and app link paths, probe ID aliases, never-probed provider IDs, openai-compatible packages
 src/probes/             → Probe implementations, registry, fingerprinting, shared HTTP helpers (see src/probes/AGENTS.md)
 scripts/check-dist.mjs  → Fails when dist/*.js imports @opencode/* or effect at runtime
-scripts/live-harness.mjs, scripts/live-check.mjs → Live checks against the installed opencode (not shipped, not in CI)
+scripts/live-harness.mjs, scripts/live-check.mjs → Live checks against the installed opencode, with mock-compat and a key-selected Actualyze mock (not shipped, not in CI)
+scripts/live-tui.mjs    → TUI scenarios through tuistory at 120x36 and 80x24, dark and light, with key-leak checks (not shipped, not in CI)
 test/                   → Unit tests (vitest, global fetch mocked by test/setup.ts)
 test/e2e/               → Embedded-host tests through @opencode/sdk (separate vitest config, real fetch)
 ```
 
 The package exports `.` and `./server` → `dist/server.js`, `./tui` → `dist/tui.js`, and `./rpc` → `dist/rpc.js`. The host resolves `<package>/server` before `<package>` and loads `<package>/tui` automatically alongside the server half; there is no separate TUI config entry. `./rpc` exports the RPC contract for other clients. Both halves and the RPC contract share the ID `opencode-model-scout` (`PLUGIN_ID`); the host dedupes a package listed in both `opencode.json` and `cli.json` by that ID.
 
-`@opentui/core` and `@opentui/solid` are optional peers and dev dependencies pinned to the version the host injects (0.5.17 for OpenCode 2.0.26). `@opencode/plugin` and `@opencode/sdk` are exact-pinned dev dependencies used for types and the E2E lane.
+`@opentui/core` and `@opentui/solid` are optional peers and dev dependencies pinned to the version the host injects (0.5.17 for OpenCode 2.0.32); the TUI also imports `solid-js` from the host at runtime for `untrack` and `createEffect`. `@opencode/plugin` and `@opencode/sdk` are exact-pinned dev dependencies used for types and the E2E lane.
 
 ## Non-obvious Constraints
 
@@ -51,10 +59,15 @@ The package exports `.` and `./server` → `dist/server.js`, `./tui` → `dist/t
 - **Effort variants.** Reasoning models on an openai-compatible package get `low`/`medium`/`high` with `settings.reasoningEffort`. Actualyze models get none: its chat endpoint does not forward `reasoning_effort`.
 - **Never dump `model.list` or `provider.list` responses.** Both include provider settings with the plaintext `apiKey`. Scripts and tests print only the fields they check. RPC payloads carry endpoint origins only, never credentials, paths, or queries.
 - **`dist/` must stay flat.** Local directory plugins ignore `package.json` `exports` and look for `server.js`, `index.js`, and `tui.js` directly in the directory, so local development points `plugins` at `<repo>/dist`.
-- **TUI keys go through `context.renderer.keyInput`.** The host keymap attaches first, so `esc` and `ctrl+c` close the dialog before the browser's listener runs, and `preventDefault` in the browser only stops the focused select or input. The browser ignores keys with ctrl, meta, option, super, or hyper, consumes only its own keys, and removes its listener when the dialog closes. A modal keymap layer does not work here: its commands receive no `KeyEvent` and swallow typing.
-- **Dialog order is `show` then `set`.** `context.ui.dialog.show(render, onClose)` resets the size, and `set` resets every option it omits, so call `context.ui.dialog.set({ size: "xlarge" })` after `show`. Renderables must be created inside the render callback; the reconciler's `createElement` throws outside it. `TuiRenderer.set` only mutates existing nodes and works anywhere. The TUI cleanup closes an open dialog, because a plugin reload would otherwise leave it on screen.
-- **Dialog layout.** Return a content-sized root (no `flexGrow`/`minHeight`) bounded by `context.renderer.terminalHeight`. OpenTUI widths are content-box widths: subtract explicit padding from the root width and reserve columns for the select's gutter and scrollbar.
-- **Theme from the dialog surface.** Map colors from `context.theme.surface("dialog")`, matching the host's own select dialog, and set the select's normal, focused, and selected backgrounds explicitly; the widget defaults render as a dark inset panel.
+- **TUI keys go through `context.renderer.keyInput`.** The host keymap attaches first, so `esc` and `ctrl+c` close the dialog before the browser's listener runs, and `preventDefault` in the browser only stops the focused input. The browser ignores keys with ctrl, meta, option, super, or hyper, consumes only keys it handles, and removes its listener when the dialog closes. Keys that close the dialog or open another one (`m`, `a`, and frame keys such as `/actualyze`'s `k`, `c`, and `b`) are consumed before the handoff, so they never reach the next focused input. In a keymap layer, inline commands (no `id`) are called without a `KeyEvent` and named commands receive it as the second argument of `run`; scout still reads keys through `keyInput`, because one listener routes every key by screen and focus (`src/tui-keys.ts`) and must leave printable keys to the search input while it has focus.
+- **One dialog at a time.** `show`, `ui.dialog.prompt`, `ui.dialog.select`, and host commands run through `keymap.dispatch` (`model.list`, `provider.connect`) replace the open dialog and run its `onClose`. State that must outlive a dialog, such as an `/actualyze` session, lives outside it, and the dialog is shown again from that state.
+- **Dialog order is `show` then `set`.** `context.ui.dialog.show(render, onClose)` resets the size and placement, and `set` resets every option it omits, so call `context.ui.dialog.set({ size: "xlarge", centered: true })` after `show`. Renderables must be created inside the render callback; the reconciler's `createElement` throws outside it. `TuiRenderer.set` and `setStyledText` only mutate existing nodes and work anywhere. The TUI cleanup closes any open `/modelscout` or `/actualyze` dialog and refuses later opens from that context, because a plugin reload would otherwise leave it on screen.
+- **The dialog render runs untracked.** Since 2.0.32 the host runs the render callback once per `show`, but inside a memo, so a reactive read during the render (`context.theme`, `context.themeMode`, `context.ui.model.current()`) would run it again and remount the dialog. `tui-session.ts` runs the render inside `untrack` from the host's `solid-js`, and a render that does run twice replaces the view it built before. Colors are never captured at build time: every paint calls `rolePalette(context)` again, and a `createEffect` owned by the dialog reads `context.theme` and `context.themeMode` and repaints on a change. Without `solid-js` the render runs tracked and a theme switch shows on the next timed repaint.
+- **Styled text is assigned to the renderable.** The reconciler's `setProp("content")` stringifies anything but a string, so `TuiRenderer.setStyledText` builds an OpenTUI `StyledText` and assigns it to the text renderable's `content` directly; OpenTUI 0.5.17 repaints on that assignment. Every list row and detail line is one text node with styled chunks. The fallback view uses one plain string.
+- **Dialog layout.** Return a content-sized root (no `flexGrow`/`minHeight`) bounded by `context.renderer.terminalHeight`. OpenTUI counts a box's padding inside its `width`, so the root's width is the whole dialog width, `min(116, cols - 2)`, with side padding 3 (the host's `DIALOG_INSET`) inside it, and content gets 6 columns less: 110 at 120 columns, 72 at 80. Its height is at most `min(30, rows - 4)`, including one bottom padding row; a frame card that replaces the list, and the key list over it, shrink the root to their lines plus one. From 120 columns the list (58), a separator (3), and the detail pane share the content width. A renderer `resize` relayouts the existing nodes without showing the dialog again.
+- **Theme from the dialog surface.** `rolePalette` in `src/tui-theme.ts` maps every view role to a `context.theme.surface("dialog")` token, matching the host's own dialogs. `text.faint` exists only from 2.0.32 and the pinned types lack it, so it is read as `unknown`, checked, and falls back to `text.muted`. The `brand` role is a hex color per `themeMode` (`#a855f7` dark, `#7c3aed` light), used only in `/actualyze`. The row list paints its own selection band (`selected` on `selectedBg`); the browser has no OpenTUI `select` widget.
+- **`/actualyze` sessions and the key flow.** A session starts when `/actualyze` opens (slash, palette, or `a` in `/modelscout`) and ends when its dialog closes for any reason except the key prompt round trip. The session holds the pending-key marker, the links screen, and the integration and provider facts; only the latest session of a context is active, and a save completion for an ended session or another location changes nothing except one warning toast when the save was not confirmed. `k` runs only when the provider's `integrationID ?? "actualyze"` is `actualyze` and that integration offers a `key` method without form fields. An `undefined` prompt result (cancel, or another dialog replaced the prompt) ends the flow and the session without showing anything again; an empty string shows `/actualyze` again unchanged; a non-empty answer that arrives after the session ended (plugin cleanup) or at another location is dropped with a warning toast that the key was not saved; any other answer is trimmed, passed once to `client.integration.connect.key` with a 15 s timeout, and the reference is dropped. A rejection or timeout is "unconfirmed", never "not saved", because the host may have stored the key first. The key is never stored, rendered, logged, sent over RPC, or kept in session state. From the provider the TUI reads only `integrationID` and `settings.baseURL` (other settings can hold a plaintext `apiKey`), and reduces the base URL at once to an origin and a `customEndpoint` flag.
+- **`/actualyze` state is derived, and claims only the catalog.** `deriveActualyzeState` is pure and maps every input combination to exactly one row, with `resolving` as the default; rows that show a discovery result need a current record (`resultEpoch === credentialEpoch`). After a submit, "checking" lasts until a current record's `credentialEpoch` is above the epoch at submit, or until any current record arrives once the payload's `instanceID` differs from the one at submit. An inference key cannot read identity, usage, spend, or budget, so the UI says "Catalog accessible" and never claims inference works.
 - **RPC errors are plain objects.** Failures reject with `{ type, message }`, not `Error` instances (`rpc.unavailable`, `rpc.internal`, `rpc.invalid_input`). Pass the dialog's captured location in every RPC call's options; without it the server falls back to its own directory. RPC and bus event subscriptions filter by type only, so the TUI filters events by location itself.
 - **No startup output.** Nothing writes to stdout or stderr. `console.warn` is for error conditions only.
 
@@ -76,7 +89,7 @@ Pre-commit runs lint-staged (eslint --fix + prettier on staged files).
 ## Releasing
 
 1. Bump the version in `package.json`.
-2. Run `npm run check` and the live harness (see CONTRIBUTING.md).
+2. Run `npm run check`, the live harness with `scripts/live-check.mjs`, and every scenario of `scripts/live-tui.mjs` (see CONTRIBUTING.md).
 3. Commit, tag (`git tag vX.Y.Z`), push with tags.
 4. CI: check → compile → npm publish (OIDC, provenance) → GitHub Release.
 
