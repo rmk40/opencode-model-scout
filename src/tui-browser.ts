@@ -933,6 +933,8 @@ interface TextPane {
   ): void;
   setViewport(width: number, height: number): void;
   scroll(move: ListMove): void;
+  /** Whether lines are hidden above or below. */
+  overflows(): boolean;
   repaint(): void;
 }
 
@@ -980,28 +982,28 @@ function createTextPane(
   let pinned = 0;
   /** Lines per block after the pinned lines. */
   let blocks: readonly number[] = [];
-  const shown = (): PaneWindow => blockWindow(blocks, height - pinned, offset);
+  const shown = (): EntryWindow => entryWindow(blocks, height - pinned, offset);
+  const indicator = (arrow: string, count: number): Line => [
+    {
+      text: count > 0 ? `${arrow} ${count} more` : `${arrow} more`,
+      role: "muted",
+    },
+  ];
   /** What each slot shows: a line and its index, or an indicator (index -1). */
-  const layoutSlots = (view: PaneWindow): { line?: Line; index: number }[] => {
+  const layoutSlots = (view: EntryWindow): { line?: Line; index: number }[] => {
     const shownSlots: { line?: Line; index: number }[] = [];
     for (let index = 0; index < Math.min(pinned, height); index += 1)
       shownSlots.push({ line: lines[index], index });
-    if (view.above > 0)
-      shownSlots.push({
-        line: [{ text: `↑ ${view.above} more`, role: "muted" }],
-        index: -1,
-      });
+    if (view.top)
+      shownSlots.push({ line: indicator("↑", view.above), index: -1 });
+    const { units } = scrollUnits(blocks, height - pinned);
     let first = pinned;
-    for (let block = 0; block < view.offset; block += 1)
-      first += blocks[block] ?? 0;
+    for (let unit = 0; unit < view.offset; unit += 1) first += units[unit] ?? 0;
     for (let index = first; index < first + view.rows; index += 1)
       shownSlots.push({ line: lines[index], index });
-    if (view.below > 0) {
+    if (view.bottom) {
       while (shownSlots.length < height - 1) shownSlots.push({ index: -1 });
-      shownSlots.push({
-        line: [{ text: `↓ ${view.below} more`, role: "muted" }],
-        index: -1,
-      });
+      shownSlots.push({ line: indicator("↓", view.below), index: -1 });
     }
     return shownSlots;
   };
@@ -1067,11 +1069,85 @@ function createTextPane(
       paint();
     },
     scroll(move) {
-      offset = scrollBlocks(blocks, height - pinned, offset, move);
+      offset = scrollEntries(blocks, height - pinned, offset, move);
       paint();
+    },
+    overflows() {
+      const view = shown();
+      return view.top || view.bottom;
     },
     repaint: paint,
   };
+}
+
+/**
+ * The units a pane scrolls by: one per entry, except that an entry taller
+ * than the room between the two indicators (`height - 2` rows) is one unit
+ * per line, so every line of it stays reachable. `entryOf` maps each unit
+ * to its entry.
+ */
+export function scrollUnits(
+  sizes: readonly number[],
+  height: number,
+): { units: number[]; entryOf: number[] } {
+  const limit = Math.max(1, Math.floor(height) - 2);
+  const units: number[] = [];
+  const entryOf: number[] = [];
+  for (const [entry, size] of sizes.entries()) {
+    if (size > limit)
+      for (let line = 0; line < size; line += 1) {
+        units.push(1);
+        entryOf.push(entry);
+      }
+    else {
+      units.push(size);
+      entryOf.push(entry);
+    }
+  }
+  return { units, entryOf };
+}
+
+/**
+ * `blockWindow` over `scrollUnits`, with the hidden counts in entries: an
+ * entry partly in view is not counted. `top` and `bottom` say whether the
+ * indicator rows show; they show without a count while only part of the
+ * entry in view is hidden.
+ */
+export interface EntryWindow extends PaneWindow {
+  readonly top: boolean;
+  readonly bottom: boolean;
+}
+
+export function entryWindow(
+  sizes: readonly number[],
+  height: number,
+  offset: number,
+): EntryWindow {
+  const { units, entryOf } = scrollUnits(sizes, height);
+  const view = blockWindow(units, height, offset);
+  const top = view.offset > 0;
+  const bottom = view.below > 0;
+  if (!top && !bottom) return { ...view, top, bottom };
+  const count = units.length - view.offset - view.below;
+  const firstEntry = entryOf[view.offset] ?? 0;
+  const lastEntry = entryOf[view.offset + count - 1] ?? firstEntry;
+  return {
+    ...view,
+    above: firstEntry,
+    below: Math.max(0, sizes.length - 1 - lastEntry),
+    top,
+    bottom,
+  };
+}
+
+/** The unit offset after one scroll move over `scrollUnits`. */
+export function scrollEntries(
+  sizes: readonly number[],
+  height: number,
+  offset: number,
+  move: ListMove,
+): number {
+  return scrollBlocks(scrollUnits(sizes, height).units, height, offset, move);
 }
 
 /**
@@ -1609,6 +1685,14 @@ export function buildBrowserView(
    * screen, then the frame's card when it sits above the list.
    */
   function bannerLines(): Line[] {
+    const lines = noticeBannerLines();
+    if (screen() === "list" && card?.placement === "above")
+      lines.push(...card.lines);
+    return lines;
+  }
+
+  /** The notice's lines in the banner: its wrapped rest, then its detail. */
+  function noticeBannerLines(): Line[] {
     const wrapped = noticeText();
     // A wrapped notice continues in base, or muted when it is a muted note.
     const continued: ForegroundRole =
@@ -1622,15 +1706,29 @@ export function buildBrowserView(
           { text: part, role: "base" as const },
         ]),
       );
-    if (screen() === "list" && card?.placement === "above")
-      lines.push(...card.lines);
     return lines;
   }
 
-  /** Rows the banner takes above the body on the current screen. */
+  /**
+   * Rows the banner takes above the body on the current screen. It leaves
+   * the list `MIN_LIST_ROWS`, except that the notice's own lines, such as
+   * text to select by hand, may take rows down to one list row.
+   */
   function bannerRows(): number {
-    const room = layout.bodyHeight - (frame ? 1 : 0) - MIN_LIST_ROWS;
-    return Math.max(0, Math.min(bannerLines().length, BANNER_CAPACITY, room));
+    const framed = frame ? 1 : 0;
+    const room = layout.bodyHeight - framed - MIN_LIST_ROWS;
+    const noticeRoom = Math.min(
+      noticeBannerLines().length,
+      layout.bodyHeight - framed - 1,
+    );
+    return Math.max(
+      0,
+      Math.min(
+        bannerLines().length,
+        BANNER_CAPACITY,
+        Math.max(room, noticeRoom),
+      ),
+    );
   }
 
   /**
@@ -2121,7 +2219,12 @@ export function buildBrowserView(
         break;
     }
     if (focus === "pane") return detailHints(row, discovery);
-    if (replacing()) return [...(card?.hints ?? [])];
+    if (replacing())
+      return [
+        // First, so a narrow footer keeps it.
+        ...(cardScrolls() ? [{ title: "scroll", key: "↑↓" }] : []),
+        ...(card?.hints ?? []),
+      ];
     if (data.status === "loading") return [];
     if (data.status === "failed") return [{ title: "retry", key: "r" }];
     if (projection.rows.length === 0) {
@@ -2212,7 +2315,18 @@ export function buildBrowserView(
       { keys: "esc", action: "close" },
     ];
     if (below === "list" && replacing())
-      return [...(card?.help ?? []), ...common];
+      return [
+        ...(card?.highlight === undefined
+          ? [
+              {
+                keys: "↑ ↓ pgup pgdn home end",
+                action: "scroll the card when it runs past the dialog",
+              },
+            ]
+          : []),
+        ...(card?.help ?? []),
+        ...common,
+      ];
     if (below === "filters")
       return [
         { keys: "↑ ↓", action: "choose a filter" },
@@ -2303,6 +2417,7 @@ export function buildBrowserView(
     switch (action.type) {
       case "move":
         if (current === "filters") filterList.move(action.move);
+        else if (current === "list" && replacing()) pane.scroll(action.move);
         else if (projection.rows.length > 0) {
           selectionPending = false;
           list.move(action.move);
@@ -2401,6 +2516,8 @@ export function buildBrowserView(
         );
         return true;
       case "refresh-all":
+        // One provider in scope: `r` is its refresh, and `R` is not a key.
+        if (scope.kind === "provider") return false;
         if (data.status === "failed") {
           actions.retry();
           return true;
@@ -2412,9 +2529,7 @@ export function buildBrowserView(
           });
           return true;
         }
-        actions.refresh(
-          scope.kind === "provider" ? scope.providerID : undefined,
-        );
+        actions.refresh(undefined);
         return true;
       case "actualyze":
         if (!actions.actualyze) return false;
@@ -2455,9 +2570,18 @@ export function buildBrowserView(
       case "refresh":
       case "refresh-all":
         return card?.refresh === true;
+      case "move":
+        // The links screen moves its own selection; an informational card
+        // that runs past the dialog scrolls.
+        return cardScrolls();
       default:
         return false;
     }
+  }
+
+  /** A replacing card other than a selectable list that runs past the dialog. */
+  function cardScrolls(): boolean {
+    return replacing() && card?.highlight === undefined && pane.overflows();
   }
 
   const onKeyPress = (key: KeyEvent): void => {
@@ -2515,12 +2639,15 @@ export function buildBrowserView(
       applyScreen(true);
     },
     setNotice(next) {
-      const before = bannerLines().length;
+      const before = bannerRows();
       notice = next;
-      // A notice that wraps or has detail changes the banner, and so the
-      // body's height.
-      if (bannerLines().length !== before) applyScreen(true);
-      else paintLine(noticeLine, noticeSegments());
+      // A banner that grows or shrinks changes the body's height; otherwise
+      // only its text changes, such as a second copied ID of the same length.
+      if (bannerRows() !== before) applyScreen(true);
+      else {
+        paintLine(noticeLine, noticeSegments());
+        if (before > 0) banner.setLines(bannerLines());
+      }
     },
     tick() {
       if (frame) applyScreen(true);

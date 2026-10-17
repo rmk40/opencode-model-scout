@@ -887,6 +887,25 @@ describe("keys", () => {
     expect(listRows(root).some((row) => row.startsWith("▌"))).toBe(true);
   });
 
+  it("shows the second copied ID when it takes as many banner rows as the first", async () => {
+    const h = harness({ terminalWidth: 80, terminalHeight: 24 });
+    h.setHostModels([
+      hostModel("aaaa-first", "A First"),
+      hostModel("bbbb-other", "B Other"),
+    ]);
+    const root = await h.ready();
+    h.renderer.isOsc52Supported.mockReturnValue(false);
+    h.press({ name: "home" });
+    h.press({ name: "down" });
+    h.press({ name: "y" });
+    expect(lines(root, "modelscout-banner")).toContain("atlas/aaaa-first");
+    // The next row is the catalog's Atlas Model; its ID also takes one row.
+    h.press({ name: "down" });
+    h.press({ name: "y" });
+    expect(lines(root, "modelscout-banner")).toContain("atlas/atlas-model");
+    expect(lines(root, "modelscout-banner")).not.toContain("atlas/aaaa-first");
+  });
+
   it("leaves a without an Actualyze hook unconsumed, and runs the hook when given", async () => {
     const h = harness();
     await openBrowser(h.context as unknown as Plugin.Context, { kind: "all" });

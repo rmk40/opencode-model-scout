@@ -12,6 +12,7 @@ import {
   blockWindow,
   browserLayout,
   cycleFilter,
+  entryWindow,
   DEFAULT_FILTERS,
   DEFAULT_NAV,
   filterSummary,
@@ -32,7 +33,9 @@ import {
   providerRowSegments,
   refreshWaitSeconds,
   scrollBlocks,
+  scrollEntries,
   scrollPane,
+  scrollUnits,
   sortModels,
   type BrowserData,
   type NavState,
@@ -1304,6 +1307,43 @@ describe("text pane blocks", () => {
     expect(scrollBlocks(sizes, 6, 0, "end")).toBe(3);
     // A page moves by the blocks shown less one, keeping one in view.
     expect(scrollBlocks(sizes, 6, 0, "pagedown")).toBe(2);
+  });
+});
+
+describe("text pane entries taller than the window", () => {
+  // 5 rows leave 3 between the indicators; the 4-line entry cannot fit whole.
+  const sizes = [1, 4, 1];
+
+  it("splits only entries taller than the room between the indicators", () => {
+    expect(scrollUnits(sizes, 5)).toEqual({
+      units: [1, 1, 1, 1, 1, 1],
+      entryOf: [0, 1, 1, 1, 1, 2],
+    });
+    expect(scrollUnits([1, 3, 1], 5).units).toEqual([1, 3, 1]);
+  });
+
+  it("reaches every line of a tall entry and counts whole entries only", () => {
+    const seen = new Set<number>();
+    let offset = 0;
+    for (let step = 0; step < 10; step += 1) {
+      const view = entryWindow(sizes, 5, offset);
+      for (let line = 0; line < view.rows; line += 1)
+        seen.add(view.offset + line);
+      offset = scrollEntries(sizes, 5, offset, "down");
+    }
+    expect([...seen].sort()).toEqual([0, 1, 2, 3, 4, 5]);
+    // The entry partly in view is not counted: only entry 0 is hidden above.
+    expect(entryWindow(sizes, 5, 2)).toMatchObject({
+      top: true,
+      above: 1,
+      bottom: false,
+    });
+    // Scrolled into a tall first entry, nothing whole is hidden above, yet
+    // the indicator shows.
+    expect(entryWindow([4, 1, 1], 5, 1)).toMatchObject({
+      top: true,
+      above: 0,
+    });
   });
 });
 

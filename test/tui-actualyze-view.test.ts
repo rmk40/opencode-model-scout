@@ -819,6 +819,89 @@ describe("copy notice", () => {
   });
 });
 
+describe("small terminals", () => {
+  const size = (h: Harness, columns: number, rows: number): void => {
+    h.context.renderer.terminalWidth = columns;
+    h.context.renderer.terminalHeight = rows;
+  };
+  const shownLines = (root: unknown, id: string): string[] =>
+    (findNodeById(root, id)?.children ?? [])
+      .filter(visible)
+      .map((child) => textOf(child).trimEnd());
+
+  it("shows the text to select when OSC 52 is unavailable, even at 80x16", async () => {
+    const h = harness(READY);
+    size(h, 80, 16);
+    h.context.renderer.isOsc52Supported.mockReturnValue(false);
+    await h.open();
+    await vi.waitFor(() =>
+      expect(line(h.root(), "modelscout-status")).toMatch(/Catalog accessible/),
+    );
+    h.press("y");
+    expect(line(h.root(), "modelscout-notice")).toMatch(
+      /select the text below/,
+    );
+    expect(shownLines(h.root(), "modelscout-banner")).toContain(
+      "actualyze/claude-haiku",
+    );
+  });
+
+  it("scrolls an overflowing card with the movement keys and says so in the footer", async () => {
+    const h = harness();
+    size(h, 80, 20);
+    await openedAt(h, /Connect an Actualyze API key/);
+    const footer = (): string => line(h.root(), "modelscout-footer");
+    expect(footer()).toMatch(/^scroll ↑↓ {2}connect key k/);
+    const before = pane(h.root()).split("\n");
+    expect(before.at(-1)).toMatch(/^↓ \d+ more$/);
+    const down = h.press("down");
+    expect(down.preventDefault).toHaveBeenCalled();
+    const after = pane(h.root()).split("\n");
+    expect(after[0]).toMatch(/^↑ /);
+    h.press("end");
+    expect(pane(h.root())).toMatch(/background service\./);
+    h.press("?");
+    expect(pane(h.root())).toMatch(
+      /scroll the card when it runs past the dialog/,
+    );
+  });
+
+  it("leaves the movement keys alone and the footer quiet when the card fits", async () => {
+    const h = harness();
+    await openedAt(h, /Connect an Actualyze API key/);
+    expect(line(h.root(), "modelscout-footer")).not.toMatch(/scroll/);
+    expect(h.press("down").preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("reaches every line of the key list at 80x16", async () => {
+    /** Every row the key list shows while scrolling from top to end. */
+    const scrolled = async (rows: number): Promise<Set<string>> => {
+      const h = harness(READY);
+      size(h, 80, rows);
+      await h.open();
+      await vi.waitFor(() =>
+        expect(line(h.root(), "modelscout-status")).toMatch(
+          /Catalog accessible/,
+        ),
+      );
+      h.press("?");
+      const seen = new Set<string>();
+      for (let step = 0; step < 80; step += 1) {
+        for (const row of pane(h.root()).split("\n"))
+          if (!/^[↑↓] /.test(row)) seen.add(row);
+        h.press("down");
+      }
+      return seen;
+    };
+    // At 80x40 every entry fits whole between the indicators, so scrolling
+    // shows every line; the same width wraps the same lines at 80x16.
+    const reference = await scrolled(40);
+    const small = await scrolled(16);
+    expect(reference.size).toBeGreaterThan(10);
+    for (const row of reference) expect(small).toContain(row);
+  });
+});
+
 describe("card action row", () => {
   const revoked: State = {
     ...READY,

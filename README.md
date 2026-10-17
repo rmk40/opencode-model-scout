@@ -783,10 +783,14 @@ The footer lists the card's keys in one order: the key action, retry, copy
 link, links, connections, all providers, then keys. When the footer runs out
 of room it leaves out the hints that do not fit and keeps any later one that
 does; the card then lists the left-out keys in an action line at its end, in
-the same order, so every key shows once. `?` lists them all. Once the catalog is
-accessible, the model list works like `/modelscout` limited to Actualyze,
-without a provider header or provider filter; the footer and `?` list `k`,
-`l`, `c`, and `b`.
+the same order, so every key shows once. `?` lists them all. A card longer
+than the dialog shows `↓ N more`, scrolls with `↑`, `↓`, `pgup`, `pgdn`,
+`home`, and `end`, and adds `scroll ↑↓` to the footer.
+
+Once the catalog is accessible, the model list works like `/modelscout`
+limited to Actualyze, without a provider header or provider filter. `r`
+refreshes Actualyze; there is no `R`. The footer shows `k` and `l` when
+there is room, and `?` lists `k`, `l`, `c`, and `b`.
 
 `k` works only when the provider reads its key from the `actualyze`
 integration and that integration offers a plain key method. Otherwise the

@@ -126,12 +126,22 @@ export function formatPriceCell(
 ): string {
   if (input === undefined && output === undefined) return "";
   const columns = Math.max(0, Math.floor(width));
-  const pair = formatPricePair(input, output);
-  const full = tiered ? `${pair}+` : pair;
-  if (full.length <= columns) return full;
-  if (pair.length <= columns) return pair;
+  const side = (value: number | undefined): string =>
+    value === undefined ? "?" : formatPrice(value);
+  // Matched cents read better, but each side's own format is shorter; it
+  // comes before a cut.
+  const pairs = [
+    formatPricePair(input, output),
+    `${side(input)}/${side(output)}`,
+  ];
+  for (const pair of pairs) {
+    const full = tiered ? `${pair}+` : pair;
+    if (full.length <= columns) return full;
+  }
+  for (const pair of pairs) if (pair.length <= columns) return pair;
   if (columns === 0) return "";
-  return `${pair.slice(0, columns - 1)}…`;
+  const shortest = pairs[1] ?? "";
+  return `${shortest.slice(0, columns - 1)}…`;
 }
 
 /**

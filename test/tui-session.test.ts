@@ -873,14 +873,16 @@ describe("refresh", () => {
     await vi.waitFor(() => expect(h.modelList).toHaveBeenCalledTimes(2));
   });
 
-  it("refreshes the scoped provider with both r and R in a single-provider scope", async () => {
+  it("refreshes the scoped provider with r and leaves R alone in a single-provider scope", async () => {
     const h = harness();
     await h.ready({ kind: "provider", providerID: "atlas" });
     h.press({ name: "r" });
-    h.press({ name: "r", sequence: "R", shift: true });
-    await vi.waitFor(() => expect(h.refresh).toHaveBeenCalledTimes(2));
-    for (const call of h.refresh.mock.calls)
-      expect(call[0]).toEqual({ providerID: "atlas" });
+    await vi.waitFor(() => expect(h.refresh).toHaveBeenCalledTimes(1));
+    expect(h.refresh.mock.calls[0]?.[0]).toEqual({ providerID: "atlas" });
+    const shifted = h.press({ name: "r", sequence: "R", shift: true });
+    await settle();
+    expect(h.refresh).toHaveBeenCalledTimes(1);
+    expect(shifted.preventDefault).not.toHaveBeenCalled();
   });
 
   it("counts a throttled refresh down each second and then drops the notice", async () => {

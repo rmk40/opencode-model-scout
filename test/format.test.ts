@@ -186,6 +186,15 @@ describe("formatPriceCell", () => {
     expect(formatPriceCell(1.25, 0.0001234, true)).toBe("$1.25/$0.000123");
   });
 
+  it("gives up matched cents before cutting a pair that does not fit", () => {
+    // "$125.50/$600.00" is 15 columns; "$125.5/$600" fits in 14.
+    expect(formatPricePair(125.5, 600)).toBe("$125.50/$600.00");
+    expect(formatPriceCell(125.5, 600, false, 14)).toBe("$125.5/$600");
+    expect(formatPriceCell(125.5, 600, true, 14)).toBe("$125.5/$600+");
+    // Matched cents stay whenever they fit.
+    expect(formatPriceCell(0.15, 0.6, false, 14)).toBe("$0.15/$0.60");
+  });
+
   it("cuts a pair that still does not fit with an ellipsis", () => {
     const cell = formatPriceCell(0.0001234, 0.0004567, true);
     expect(cell).toBe("$0.000123/$0.0…");
