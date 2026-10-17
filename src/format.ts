@@ -12,11 +12,96 @@ export function compactCount(n: number): string {
   // the millions branch instead of rendering an awkward "1000K".
   const thousands = Math.round(n / 1000);
   if (thousands >= 1000) {
-    const m = thousands / 1000;
-    return `${m % 1 === 0 ? m.toFixed(0) : m.toFixed(1)}M`;
+    // 1_048_576 is 1.049M; one decimal rounds it to "1.0", which is trimmed.
+    return `${trimZeros((thousands / 1000).toFixed(1))}M`;
   }
   if (n >= 1_000) return `${thousands}K`;
   return formatNumber(n);
+}
+
+/**
+ * A context limit for a fixed-width column. A limit that is OpenCode's
+ * default rather than a reported value gets a `~` prefix: "~200K".
+ */
+export function formatContextCell(tokens: number, assumed: boolean): string {
+  const count = compactCount(tokens);
+  return assumed ? `~${count}` : count;
+}
+
+/** Columns of the list's price cell. */
+export const PRICE_CELL_WIDTH = 15;
+
+/** Drop trailing fractional zeros, and the point when nothing follows it. */
+function trimZeros(fixed: string): string {
+  return fixed.includes(".") ? fixed.replace(/\.?0+$/, "") : fixed;
+}
+
+/** Decimals that show `value` (0 < value < 1) with three significant digits. */
+function significantDecimals(value: number): number {
+  return Math.max(0, 2 - Math.floor(Math.log10(value)));
+}
+
+function isPrice(value: number): boolean {
+  return Number.isFinite(value) && value >= 0;
+}
+
+/** Nonzero prices below this render as a bound instead of digits. */
+const TINY_PRICE = 1e-12;
+const TINY_PRICE_LABEL = "<$0.000000000001";
+
+/**
+ * A USD price per 1M tokens for dense lists: integers bare ("$3"), up to two
+ * decimals under 10 ("$1.25"), one decimal from 10 ("$12.5"), and three
+ * significant digits under 0.1 ("$0.075"), with trailing zeros trimmed. A
+ * nonzero price never renders as "$0"; one below $1e-12 is "<$0.000000000001".
+ * Negative or non-finite input is "?".
+ */
+export function formatPrice(value: number): string {
+  if (!isPrice(value)) return "?";
+  if (Number.isInteger(value)) return `$${value}`;
+  if (value < TINY_PRICE) return TINY_PRICE_LABEL;
+  const decimals =
+    value < 0.1 ? significantDecimals(value) : value < 10 ? 2 : 1;
+  return `$${trimZeros(value.toFixed(decimals))}`;
+}
+
+/**
+ * A USD price per 1M tokens for details: two fixed decimals ("$3.00"), or
+ * three significant digits under 0.1 ("$0.075", never fewer than two
+ * decimals); one below $1e-12 is "<$0.000000000001". Negative or non-finite
+ * input is "?".
+ */
+export function formatDetailPrice(value: number): string {
+  if (!isPrice(value)) return "?";
+  if (value === 0 || value >= 0.1) return `$${value.toFixed(2)}`;
+  if (value < TINY_PRICE) return TINY_PRICE_LABEL;
+  const fixed = trimZeros(value.toFixed(significantDecimals(value)));
+  const decimals = fixed.length - fixed.indexOf(".") - 1;
+  return `$${decimals < 2 ? value.toFixed(2) : fixed}`;
+}
+
+/**
+ * The list's `in/out` price cell, unpadded, at most `width` columns. An
+ * unknown side is "?", and both unknown is empty. `tiered` adds a `+` for
+ * context-priced tiers above the first; when the pair does not fit, the `+`
+ * goes first, then the pair is cut with "…".
+ */
+export function formatPriceCell(
+  input: number | undefined,
+  output: number | undefined,
+  tiered: boolean,
+  width: number = PRICE_CELL_WIDTH,
+): string {
+  if (input === undefined && output === undefined) return "";
+  const columns = Math.max(0, Math.floor(width));
+  const side = (value: number | undefined): string =>
+    value === undefined ? "?" : formatPrice(value);
+  const pair = `${side(input)}/${side(output)}`;
+  const full = tiered ? `${pair}+` : pair;
+  if (full.length <= columns) return full;
+  if (pair.length <= columns) return pair;
+  if (columns === 0) return "";
+  return `${pair.slice(0, columns - 1)}…`;
 }
 
 /** Format bytes as human-readable: 20285680936 → "18.9 GB" */

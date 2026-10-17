@@ -22,8 +22,13 @@ import {
   OPENAI_COMPATIBLE_PACKAGES,
 } from "./constants";
 
-/** One price tier of an OpenCode `Model.Info.cost` entry. */
+/**
+ * One entry of an OpenCode `Model.Info.cost` array. The entry without a
+ * `tier` is the base price; a `context` tier applies once the request's
+ * context exceeds `size` tokens.
+ */
 export interface HostModelCost {
+  readonly tier?: { readonly type: string; readonly size: number };
   readonly input: number;
   readonly output: number;
   readonly cache: { readonly read: number; readonly write: number };
@@ -40,6 +45,11 @@ export interface HostModel {
     readonly tools: boolean;
     readonly input: readonly string[];
     readonly output: readonly string[];
+    /**
+     * Whether the model accepts a sampling temperature, from OpenCode 2.0.31;
+     * the pinned 2.0.26 types lack it, so it is read as `unknown` and checked.
+     */
+    readonly temperature?: unknown;
   };
   readonly variants: readonly unknown[];
   readonly cost: readonly HostModelCost[];
@@ -91,11 +101,54 @@ export interface ModelRow {
   origin?: "discovered" | "pre-existing";
   capabilities?: ModelCapabilityEvidence;
   inputModalities?: InputModalityEvidence;
+  /** Base prices; for context-priced models, the tier below every threshold. */
   cost?: CostEvidence;
+  /** Context-priced tiers above the base price, by ascending threshold. */
+  priceTiers?: readonly PriceTier[];
+  /** The host's explicit `capabilities.temperature`, when it states one. */
+  hostTemperature?: boolean;
   provenance?: Partial<
     Record<ModelScalarField, ScalarEvidence<string | number>>
   >;
   warnings?: string[];
+}
+
+/** Prices, USD per 1M tokens, that apply above a context size. */
+export interface PriceTier {
+  /** Context size in tokens above which these prices apply. */
+  readonly above: number;
+  readonly input?: number;
+  readonly output?: number;
+  readonly cacheRead?: number;
+  readonly cacheWrite?: number;
+}
+
+/**
+ * How sure a displayed value is: `confirmed` when reported, configured, or
+ * stated by the host; `assumed` when it is an OpenCode or policy default;
+ * `inferred` when it comes from models.dev or a heuristic; `unsupported`
+ * when a source says the model lacks it; `not-reported` when no source
+ * states anything.
+ */
+export type Certainty =
+  | "confirmed"
+  | "assumed"
+  | "inferred"
+  | "unsupported"
+  | "not-reported";
+
+export type CapabilityName =
+  | "tools"
+  | "reasoning"
+  | "temperature"
+  | InputModality;
+
+export interface ModelCertainty {
+  readonly capabilities: Readonly<Record<CapabilityName, Certainty>>;
+  /** `assumed` is OpenCode's 200 000 token default, shown as "~200K". */
+  readonly context: Exclude<Certainty, "unsupported">;
+  /** `not-reported` means OpenCode fits output to the remaining context. */
+  readonly output: Exclude<Certainty, "unsupported">;
 }
 
 export type CoreMetadataName =
@@ -278,17 +331,129 @@ function reconcileCapability(
   return unknownCapability();
 }
 
+function readPrice(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? value
+    : undefined;
+}
+
+/** The context threshold of a context-priced entry, else undefined. */
+function contextTierSize(cost: HostModelCost): number | undefined {
+  const tier = cost.tier;
+  return tier?.type === "context" &&
+    Number.isSafeInteger(tier.size) &&
+    tier.size >= 0
+    ? tier.size
+    : undefined;
+}
+
+/**
+ * The entry OpenCode prices a request with below every context threshold:
+ * the one without a tier, else the first, as OpenCode's own model list does.
+ */
+function baseCost(model: HostModel | undefined): HostModelCost | undefined {
+  return model?.cost.find((cost) => cost.tier === undefined) ?? model?.cost[0];
+}
+
 function hostCost(model: HostModel | undefined): CostEvidence {
-  const tier = model?.cost[0];
-  const price = (value: number | undefined): ScalarEvidence<number> =>
-    typeof value === "number" && Number.isFinite(value) && value >= 0
-      ? knownScalar(value, "unmatched-host", "unmatched")
-      : unknownScalar();
+  const base = baseCost(model);
+  const price = (value: unknown): ScalarEvidence<number> => {
+    const known = readPrice(value);
+    return known === undefined
+      ? unknownScalar()
+      : knownScalar(known, "unmatched-host", "unmatched");
+  };
   return {
-    input: price(tier?.input),
-    output: price(tier?.output),
-    cacheRead: price(tier?.cache.read),
-    cacheWrite: price(tier?.cache.write),
+    input: price(base?.input),
+    output: price(base?.output),
+    cacheRead: price(base?.cache.read),
+    cacheWrite: price(base?.cache.write),
+  };
+}
+
+/** Every context-priced entry other than the base, by ascending threshold. */
+function hostPriceTiers(model: HostModel | undefined): PriceTier[] {
+  const base = baseCost(model);
+  const tiers: PriceTier[] = [];
+  for (const cost of model?.cost ?? []) {
+    if (cost === base) continue;
+    const above = contextTierSize(cost);
+    if (above === undefined) continue;
+    tiers.push({
+      above,
+      input: readPrice(cost.input),
+      output: readPrice(cost.output),
+      cacheRead: readPrice(cost.cache.read),
+      cacheWrite: readPrice(cost.cache.write),
+    });
+  }
+  return tiers.sort((a, b) => a.above - b.above);
+}
+
+function readHostTemperature(
+  model: HostModel | undefined,
+): boolean | undefined {
+  const value = model?.capabilities.temperature;
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function capabilityCertainty(
+  evidence: CapabilityEvidence | undefined,
+): Certainty {
+  if (!evidence || evidence.state === "unknown") return "not-reported";
+  if (evidence.state === "unsupported") return "unsupported";
+  switch (evidence.strength) {
+    case "assumed":
+      return "assumed";
+    case "inferred":
+      return "inferred";
+    case "authoritative":
+    case "configured":
+    case "reported":
+    case "unmatched":
+      return "confirmed";
+  }
+}
+
+function limitCertainty(
+  value: number | undefined,
+  evidence: ScalarEvidence<string | number> | undefined,
+): Exclude<Certainty, "unsupported"> {
+  if (value === undefined) return "not-reported";
+  if (evidence?.state !== "known") return "confirmed";
+  if (evidence.strength === "assumed") return "assumed";
+  if (evidence.strength === "inferred") return "inferred";
+  return "confirmed";
+}
+
+/**
+ * How sure each capability and limit of a row is. Host `false` for
+ * temperature is the one host denial evidence cannot carry, so it is read
+ * from `hostTemperature` when no source states support.
+ */
+export function modelCertainty(model: ModelRow): ModelCertainty {
+  const temperature = capabilityCertainty(model.capabilities?.temperature);
+  const capabilities: Record<CapabilityName, Certainty> = {
+    tools: capabilityCertainty(model.capabilities?.toolCall),
+    reasoning: capabilityCertainty(model.capabilities?.reasoning),
+    temperature:
+      temperature === "not-reported" && model.hostTemperature === false
+        ? "unsupported"
+        : temperature,
+    text: "not-reported",
+    image: "not-reported",
+    pdf: "not-reported",
+    audio: "not-reported",
+    video: "not-reported",
+  };
+  for (const modality of INPUT_MODALITIES)
+    capabilities[modality] = capabilityCertainty(
+      model.inputModalities?.[modality],
+    );
+  return {
+    capabilities,
+    context: limitCertainty(model.context, model.provenance?.context),
+    output: limitCertainty(model.output, model.provenance?.output),
   };
 }
 
@@ -312,15 +477,11 @@ const CHAT_CORE_FIELDS: readonly CoreMetadataName[] = [
 const BASE_CORE_FIELDS: readonly CoreMetadataName[] = ["type", "context"];
 
 /**
- * A limit counts as known only when it is observed: a value the server marks
- * as OpenCode's `Model.Info` default is still missing metadata.
+ * A limit counts as known only when it is observed: a value that is OpenCode's
+ * `Model.Info` default is still missing metadata.
  */
-function limitKnown(
-  value: number | undefined,
-  evidence: ScalarEvidence<string | number> | undefined,
-): boolean {
-  if (value === undefined) return false;
-  return !(evidence?.state === "known" && evidence.source === "host-default");
+function limitKnown(certainty: Certainty): boolean {
+  return certainty !== "not-reported" && certainty !== "assumed";
 }
 
 /** Applicability-aware core metadata coverage for one model row. */
@@ -329,24 +490,22 @@ export function coreMetadataCoverage(model: ModelRow): CoreMetadataCoverage {
     model.type === "llm" || model.type === "vlm"
       ? CHAT_CORE_FIELDS
       : BASE_CORE_FIELDS;
+  const certainty = modelCertainty(model);
+  const stated = (name: CapabilityName): boolean =>
+    certainty.capabilities[name] !== "not-reported";
   const known = (field: CoreMetadataName): boolean => {
     switch (field) {
       case "type":
         return model.type !== undefined;
       case "context":
-        return limitKnown(model.context, model.provenance?.context);
+        return limitKnown(certainty.context);
       case "output":
-        return limitKnown(model.output, model.provenance?.output);
+        return limitKnown(certainty.output);
       case "image":
-        return (model.inputModalities?.image.state ?? "unknown") !== "unknown";
       case "tools":
-        return (model.capabilities?.toolCall.state ?? "unknown") !== "unknown";
       case "reasoning":
-        return (model.capabilities?.reasoning.state ?? "unknown") !== "unknown";
       case "temperature":
-        return (
-          (model.capabilities?.temperature.state ?? "unknown") !== "unknown"
-        );
+        return stated(field);
     }
   };
   const missing = applicable.filter((field) => !known(field));
@@ -433,6 +592,7 @@ export function toModelRow(
   const quantization = evidenceOnly("quantization", evidence?.quantization);
   const sizeBytes = evidenceOnly("sizeBytes", evidence?.sizeBytes);
   const probeIdentity = evidenceOnly("probeIdentity", evidence?.probeIdentity);
+  const hostTemperature = readHostTemperature(host);
 
   const capabilities: ModelCapabilityEvidence = {
     toolCall: reconcileCapability(
@@ -449,7 +609,7 @@ export function toModelRow(
     ),
     temperature: reconcileCapability(
       "temperature",
-      undefined,
+      hostTemperature,
       evidence?.capabilities.temperature,
       warnings,
     ),
@@ -472,6 +632,11 @@ export function toModelRow(
   if (capabilities.reasoning.state === "supported") flags.push("Reasoning");
   if (capabilities.temperature.state === "supported") flags.push("Temp");
 
+  // Scout never prices a declared model, so its prices come from the host.
+  // A discovered model's host prices are scout's own single entry.
+  const discovered = evidence?.origin === "discovered";
+  const priceTiers = discovered ? [] : hostPriceTiers(host);
+
   return {
     id,
     name,
@@ -488,8 +653,9 @@ export function toModelRow(
     origin: evidence?.origin,
     capabilities,
     inputModalities,
-    // Scout never prices a declared model, so its prices come from the host.
-    cost: evidence?.origin === "discovered" ? evidence.cost : hostCost(host),
+    cost: discovered ? evidence.cost : hostCost(host),
+    ...(priceTiers.length > 0 ? { priceTiers } : {}),
+    ...(hostTemperature === undefined ? {} : { hostTemperature }),
     provenance,
     warnings,
   };

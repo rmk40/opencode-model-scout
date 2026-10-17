@@ -1,10 +1,15 @@
 import { describe, it, expect } from "vitest";
 import {
+  PRICE_CELL_WIDTH,
   compactCount,
   extractModelOwner,
   formatBytes,
+  formatContextCell,
+  formatDetailPrice,
   formatModelName,
   formatNumber,
+  formatPrice,
+  formatPriceCell,
 } from "../src/format";
 
 describe("formatNumber", () => {
@@ -37,6 +42,149 @@ describe("compactCount", () => {
   it("rolls over to millions instead of rendering 1000K", () => {
     expect(compactCount(999999)).toBe("1M");
     expect(compactCount(999499)).toBe("999K");
+  });
+
+  it("drops a trailing .0 from millions", () => {
+    expect(compactCount(1_048_576)).toBe("1M");
+    expect(compactCount(2_000_000)).toBe("2M");
+    expect(compactCount(2_400_000)).toBe("2.4M");
+  });
+});
+
+describe("formatContextCell", () => {
+  it("marks OpenCode's assumed default with a tilde", () => {
+    expect(formatContextCell(200_000, true)).toBe("~200K");
+  });
+
+  it("shows a reported limit plainly", () => {
+    expect(formatContextCell(200_000, false)).toBe("200K");
+    expect(formatContextCell(1_048_576, false)).toBe("1M");
+  });
+});
+
+describe("formatPrice", () => {
+  it("shows integers bare", () => {
+    expect(formatPrice(3)).toBe("$3");
+    expect(formatPrice(15)).toBe("$15");
+    expect(formatPrice(0)).toBe("$0");
+  });
+
+  it("uses up to two decimals under 10, trimming trailing zeros", () => {
+    expect(formatPrice(1.25)).toBe("$1.25");
+    expect(formatPrice(1.256)).toBe("$1.26");
+    expect(formatPrice(0.6)).toBe("$0.6");
+    expect(formatPrice(0.1)).toBe("$0.1");
+  });
+
+  it("uses up to one decimal from 10, trimming a trailing zero", () => {
+    expect(formatPrice(12.5)).toBe("$12.5");
+    expect(formatPrice(12.34)).toBe("$12.3");
+    expect(formatPrice(10.04)).toBe("$10");
+  });
+
+  it("uses three significant digits under 0.1", () => {
+    expect(formatPrice(0.075)).toBe("$0.075");
+    expect(formatPrice(0.01234)).toBe("$0.0123");
+    expect(formatPrice(0.0001234)).toBe("$0.000123");
+    expect(formatPrice(0.05)).toBe("$0.05");
+  });
+
+  it.each([0.0049, 0.001, 1e-9])(
+    "never shows the nonzero price %s as $0",
+    (value) => {
+      const text = formatPrice(value);
+      expect(text).not.toBe("$0");
+      expect(Number(text.slice(1))).toBeGreaterThan(0);
+    },
+  );
+
+  it("formats an extremely small nonzero price without throwing", () => {
+    expect(() => formatPrice(1e-120)).not.toThrow();
+    expect(formatPrice(1e-120)).not.toBe("$0");
+  });
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY])(
+    "shows %s as unknown",
+    (value) => {
+      expect(formatPrice(value)).toBe("?");
+    },
+  );
+});
+
+describe("formatDetailPrice", () => {
+  it("uses two fixed decimals from 0.1", () => {
+    expect(formatDetailPrice(3)).toBe("$3.00");
+    expect(formatDetailPrice(15)).toBe("$15.00");
+    expect(formatDetailPrice(0.6)).toBe("$0.60");
+    expect(formatDetailPrice(0.1)).toBe("$0.10");
+  });
+
+  it("shows zero with two decimals", () => {
+    expect(formatDetailPrice(0)).toBe("$0.00");
+  });
+
+  it("uses three significant digits under 0.1", () => {
+    expect(formatDetailPrice(0.075)).toBe("$0.075");
+    expect(formatDetailPrice(0.0001234)).toBe("$0.000123");
+  });
+
+  it("never shows fewer than two decimals under 0.1", () => {
+    expect(formatDetailPrice(0.05)).toBe("$0.05");
+    // Three significant digits round 0.09999 up to 0.1.
+    expect(formatDetailPrice(0.09999)).toBe("$0.10");
+  });
+
+  it("formats an extremely small nonzero price without throwing", () => {
+    expect(() => formatDetailPrice(1e-120)).not.toThrow();
+  });
+
+  it.each([-0.5, Number.NaN, Number.NEGATIVE_INFINITY])(
+    "shows %s as unknown",
+    (value) => {
+      expect(formatDetailPrice(value)).toBe("?");
+    },
+  );
+});
+
+describe("formatPriceCell", () => {
+  it("is 15 columns wide by default", () => {
+    expect(PRICE_CELL_WIDTH).toBe(15);
+  });
+
+  it("joins input and output prices", () => {
+    expect(formatPriceCell(3, 15, false)).toBe("$3/$15");
+    expect(formatPriceCell(1.25, 10, false)).toBe("$1.25/$10");
+  });
+
+  it("adds + for context-priced tiers", () => {
+    expect(formatPriceCell(3, 15, true)).toBe("$3/$15+");
+  });
+
+  it("shows ? for an unknown side and nothing when both are unknown", () => {
+    expect(formatPriceCell(3, undefined, false)).toBe("$3/?");
+    expect(formatPriceCell(undefined, 15, true)).toBe("?/$15+");
+    expect(formatPriceCell(undefined, undefined, true)).toBe("");
+  });
+
+  it("shows ? for an invalid price", () => {
+    expect(formatPriceCell(-1, 2, false)).toBe("?/$2");
+  });
+
+  it("drops the + first when the tiered pair does not fit", () => {
+    // "$1.25/$0.000123" is exactly 15 columns.
+    expect(formatPriceCell(1.25, 0.0001234, true)).toBe("$1.25/$0.000123");
+  });
+
+  it("cuts a pair that still does not fit with an ellipsis", () => {
+    const cell = formatPriceCell(0.0001234, 0.0004567, true);
+    expect(cell).toBe("$0.000123/$0.0…");
+    expect(cell).toHaveLength(PRICE_CELL_WIDTH);
+  });
+
+  it("honors a narrower width", () => {
+    expect(formatPriceCell(3, 15, true, 6)).toBe("$3/$15");
+    expect(formatPriceCell(3, 15, false, 4)).toBe("$3/…");
+    expect(formatPriceCell(3, 15, false, 0)).toBe("");
   });
 });
 

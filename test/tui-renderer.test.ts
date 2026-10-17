@@ -1,8 +1,9 @@
-import type { BaseRenderable } from "@opentui/core";
+import type { BaseRenderable, TextChunk } from "@opentui/core";
 import { describe, expect, it, vi } from "vitest";
 import {
   TuiRenderer,
   type ReconcilerBridge,
+  type StyleBridge,
   type TuiTag,
 } from "../src/tui-renderer";
 
@@ -114,5 +115,94 @@ describe("TuiRenderer", () => {
     expect(
       (renderer.raw(input) as unknown as FakeNode).props,
     ).not.toHaveProperty("ref");
+  });
+});
+
+class FakeStyledText {
+  constructor(readonly chunks: TextChunk[]) {}
+}
+
+/** A style bridge whose parsed colors record their input. */
+function fakeStyle() {
+  const parseColor = (color: unknown) => ({ parsed: color });
+  const style: StyleBridge = {
+    StyledText: FakeStyledText as unknown as StyleBridge["StyledText"],
+    parseColor: parseColor as unknown as StyleBridge["parseColor"],
+    TextAttributes: { BOLD: 1 },
+  };
+  return { style };
+}
+
+describe("TuiRenderer styled text", () => {
+  it("reports whether it can render styled text", () => {
+    expect(new TuiRenderer(fakeBridge().bridge).styled).toBe(false);
+    expect(new TuiRenderer(fakeBridge().bridge, fakeStyle().style).styled).toBe(
+      true,
+    );
+  });
+
+  it("throws on styled text without a style bridge", () => {
+    const renderer = new TuiRenderer(fakeBridge().bridge);
+    const text = renderer.create("text", { content: "" });
+    expect(() => renderer.setStyledText(text, [{ text: "Atlas" }])).toThrow();
+  });
+
+  it("assigns the StyledText to the renderable, not through setProp", () => {
+    // The reconciler's setProp stringifies non-string content, which would
+    // render "[object Object]".
+    const fake = fakeBridge();
+    const renderer = new TuiRenderer(fake.bridge, fakeStyle().style);
+    const text = renderer.create("text", { content: "" });
+    fake.setProp.mockClear();
+
+    renderer.setStyledText(text, [{ text: "Atlas" }]);
+
+    const node = renderer.raw(text) as unknown as { content: unknown };
+    expect(node.content).toBeInstanceOf(FakeStyledText);
+    expect(fake.setProp).not.toHaveBeenCalled();
+  });
+
+  it("builds one chunk per span with parsed colors and bold only where asked", () => {
+    const { style } = fakeStyle();
+    const renderer = new TuiRenderer(fakeBridge().bridge, style);
+    const text = renderer.create("text", { content: "" });
+
+    renderer.setStyledText(text, [
+      { text: "▌", fg: "#111111", bg: "#222222" },
+      { text: "Actualyze", fg: "#a855f7", bold: true },
+      { text: "   ", bg: "#222222" },
+      { text: "plain", bold: false },
+    ]);
+
+    const { chunks } = (
+      renderer.raw(text) as unknown as {
+        content: FakeStyledText;
+      }
+    ).content;
+    expect(chunks).toEqual([
+      {
+        __isChunk: true,
+        text: "▌",
+        fg: { parsed: "#111111" },
+        bg: { parsed: "#222222" },
+      },
+      {
+        __isChunk: true,
+        text: "Actualyze",
+        fg: { parsed: "#a855f7" },
+        attributes: 1,
+      },
+      { __isChunk: true, text: "   ", bg: { parsed: "#222222" } },
+      { __isChunk: true, text: "plain" },
+    ]);
+  });
+
+  it("clears a node with no spans", () => {
+    const renderer = new TuiRenderer(fakeBridge().bridge, fakeStyle().style);
+    const text = renderer.create("text", { content: "" });
+    renderer.setStyledText(text, [{ text: "old" }]);
+    renderer.setStyledText(text, []);
+    const node = renderer.raw(text) as unknown as { content: FakeStyledText };
+    expect(node.content.chunks).toEqual([]);
   });
 });
