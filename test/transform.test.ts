@@ -418,6 +418,17 @@ describe("provider transform", () => {
     };
     expect(() => createProviderTransform(state)(editor)).not.toThrow();
     expect(state.recorded).toEqual(new Set(["a"]));
+    expect(state.actualyze).toBe("failed");
+  });
+
+  it("records on every fold whether it added Actualyze or found another", () => {
+    const state = createTransformState();
+    expect(state.actualyze).toBeUndefined();
+    const transform = createProviderTransform(state);
+    transform(fakeProviderEditor([provider("actualyze")]).editor);
+    expect(state.actualyze).toBe("existing");
+    transform(fakeProviderEditor([]).editor);
+    expect(state.actualyze).toBe("added");
   });
 });
 

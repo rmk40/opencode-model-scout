@@ -84,12 +84,22 @@ export function actualyzeProviderInfo(): ProviderInfo {
   };
 }
 
+/**
+ * What {@link addActualyzeProvider} did: added the provider, found one that
+ * another source defined, or failed and left the catalog unchanged.
+ */
+export type ActualyzeAddition = "added" | "existing" | "failed";
+
 /** Add the `actualyze` provider, with no models, unless one already exists. */
-export function addActualyzeProvider(editor: ProviderEditor): void {
+export function addActualyzeProvider(
+  editor: ProviderEditor,
+): ActualyzeAddition {
   try {
-    if (editor.get(ACTUALYZE_PROVIDER_ID)) return;
+    if (editor.get(ACTUALYZE_PROVIDER_ID)) return "existing";
     editor.add({ info: actualyzeProviderInfo(), models: [] });
+    return "added";
   } catch {
     // Leave the catalog as it was rather than disable the plugin.
+    return "failed";
   }
 }

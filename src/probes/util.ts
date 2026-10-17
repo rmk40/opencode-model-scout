@@ -117,6 +117,7 @@ async function raceBody<T>(
   read: () => Promise<T>,
   timeoutMs: number,
   onTimeout: T,
+  onError: T = onTimeout,
 ): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -129,7 +130,7 @@ async function raceBody<T>(
     });
     return await Promise.race([read(), timeout]);
   } catch {
-    return onTimeout;
+    return onError;
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
@@ -187,6 +188,98 @@ export async function probeFetchJson<T>(
   if (!res) return undefined;
   if (!res.ok) return undefined;
   return readJson<T>(res, options?.timeoutMs ?? 2000);
+}
+
+/**
+ * Outcome of {@link fetchOutcome}: a successful response; a non-success
+ * status, whose body is already cancelled; the request's own timer fired;
+ * the request failed without a response (refused connection, DNS, TLS); or
+ * the caller's signal aborted it.
+ */
+export type FetchOutcome =
+  | { readonly type: "ok"; readonly response: Response }
+  | {
+      readonly type: "status";
+      readonly status: number;
+      readonly headers: Headers | undefined;
+    }
+  | { readonly type: "timeout" }
+  | { readonly type: "network" }
+  | { readonly type: "aborted" };
+
+/**
+ * {@link probeFetch} with a typed outcome instead of `undefined`, so a
+ * caller can tell a timeout from an unreachable server. The timeout covers
+ * only the connection and headers phase: it is cleared once headers
+ * arrive, so a stalled body is bounded and reported by the body-read timer
+ * of {@link readJsonOutcome} (or `readJson`), which can abort the fetch.
+ */
+export async function fetchOutcome(
+  url: string,
+  options?: ProbeFetchOptions,
+): Promise<FetchOutcome> {
+  const controller = new AbortController();
+  const headerPhase = new AbortController();
+  const timer = setTimeout(() => {
+    headerPhase.abort(new DOMException("timed out", "TimeoutError"));
+  }, options?.timeoutMs ?? 2000);
+  try {
+    const signals: AbortSignal[] = [controller.signal, headerPhase.signal];
+    if (options?.signal) signals.push(options.signal);
+    const res = await fetch(url, {
+      method: options?.method,
+      headers: options?.headers,
+      body: options?.body,
+      signal: AbortSignal.any(signals),
+    });
+    responseAborters.set(res, controller);
+    if (!res.ok) {
+      void res.body?.cancel().catch(() => {});
+      return {
+        type: "status",
+        status: res.status,
+        headers: res.headers instanceof Headers ? res.headers : undefined,
+      };
+    }
+    return { type: "ok", response: res };
+  } catch {
+    if (options?.signal?.aborted) return { type: "aborted" };
+    if (headerPhase.signal.aborted) return { type: "timeout" };
+    return { type: "network" };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Outcome of {@link readJsonOutcome}: the parsed value, the body-read timer
+ * fired, or the body could not be read or parsed.
+ */
+export type JsonOutcome =
+  | { readonly type: "ok"; readonly value: unknown }
+  | { readonly type: "timeout" }
+  | { readonly type: "invalid" };
+
+/**
+ * {@link readJson} with a typed outcome: a fired body-read timeout is
+ * `timeout`, and an empty, malformed, or failed body is `invalid`. The
+ * timeout aborts the fetch the same way.
+ */
+export async function readJsonOutcome(
+  res: Response,
+  timeoutMs = 2000,
+): Promise<JsonOutcome> {
+  const read =
+    typeof res.json === "function"
+      ? async (): Promise<unknown> => res.json()
+      : async (): Promise<unknown> => JSON.parse(await res.text());
+  return raceBody<JsonOutcome>(
+    res,
+    async () => ({ type: "ok", value: await read() }),
+    timeoutMs,
+    { type: "timeout" },
+    { type: "invalid" },
+  );
 }
 
 /** Frozen empty probe result — shared constant for early returns. */

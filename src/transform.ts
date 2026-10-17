@@ -17,7 +17,7 @@
  * host can abandon a candidate and restart the fold.
  */
 import type { Plugin } from "@opencode/plugin";
-import { addActualyzeProvider } from "./actualyze";
+import { addActualyzeProvider, type ActualyzeAddition } from "./actualyze";
 import {
   NEVER_PROBED_PROVIDER_IDS,
   OPENAI_COMPATIBLE_PACKAGES,
@@ -156,10 +156,20 @@ export interface TransformState {
   readonly active: Map<string, Binding>;
   /** Replaced on every model fold. */
   view: ReadonlyMap<string, FoldView>;
+  /**
+   * What the latest provider fold did with the built-in Actualyze provider;
+   * undefined before the first fold.
+   */
+  actualyze: ActualyzeAddition | undefined;
 }
 
 export function createTransformState(): TransformState {
-  return { recorded: undefined, active: new Map(), view: new Map() };
+  return {
+    recorded: undefined,
+    active: new Map(),
+    view: new Map(),
+    actualyze: undefined,
+  };
 }
 
 /**
@@ -183,8 +193,9 @@ export function servedBinding(
 
 /**
  * Record the provider IDs present before this transform, then add the
- * built-in Actualyze provider. Recording comes first so the added provider
- * never counts as pre-existing; it is a target through `settings.probe`.
+ * built-in Actualyze provider and record whether it was added. Recording
+ * comes first so the added provider never counts as pre-existing; it is a
+ * target through `settings.probe`.
  */
 export function createProviderTransform(
   state: TransformState,
@@ -197,7 +208,7 @@ export function createProviderTransform(
     } catch {
       state.recorded = undefined;
     }
-    addActualyzeProvider(editor);
+    state.actualyze = addActualyzeProvider(editor);
   };
 }
 

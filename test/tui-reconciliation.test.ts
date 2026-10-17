@@ -91,6 +91,12 @@ function evidenceProvider(
     probeAttempt: "complete",
     skippedModelIds: [],
     models: [evidenceModel()],
+    discovering: false,
+    lastAttemptAt: "2026-10-11T08:00:00.000Z",
+    nextRefreshAt: null,
+    credentialSource: "connection",
+    credentialEpoch: 0,
+    resultEpoch: 0,
     ...overrides,
   };
 }
@@ -101,8 +107,11 @@ function catalog(
   return {
     schemaVersion: CATALOG_SCHEMA_VERSION,
     packageVersion: "2.0.0",
+    instanceID: "instance",
+    generatedAt: "2026-10-11T08:00:00.000Z",
     status: "complete",
     completedAt: "2026-10-11T08:00:00.000Z",
+    builtIn: { actualyze: "managed" },
     providers,
   };
 }
@@ -409,7 +418,10 @@ describe("provider grouping with evidence", () => {
     const starting: CatalogPayload = {
       schemaVersion: CATALOG_SCHEMA_VERSION,
       packageVersion: "2.0.0",
+      instanceID: "instance",
+      generatedAt: "2026-10-11T08:00:00.000Z",
       status: "pending",
+      builtIn: { actualyze: "managed" },
       providers: [],
     };
     const [group] = collectModelGroups(

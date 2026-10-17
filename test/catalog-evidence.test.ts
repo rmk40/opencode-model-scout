@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CATALOG_SCHEMA_VERSION,
+  failureKindForStatus,
   hasSafeObjectKeys,
   knownScalar,
   sanitizeEndpointOrigin,
@@ -88,6 +89,12 @@ function provider(id = "actualyze-dev"): CatalogProviderRecord {
     probeAttempt: "complete",
     skippedModelIds: ["declared-model"],
     models: [model()],
+    discovering: false,
+    lastAttemptAt: AT,
+    nextRefreshAt: null,
+    credentialSource: "connection",
+    credentialEpoch: 0,
+    resultEpoch: 0,
   };
 }
 
@@ -95,15 +102,18 @@ function payload(): CatalogPayload {
   return {
     schemaVersion: CATALOG_SCHEMA_VERSION,
     packageVersion: "2.0.0",
+    instanceID: "instance",
+    generatedAt: LATER,
     status: "complete",
     startedAt: AT,
     completedAt: LATER,
+    builtIn: { actualyze: "managed" },
     providers: [provider()],
   };
 }
 
 describe("validateCatalogPayload", () => {
-  it("accepts a complete v4 payload and returns it unchanged", () => {
+  it("accepts a complete v5 payload and returns it unchanged", () => {
     const value = payload();
     expect(validateCatalogPayload(value)).toBe(value);
   });
@@ -127,7 +137,7 @@ describe("validateCatalogPayload", () => {
 
   it("rejects another schema version", () => {
     expect(
-      validateCatalogPayload({ ...payload(), schemaVersion: 3 }),
+      validateCatalogPayload({ ...payload(), schemaVersion: 4 }),
     ).toBeUndefined();
   });
 
@@ -362,6 +372,193 @@ describe("validateCatalogPayload", () => {
     const skipped = payload();
     skipped.providers[0].skippedModelIds.push("declared-model");
     expect(validateCatalogPayload(skipped)).toBeUndefined();
+  });
+});
+
+describe("failureKindForStatus", () => {
+  it.each([
+    [401, "unauthorized"],
+    [402, "payment-required"],
+    [403, "forbidden"],
+    [404, "not-found"],
+    [429, "rate-limited"],
+    [500, "server-error"],
+    [503, "server-error"],
+    [599, "server-error"],
+    [400, "http-error"],
+    [418, "http-error"],
+    [302, "http-error"],
+    [600, "http-error"],
+  ] as const)("maps HTTP %i to %s", (status, kind) => {
+    expect(failureKindForStatus(status)).toBe(kind);
+  });
+});
+
+describe("validateCatalogPayload v5 fields", () => {
+  const RETRY = "2026-10-11T12:01:00.000Z";
+
+  function unresolved(): CatalogProviderRecord {
+    return {
+      ...provider(),
+      resolvedProbe: unknownScalar(),
+      lastGoodAt: null,
+      failure: null,
+      modelListAttempt: "pending",
+      probeAttempt: "pending",
+      skippedModelIds: [],
+      models: [],
+      discovering: false,
+      lastAttemptAt: null,
+      nextRefreshAt: null,
+      credentialSource: "unresolved",
+      credentialEpoch: 3,
+      resultEpoch: 0,
+    };
+  }
+
+  function withProvider(record: CatalogProviderRecord): CatalogPayload {
+    return { ...payload(), providers: [record] };
+  }
+
+  it.each(["instanceID", "generatedAt", "builtIn"] as const)(
+    "rejects a payload without %s",
+    (key) => {
+      const value = payload();
+      delete (value as Partial<CatalogPayload>)[key];
+      expect(validateCatalogPayload(value)).toBeUndefined();
+    },
+  );
+
+  it.each([
+    "discovering",
+    "lastAttemptAt",
+    "nextRefreshAt",
+    "credentialSource",
+    "credentialEpoch",
+    "resultEpoch",
+  ] as const)("rejects a provider record without %s", (key) => {
+    const record = provider();
+    delete (record as Partial<CatalogProviderRecord>)[key];
+    expect(validateCatalogPayload(withProvider(record))).toBeUndefined();
+  });
+
+  it.each([
+    ["an empty instanceID", { instanceID: "" }],
+    ["a non-canonical generatedAt", { generatedAt: "2026-10-11" }],
+    ["an unknown builtIn state", { builtIn: { actualyze: "hidden" } }],
+    [
+      "an extra builtIn key",
+      { builtIn: { actualyze: "managed", other: "managed" } },
+    ],
+  ])("rejects %s", (_label, change) => {
+    expect(
+      validateCatalogPayload({ ...payload(), ...change } as unknown),
+    ).toBeUndefined();
+  });
+
+  it("accepts a foreign built-in provider", () => {
+    expect(
+      validateCatalogPayload({
+        ...payload(),
+        builtIn: { actualyze: "foreign" },
+      }),
+    ).toBeDefined();
+  });
+
+  it.each([
+    ["an unknown credential source", { credentialSource: "env" }],
+    ["a string discovering flag", { discovering: "true" }],
+    ["a negative credentialEpoch", { credentialEpoch: -1 }],
+    ["a fractional credentialEpoch", { credentialEpoch: 1.5 }],
+    ["a resultEpoch above credentialEpoch", { resultEpoch: 1 }],
+    ["a non-canonical nextRefreshAt", { nextRefreshAt: "soon" }],
+    ["a non-canonical lastAttemptAt", { lastAttemptAt: 0 }],
+  ])("rejects a provider record with %s", (_label, change) => {
+    const record = { ...provider(), ...change } as CatalogProviderRecord;
+    expect(validateCatalogPayload(withProvider(record))).toBeUndefined();
+  });
+
+  it("accepts a record with no result yet and a pending refresh time", () => {
+    const record: CatalogProviderRecord = {
+      ...provider(),
+      discovering: true,
+      nextRefreshAt: RETRY,
+      credentialEpoch: 2,
+      resultEpoch: null,
+    };
+    expect(validateCatalogPayload(withProvider(record))).toBeDefined();
+  });
+
+  it("accepts an unresolved record that carries status fields only", () => {
+    expect(validateCatalogPayload(withProvider(unresolved()))).toBeDefined();
+  });
+
+  it.each([
+    ["models", { models: [model()] }],
+    ["skipped IDs", { skippedModelIds: ["declared-model"] }],
+    ["a last good inventory", { lastGoodAt: AT }],
+    ["a failure", { failure: { kind: "unreachable", at: AT } }],
+    ["a running job", { discovering: true }],
+    ["an attempt time", { lastAttemptAt: AT }],
+    ["a next refresh time", { nextRefreshAt: RETRY }],
+  ])("rejects an unresolved record with %s", (_label, change) => {
+    const record = { ...unresolved(), ...change } as CatalogProviderRecord;
+    expect(validateCatalogPayload(withProvider(record))).toBeUndefined();
+  });
+
+  describe("failures", () => {
+    function withFailure(failure: unknown): CatalogPayload {
+      return withProvider({
+        ...provider(),
+        failure: failure as CatalogProviderRecord["failure"],
+      });
+    }
+
+    it.each([
+      [
+        "an HTTP kind with its status",
+        { kind: "unauthorized", httpStatus: 401 },
+      ],
+      ["a 1xx http-error", { kind: "http-error", httpStatus: 101 }],
+      [
+        "a rate limit with a retry time",
+        { kind: "rate-limited", httpStatus: 429, retryAt: RETRY },
+      ],
+      [
+        "a server error with a retry time",
+        { kind: "server-error", httpStatus: 503, retryAt: RETRY },
+      ],
+      ["a non-HTTP kind without a status", { kind: "timeout" }],
+    ])("accepts %s", (_label, failure) => {
+      expect(
+        validateCatalogPayload(withFailure({ ...failure, at: AT })),
+      ).toBeDefined();
+    });
+
+    it.each([
+      ["the retired credential kind", { kind: "credential" }],
+      ["an HTTP kind without a status", { kind: "forbidden" }],
+      [
+        "a status that belongs to another kind",
+        { kind: "unauthorized", httpStatus: 403 },
+      ],
+      ["a success status", { kind: "http-error", httpStatus: 200 }],
+      ["a status out of range", { kind: "http-error", httpStatus: 600 }],
+      ["a fractional status", { kind: "http-error", httpStatus: 400.5 }],
+      ["a non-HTTP kind with a status", { kind: "timeout", httpStatus: 504 }],
+      [
+        "a retry time without a status",
+        { kind: "unreachable", retryAt: RETRY },
+      ],
+      [
+        "a non-canonical retry time",
+        { kind: "rate-limited", httpStatus: 429, retryAt: "in 5s" },
+      ],
+    ])("rejects %s", (_label, failure) => {
+      expect(
+        validateCatalogPayload(withFailure({ ...failure, at: AT })),
+      ).toBeUndefined();
+    });
   });
 });
 

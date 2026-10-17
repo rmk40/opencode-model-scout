@@ -11,19 +11,30 @@
  * instance's location; `credential.switched` is published without one.
  * A reload publishes only `model.updated`, which is not a trigger, so a
  * reload cannot trigger itself.
+ *
+ * Catalog records are kept per provider ID in a map that outlives each
+ * sync's resolved targets, so an eligible provider keeps its record through
+ * a credential switch and a failed credential lookup. Serving still goes
+ * only through the active binding of a resolved target.
  */
+import { randomUUID } from "node:crypto";
 import {
   CATALOG_SCHEMA_VERSION,
   MAX_MODELS_PER_PROVIDER,
   isBoundedString,
+  isProviderFailure,
   knownScalar,
   sanitizeEndpointOrigin,
   unknownScalar,
   validateCatalogPayload,
+  type BuiltInState,
   type CatalogModelRecord,
   type CatalogPayload,
   type CatalogProviderRecord,
+  type CredentialSource,
+  type ProviderFailure,
 } from "./catalog-evidence";
+import { ACTUALYZE_PROBE_ID, ACTUALYZE_PROVIDER_ID } from "./constants";
 import {
   discoverProvider,
   normalizeBaseURL,
@@ -40,6 +51,7 @@ import type { RefreshOutput } from "./rpc";
 import {
   credentialKeys,
   fingerprint,
+  MIN_REFRESH_INTERVAL_MS,
   type Binding,
   type CredentialFingerprint,
   type DiscoveryStore,
@@ -142,6 +154,8 @@ export interface RefresherHost {
   reload(): Promise<void>;
   events(signal: AbortSignal): AsyncIterable<HostEvent>;
   emitUpdated(completedAt: string): Promise<void>;
+  /** Publish the RPC `status` event. */
+  emitStatus(at: string): Promise<void>;
   persist(key: string, value: PersistedBinding): Promise<void>;
 }
 
@@ -179,6 +193,90 @@ interface TargetState extends EligibleTarget {
   readonly credential: CredentialFingerprint;
   /** The key used for discovery: the integration key or `settings.apiKey`. */
   readonly discoveryKey?: string;
+}
+
+/** Record identity of a target whose credential is not resolved. */
+const UNRESOLVED = "unresolved";
+
+/** Catalog record state of one provider ID. */
+interface RecordState {
+  /** The provider as the latest sync that found it eligible saw it. */
+  target: EligibleTarget;
+  /** Eligible in the latest sync, so listed in the catalog. */
+  present: boolean;
+  /**
+   * {@link credentialIdentity} of the current resolution, {@link UNRESOLVED},
+   * or undefined before the first sync that saw the provider.
+   */
+  identity: string | undefined;
+  credentialEpoch: number;
+  resultEpoch: number | null;
+}
+
+/**
+ * The identity whose change increments a record's `credentialEpoch`: the
+ * endpoint key, which covers `settings.apiKey` and provider headers, plus
+ * the resolved credential fingerprint. The probe selection is left out,
+ * because a probe-only edit keeps serving the active binding.
+ */
+function credentialIdentity(target: TargetState): string {
+  return `${target.keys.endpointKey}\n${target.credential}`;
+}
+
+/** Headers that replace the discovery key, by probe (lowercase names). */
+const ACTUALYZE_KEY_HEADERS: ReadonlySet<string> = new Set([
+  "authorization",
+  "x-actualyze-api-key",
+]);
+const KEY_HEADERS: ReadonlySet<string> = new Set([
+  "authorization",
+  "x-api-key",
+]);
+
+/**
+ * Provider headers carry a header that replaces the key for the target's
+ * probe. Actualyze's `/openai/v1` mount ignores `x-api-key`, so for that
+ * probe only `authorization` and `x-actualyze-api-key` count.
+ */
+function headersReplaceKey(
+  target: EligibleTarget,
+  resolvedProbe: string | undefined,
+): boolean {
+  if (!target.headers) return false;
+  const actualyze =
+    canonicalProbeKey(target.probe) === ACTUALYZE_PROBE_ID ||
+    resolvedProbe === ACTUALYZE_PROBE_ID;
+  const names = actualyze ? ACTUALYZE_KEY_HEADERS : KEY_HEADERS;
+  return Object.keys(target.headers).some((name) =>
+    names.has(name.toLowerCase()),
+  );
+}
+
+function credentialSource(
+  target: TargetState,
+  resolvedProbe: string | undefined,
+): CredentialSource {
+  if (headersReplaceKey(target, resolvedProbe)) return "headers";
+  if (target.credential === "settings") return "settings";
+  if (target.credential === "none") return "none";
+  return "connection";
+}
+
+/**
+ * The RPC copy of a store failure. One whose `httpStatus` is missing for an
+ * HTTP kind, or does not match its kind, is reported as `error`, so the
+ * record still passes the evidence validator instead of being dropped from
+ * the payload.
+ */
+function toFailure(failure: ProviderFailure): ProviderFailure {
+  const { kind, at, httpStatus, retryAt } = failure;
+  const copy: ProviderFailure = {
+    kind,
+    at,
+    ...(httpStatus === undefined ? {} : { httpStatus }),
+    ...(retryAt === undefined ? {} : { retryAt }),
+  };
+  return isProviderFailure(copy) ? copy : { kind: "error", at };
 }
 
 // ── Persistence ─────────────────────────────────────────────────────────
@@ -402,13 +500,63 @@ export function createRefresher(deps: RefresherDeps): Refresher {
    */
   const switchedAt = new Map<string | undefined, number>();
 
+  /**
+   * Record state per provider ID. Entries are never removed, so a provider
+   * that leaves and returns keeps counting its `credentialEpoch` upward.
+   */
+  const records = new Map<string, RecordState>();
+  const instanceID = randomUUID();
+  let statusQueued = false;
+
   const lastSwitch = (integrationID: string): number =>
     Math.max(
       switchedAt.get(integrationID) ?? 0,
       switchedAt.get(undefined) ?? 0,
     );
 
-  const iso = (): string => new Date(now()).toISOString();
+  const iso = (at: number = now()): string => new Date(at).toISOString();
+
+  /** Publish one `status` event for every change made in this turn. */
+  const queueStatus = (): void => {
+    if (disposed || statusQueued) return;
+    statusQueued = true;
+    queueMicrotask(() => {
+      statusQueued = false;
+      if (disposed) return;
+      void Promise.resolve()
+        .then(() => host.emitStatus(iso()))
+        .catch(() => {});
+    });
+  };
+
+  /**
+   * Set a record's credential identity. Any change after the first
+   * increments `credentialEpoch`; `resultEpoch` keeps its value, so the
+   * record is not current until its new store key holds a result.
+   */
+  const setIdentity = (record: RecordState, identity: string): void => {
+    if (record.identity === identity) return;
+    const first = record.identity === undefined;
+    record.identity = identity;
+    if (first) return;
+    record.credentialEpoch += 1;
+    queueStatus();
+  };
+
+  /**
+   * Mark the record's result as belonging to the current epoch when the
+   * target's current store key has no running job and holds a binding or a
+   * failure, whichever job or stored binding produced it. A store key
+   * encodes one credential, so that result belongs to the current epoch.
+   */
+  const settleResult = (record: RecordState): void => {
+    if (record.identity === undefined || record.identity === UNRESOLVED) return;
+    const target = targets.get(record.target.providerID);
+    if (!target) return;
+    const entry = store.state(target.keys.key);
+    if (entry && !entry.running && (entry.binding || entry.failure))
+      record.resultEpoch = record.credentialEpoch;
+  };
 
   const running = (): boolean =>
     [...targets.values()].some(
@@ -518,12 +666,18 @@ export function createRefresher(deps: RefresherDeps): Refresher {
       cycleCompletedAt = startedAt;
   };
 
+  /**
+   * Announce a settled job: `updated` and `status` after the reload, when
+   * the binding needs one, so the payload's model evidence comes from a
+   * fold that has seen it.
+   */
   const announce = (afterReload: boolean): void => {
     const done = afterReload ? reload() : Promise.resolve();
     void done.then(() => {
       if (disposed) return;
       markCompleted();
       emitCatalog();
+      queueStatus();
     });
   };
 
@@ -536,13 +690,24 @@ export function createRefresher(deps: RefresherDeps): Refresher {
         (target) => target.keys.key === key,
       );
       if (affected.length === 0) return;
+      // A job started on this key, here or in another location sharing it:
+      // `discovering`, `lastAttemptAt`, and `nextRefreshAt` changed.
+      if (update === "started") {
+        queueStatus();
+        return;
+      }
       if (update === "invalidated") {
         for (const [providerID, binding] of state.active) {
           if (binding.key === key) state.active.delete(providerID);
         }
         void reload();
         trigger();
+        queueStatus();
         return;
+      }
+      for (const target of affected) {
+        const record = records.get(target.providerID);
+        if (record) settleResult(record);
       }
       if (update === "binding") {
         const binding = store.served(key);
@@ -576,7 +741,10 @@ export function createRefresher(deps: RefresherDeps): Refresher {
       timeoutMs: options.timeoutMs,
       run: (signal) => discover(discoveryTarget, signal),
     });
-    if (result !== "throttled" && !wasRunning) startedAt = iso();
+    if (result !== "throttled") {
+      if (!wasRunning) startedAt = iso();
+      queueStatus();
+    }
     return result;
   };
 
@@ -677,6 +845,30 @@ export function createRefresher(deps: RefresherDeps): Refresher {
       store.subscribe(target.keys.key, subscriber);
     targets = next;
 
+    // Every eligible provider keeps a record; one left out of `next` has no
+    // resolution this sync and is `unresolved`.
+    const eligibleIDs = new Set<string>();
+    for (const target of eligible) {
+      eligibleIDs.add(target.providerID);
+      let record = records.get(target.providerID);
+      if (!record) {
+        record = {
+          target,
+          present: true,
+          identity: undefined,
+          credentialEpoch: 0,
+          resultEpoch: null,
+        };
+        records.set(target.providerID, record);
+      }
+      record.target = target;
+      record.present = true;
+      const current = next.get(target.providerID);
+      setIdentity(record, current ? credentialIdentity(current) : UNRESOLVED);
+    }
+    for (const record of records.values())
+      if (!eligibleIDs.has(record.target.providerID)) record.present = false;
+
     let changed = false;
     for (const target of next.values()) {
       const key = target.keys.key;
@@ -706,6 +898,8 @@ export function createRefresher(deps: RefresherDeps): Refresher {
             options.refreshIntervalMs);
       if (stale) startJob(target);
     }
+    for (const record of records.values())
+      if (record.present) settleResult(record);
     resolvedAt ??= iso();
     if (changed) void reload();
     // Announced after any reload in flight, so the payload's model evidence
@@ -751,9 +945,11 @@ export function createRefresher(deps: RefresherDeps): Refresher {
       // precedence over both. Revoking it and leaving its store key means
       // the target serves nothing until a sync resolves the current
       // connection, and a failed lookup has no integration resolution to
-      // fall back to. Store entries stay: each is keyed by the credential
-      // that produced it, other locations may still use that credential,
-      // and a job is aborted only when its last subscriber leaves.
+      // fall back to. The target's record stays, `unresolved` and with a
+      // new epoch, until that sync. Store entries stay: each is keyed by
+      // the credential that produced it, other locations may still use
+      // that credential, and a job is aborted only when its last
+      // subscriber leaves.
       // `credential.updated` carries no integration and only triggers a
       // sync; the host also publishes `credential.switched` whenever an
       // integration's active credential changes, including the first one.
@@ -770,6 +966,8 @@ export function createRefresher(deps: RefresherDeps): Refresher {
         targets.delete(target.providerID);
         store.unsubscribe(target.keys.key, subscriber);
         dropped = state.active.delete(target.providerID) || dropped;
+        const record = records.get(target.providerID);
+        if (record) setIdentity(record, UNRESOLVED);
       }
       // The reload drops the old account's models now. The catalog event
       // waits for the follow-up sync, so the TUI never sees the revoked
@@ -820,9 +1018,80 @@ export function createRefresher(deps: RefresherDeps): Refresher {
     return accepted ? { accepted } : { accepted, reason: "throttled" };
   };
 
-  const providerRecord = (target: TargetState): CatalogProviderRecord => {
+  /**
+   * A record that carries status fields only: no result, no models. Used
+   * for an `unresolved` target and for a target whose credential changed
+   * and whose new store key has no result yet, so nothing from the
+   * previous credential appears under the new one.
+   */
+  const statusRecord = (
+    target: EligibleTarget,
+    record: RecordState,
+    status: Pick<
+      CatalogProviderRecord,
+      "discovering" | "lastAttemptAt" | "nextRefreshAt" | "credentialSource"
+    >,
+  ): CatalogProviderRecord => {
+    const origin = sanitizeEndpointOrigin(normalizeBaseURL(target.baseURL));
+    return {
+      id: target.providerID,
+      endpointOrigin: origin
+        ? knownScalar(origin, "pre-existing", "configured")
+        : unknownScalar(),
+      configuredProbe:
+        target.probe && isBoundedString(target.probe)
+          ? knownScalar(target.probe, "pre-existing", "configured")
+          : unknownScalar(),
+      resolvedProbe: unknownScalar(),
+      lastGoodAt: null,
+      failure: null,
+      modelListAttempt: "pending",
+      probeAttempt: target.probe ? "pending" : "not-requested",
+      skippedModelIds: [],
+      models: [],
+      ...status,
+      credentialEpoch: record.credentialEpoch,
+      resultEpoch: record.resultEpoch,
+    };
+  };
+
+  const providerRecord = (record: RecordState): CatalogProviderRecord => {
+    settleResult(record);
+    const target =
+      record.identity === UNRESOLVED
+        ? undefined
+        : targets.get(record.target.providerID);
+    if (!target)
+      return statusRecord(record.target, record, {
+        discovering: false,
+        lastAttemptAt: null,
+        nextRefreshAt: null,
+        credentialSource: "unresolved",
+      });
     const entry = store.state(target.keys.key);
     const binding = servedBinding(target, state);
+    const lastStartedAt = entry?.lastStartedAt;
+    const nextAt = Math.max(
+      lastStartedAt === undefined
+        ? Number.NEGATIVE_INFINITY
+        : lastStartedAt + MIN_REFRESH_INTERVAL_MS,
+      entry?.retryAt ?? Number.NEGATIVE_INFINITY,
+    );
+    const status = {
+      discovering: entry?.running === true,
+      lastAttemptAt: lastStartedAt === undefined ? null : iso(lastStartedAt),
+      nextRefreshAt:
+        Number.isFinite(nextAt) && nextAt > now() ? iso(nextAt) : null,
+      credentialSource: credentialSource(
+        target,
+        binding?.inventory.resolvedProbe,
+      ),
+    };
+    if (
+      record.credentialEpoch > 0 &&
+      record.resultEpoch !== record.credentialEpoch
+    )
+      return statusRecord(target, record, status);
     const view = state.view.get(target.providerID);
     const inventory = binding?.inventory;
     const declared = view?.declared ?? new Set<string>();
@@ -842,10 +1111,11 @@ export function createRefresher(deps: RefresherDeps): Refresher {
         models.push(model.evidence);
     }
     const origin = sanitizeEndpointOrigin(normalizeBaseURL(target.baseURL));
-    const failure = entry?.failure
-      ? { kind: entry.failure.kind, at: entry.failure.at }
-      : view?.failed
-        ? { kind: "error" as const, at: inventory?.completedAt ?? iso() }
+    // A mapping failure counts only for the inventory the fold mapped.
+    const failure: ProviderFailure | null = entry?.failure
+      ? toFailure(entry.failure)
+      : view?.failed && inventory !== undefined && view.inventory === inventory
+        ? { kind: "error", at: inventory.completedAt }
         : null;
     return {
       id: target.providerID,
@@ -871,20 +1141,47 @@ export function createRefresher(deps: RefresherDeps): Refresher {
         (id) => served.has(id) && isBoundedString(id),
       ),
       models,
+      ...status,
+      credentialEpoch: record.credentialEpoch,
+      resultEpoch: record.resultEpoch,
     };
+  };
+
+  /**
+   * `foreign` when an `actualyze` provider existed before scout's provider
+   * transform and is not a discovery target. A failed addition, or no fold
+   * yet, gives no evidence that another source defines the provider, so it
+   * reports `managed` rather than telling the user to configure someone
+   * else's provider.
+   */
+  const builtInActualyze = (): BuiltInState => {
+    switch (state.actualyze) {
+      case "existing":
+        return records.get(ACTUALYZE_PROVIDER_ID)?.present === true
+          ? "managed"
+          : "foreign";
+      case "added":
+      case "failed":
+      case undefined:
+        return "managed";
+    }
   };
 
   const catalog = (): CatalogPayload => {
     const base = {
       schemaVersion: CATALOG_SCHEMA_VERSION,
       packageVersion: deps.packageVersion,
+      instanceID,
+      generatedAt: iso(),
       ...catalogTimes(),
+      builtIn: { actualyze: builtInActualyze() },
     };
     const providers: CatalogProviderRecord[] = [];
-    for (const target of targets.values()) {
+    for (const recordState of records.values()) {
+      if (!recordState.present) continue;
       let record: CatalogProviderRecord;
       try {
-        record = providerRecord(target);
+        record = providerRecord(recordState);
       } catch {
         continue;
       }

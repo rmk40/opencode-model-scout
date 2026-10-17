@@ -17,7 +17,7 @@ import type {
   ProbeModelCost,
   ProbeModelMeta,
 } from "./probes/index";
-import { buildHeaders, probeFetch, readJson } from "./probes/util";
+import { buildHeaders, fetchOutcome, readJsonOutcome } from "./probes/util";
 import { extractModelOwner, formatModelName } from "./format";
 import {
   findModelsDevMatch,
@@ -26,6 +26,7 @@ import {
 } from "./models-dev-index";
 import {
   INPUT_MODALITIES,
+  failureKindForStatus,
   knownScalar,
   sanitizeEndpointOrigin,
   unknownCapability,
@@ -97,12 +98,77 @@ export type DiscoveryResult =
       readonly ok: false;
       readonly failure: ProviderFailureKind;
       readonly modelListAttempt: ModelListAttempt;
+      /** HTTP status of the model list, for the HTTP failure kinds. */
+      readonly httpStatus?: number;
+      /** Epoch milliseconds before which discovery should not retry. */
+      readonly retryAt?: number;
     };
 
 interface FetchModelsResult {
   readonly models: OpenAIModelEntry[];
   readonly attempt: ModelListAttempt;
-  readonly status?: number;
+  /** Set for a failed attempt other than a caller abort. */
+  readonly failure?: ProviderFailureKind;
+  readonly httpStatus?: number;
+  readonly retryAt?: number;
+}
+
+/** Longest delay a server's retry hint can impose. */
+export const MAX_RETRY_DELAY_MS = 3_600_000;
+
+/** Epoch seconds below this are read as a delay in seconds, not a time. */
+const EPOCH_SECONDS_FLOOR = 1_000_000_000;
+const EPOCH_MILLISECONDS_FLOOR = 1_000_000_000_000;
+
+function parseRetryAfter(value: string, now: number): number | undefined {
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return now + Number(trimmed) * 1000;
+  const date = Date.parse(trimmed);
+  return Number.isFinite(date) ? date : undefined;
+}
+
+/**
+ * `X-RateLimit-Reset` is sent as epoch seconds, epoch milliseconds, or
+ * seconds until the reset, depending on the server.
+ */
+function parseRateLimitReset(value: string, now: number): number | undefined {
+  const trimmed = value.trim();
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return undefined;
+  const number = Number(trimmed);
+  if (!Number.isFinite(number)) return undefined;
+  if (number >= EPOCH_MILLISECONDS_FLOOR) return number;
+  if (number >= EPOCH_SECONDS_FLOOR) return number * 1000;
+  return now + number * 1000;
+}
+
+/**
+ * When a failed model-list request may be retried: `Retry-After` (seconds
+ * or an HTTP date) on a 429 or 503, else `X-RateLimit-Reset` on a 429,
+ * clamped to `[now, now + MAX_RETRY_DELAY_MS]`. Undefined for any other
+ * status or when neither header parses.
+ */
+export function retryAtFromHeaders(
+  status: number,
+  headers: { get(name: string): string | null } | undefined,
+  now: number,
+): number | undefined {
+  if (status !== 429 && status !== 503) return undefined;
+  const read = (name: string): string | undefined => {
+    try {
+      return headers?.get(name) ?? undefined;
+    } catch {
+      return undefined;
+    }
+  };
+  const retryAfter = read("retry-after");
+  let at =
+    retryAfter === undefined ? undefined : parseRetryAfter(retryAfter, now);
+  if (at === undefined && status === 429) {
+    const reset = read("x-ratelimit-reset");
+    if (reset !== undefined) at = parseRateLimitReset(reset, now);
+  }
+  if (at === undefined) return undefined;
+  return Math.min(now + MAX_RETRY_DELAY_MS, Math.max(now, at));
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -127,47 +193,68 @@ function abortKind(signal: AbortSignal | undefined): ProviderFailureKind {
     : "aborted";
 }
 
+/**
+ * Fetch the model list. A fired list timer (headers or body) is a `timeout`
+ * failure with the `aborted` list attempt, the same attempt a job-budget
+ * timeout records; a caller abort leaves `failure` unset for the caller to
+ * classify from its signal.
+ */
 async function fetchModels(
   baseURL: string,
   headers: Record<string, string>,
   signal?: AbortSignal,
 ): Promise<FetchModelsResult> {
   const aborted = (): FetchModelsResult => ({ models: [], attempt: "aborted" });
+  const timedOut = (): FetchModelsResult => ({
+    models: [],
+    attempt: "aborted",
+    failure: "timeout",
+  });
   try {
-    const res = await probeFetch(`${baseURL}/v1/models`, {
+    const outcome = await fetchOutcome(`${baseURL}/v1/models`, {
       headers,
       signal,
       timeoutMs: LIST_TIMEOUT_MS,
     });
-    if (signal?.aborted) return aborted();
-    if (!res) return { models: [], attempt: "unreachable" };
-    if (!res.ok) {
-      void res.body?.cancel().catch(() => {});
-      return { models: [], attempt: "http-error", status: res.status };
+    if (signal?.aborted || outcome.type === "aborted") return aborted();
+    switch (outcome.type) {
+      case "timeout":
+        return timedOut();
+      case "network":
+        return { models: [], attempt: "unreachable", failure: "unreachable" };
+      case "status": {
+        const retryAt = retryAtFromHeaders(
+          outcome.status,
+          outcome.headers,
+          Date.now(),
+        );
+        return {
+          models: [],
+          attempt: "http-error",
+          failure: failureKindForStatus(outcome.status),
+          httpStatus: outcome.status,
+          ...(retryAt === undefined ? {} : { retryAt }),
+        };
+      }
+      case "ok":
+        break;
     }
-    const data = await readJson<{ data?: unknown }>(res, LIST_TIMEOUT_MS);
+    const body = await readJsonOutcome(outcome.response, LIST_TIMEOUT_MS);
     if (signal?.aborted) return aborted();
-    if (!data || !Array.isArray(data.data))
-      return { models: [], attempt: "invalid-response" };
+    if (body.type === "timeout") return timedOut();
+    const data = body.type === "ok" ? body.value : undefined;
+    if (!isRecord(data) || !Array.isArray(data.data))
+      return {
+        models: [],
+        attempt: "invalid-response",
+        failure: "invalid-response",
+      };
     const models = data.data.filter(isOpenAIModelEntry);
     return { models, attempt: models.length > 0 ? "ready" : "empty" };
   } catch {
-    return signal?.aborted ? aborted() : { models: [], attempt: "error" };
-  }
-}
-
-function listFailure(result: FetchModelsResult): ProviderFailureKind {
-  switch (result.attempt) {
-    case "http-error":
-      return result.status === 401 || result.status === 403
-        ? "credential"
-        : "http-error";
-    case "unreachable":
-    case "invalid-response":
-    case "aborted":
-      return result.attempt;
-    default:
-      return "error";
+    return signal?.aborted
+      ? aborted()
+      : { models: [], attempt: "error", failure: "error" };
   }
 }
 
@@ -258,11 +345,12 @@ export async function discoverProvider(
     if (fetched.attempt !== "ready" && fetched.attempt !== "empty") {
       return {
         ok: false,
-        failure:
-          fetched.attempt === "aborted"
-            ? abortKind(signal)
-            : listFailure(fetched),
+        failure: fetched.failure ?? abortKind(signal),
         modelListAttempt: fetched.attempt,
+        ...(fetched.httpStatus === undefined
+          ? {}
+          : { httpStatus: fetched.httpStatus }),
+        ...(fetched.retryAt === undefined ? {} : { retryAt: fetched.retryAt }),
       };
     }
 

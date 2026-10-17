@@ -21,8 +21,13 @@ import { createHash } from "node:crypto";
 import type { ModelListAttempt, ProviderFailure } from "./catalog-evidence";
 import type { DiscoveryResult, ProviderInventory } from "./discover";
 
+/**
+ * The version changes whenever the store's entry shape or semantics change,
+ * so a store that an older build of the plugin left on `globalThis` in the
+ * same process is never reused with its closures.
+ */
 export const STORE_SYMBOL = Symbol.for(
-  "opencode-model-scout/discovery-store/v1",
+  "opencode-model-scout/discovery-store/v2",
 );
 
 /** Minimum time between discovery starts for one target. */
@@ -48,7 +53,12 @@ export interface EntryFailure extends ProviderFailure {
   readonly modelListAttempt: ModelListAttempt;
 }
 
-export type StoreUpdate = "binding" | "failure" | "invalidated";
+/**
+ * What changed on an entry: a job started (`started`, sent to every
+ * subscriber, including the one that started it), a job settled with a
+ * binding or a failure, or the entry was invalidated.
+ */
+export type StoreUpdate = "started" | "binding" | "failure" | "invalidated";
 
 export interface Subscriber {
   onUpdate(key: string, update: StoreUpdate): void;
@@ -82,6 +92,8 @@ interface Entry {
   failure: EntryFailure | undefined;
   job: Job | undefined;
   lastStartedAt: number | undefined;
+  /** Epoch milliseconds before which no job starts, from a server retry hint. */
+  retryAt: number | undefined;
   readonly subscribers: Set<Subscriber>;
 }
 
@@ -91,6 +103,7 @@ export interface EntryState {
   readonly failure: EntryFailure | undefined;
   readonly running: boolean;
   readonly lastStartedAt: number | undefined;
+  readonly retryAt: number | undefined;
 }
 
 export interface DiscoveryStore {
@@ -114,10 +127,13 @@ export interface DiscoveryStore {
   invalidate(key: string): void;
   /**
    * Start discovery, or join the in-flight job for the same credential.
-   * Starts are throttled to one per {@link MIN_REFRESH_INTERVAL_MS} per key;
-   * invalidation resets the throttle. A request whose credential differs
-   * from the in-flight job's invalidates the entry first; that is a
-   * defensive path, since a store key maps to one credential fingerprint.
+   * Starts are throttled to one per {@link MIN_REFRESH_INTERVAL_MS} per key,
+   * and none starts before the entry's `retryAt`, which the latest failure
+   * set from the server's retry hint and a success clears. Both are per
+   * key, so per credential. Invalidation resets both. A request whose
+   * credential differs from the in-flight job's invalidates the entry
+   * first; that is a defensive path, since a store key maps to one
+   * credential fingerprint.
    */
   start(key: string, request: StartRequest): StartResult;
   /** Resolves when the key's in-flight job settles. */
@@ -215,6 +231,7 @@ export function createStore(now: () => number = Date.now): DiscoveryStore {
         failure: undefined,
         job: undefined,
         lastStartedAt: undefined,
+        retryAt: undefined,
         subscribers: new Set(),
       };
       entries.set(key, current);
@@ -246,6 +263,7 @@ export function createStore(now: () => number = Date.now): DiscoveryStore {
     current.unverified = undefined;
     current.failure = undefined;
     current.lastStartedAt = undefined;
+    current.retryAt = undefined;
     abortJob(current);
     notify(current, "invalidated");
   };
@@ -271,15 +289,30 @@ export function createStore(now: () => number = Date.now): DiscoveryStore {
       current.binding = binding;
       current.unverified = undefined;
       current.failure = undefined;
+      current.retryAt = undefined;
       const [persister] = current.subscribers;
       if (persister) void persister.persist(binding).catch(() => {});
       notify(current, "binding");
       return;
     }
+    const retryAt =
+      typeof result.retryAt === "number" && Number.isFinite(result.retryAt)
+        ? result.retryAt
+        : undefined;
+    const httpStatus =
+      typeof result.httpStatus === "number" &&
+      Number.isSafeInteger(result.httpStatus)
+        ? result.httpStatus
+        : undefined;
+    current.retryAt = retryAt;
     current.failure = {
       kind: result.failure,
       at: new Date(now()).toISOString(),
       modelListAttempt: result.modelListAttempt,
+      ...(httpStatus === undefined ? {} : { httpStatus }),
+      ...(retryAt === undefined
+        ? {}
+        : { retryAt: new Date(retryAt).toISOString() }),
     };
     notify(current, "failure");
   };
@@ -296,6 +329,7 @@ export function createStore(now: () => number = Date.now): DiscoveryStore {
         failure: current.failure,
         running: current.job !== undefined,
         lastStartedAt: current.lastStartedAt,
+        retryAt: current.retryAt,
       };
     },
 
@@ -340,8 +374,9 @@ export function createStore(now: () => number = Date.now): DiscoveryStore {
         if (current.job.credential === request.credential) return "joined";
         invalidate(key);
       } else if (
-        current.lastStartedAt !== undefined &&
-        now() - current.lastStartedAt < MIN_REFRESH_INTERVAL_MS
+        (current.lastStartedAt !== undefined &&
+          now() - current.lastStartedAt < MIN_REFRESH_INTERVAL_MS) ||
+        (current.retryAt !== undefined && now() < current.retryAt)
       ) {
         return "throttled";
       }
@@ -376,6 +411,7 @@ export function createStore(now: () => number = Date.now): DiscoveryStore {
         promise,
       };
       current.job = created.job;
+      notify(current, "started");
       return "started";
     },
 

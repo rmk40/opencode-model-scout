@@ -5,10 +5,12 @@
  *
  * The payload carries no credentials, provider settings, or process
  * identifiers: endpoints are reduced to credential-free origins, and the host
- * scopes RPC calls by location.
+ * scopes RPC calls by location. The one exception is `instanceID`, a random
+ * value generated per refresher, so a client can tell that the plugin was
+ * reloaded or restarted; it identifies nothing outside that.
  */
 
-export const CATALOG_SCHEMA_VERSION = 4 as const;
+export const CATALOG_SCHEMA_VERSION = 5 as const;
 export const MAX_ID_LENGTH = 4096;
 export const MAX_PROVIDERS = 4096;
 export const MAX_MODELS_PER_PROVIDER = 100_000;
@@ -130,21 +132,69 @@ export type ProbeAttempt =
   | "aborted"
   | "error";
 
+/** Failure kinds that come from an HTTP status; each carries `httpStatus`. */
+export type HttpFailureKind =
+  | "unauthorized"
+  | "forbidden"
+  | "payment-required"
+  | "rate-limited"
+  | "not-found"
+  | "server-error"
+  | "http-error";
+
 export type ProviderFailureKind =
+  | HttpFailureKind
   | "unreachable"
-  | "aborted"
   | "timeout"
-  | "http-error"
+  | "aborted"
   | "invalid-response"
-  | "credential"
   | "error";
+
+/** The failure kind for a non-success HTTP status of the model list. */
+export function failureKindForStatus(status: number): HttpFailureKind {
+  switch (status) {
+    case 401:
+      return "unauthorized";
+    case 402:
+      return "payment-required";
+    case 403:
+      return "forbidden";
+    case 404:
+      return "not-found";
+    case 429:
+      return "rate-limited";
+    default:
+      return status >= 500 && status <= 599 ? "server-error" : "http-error";
+  }
+}
 
 /** The most recent discovery attempt failed; the last good inventory stays. */
 export interface ProviderFailure {
   kind: ProviderFailureKind;
   /** ISO timestamp of the failed attempt. */
   at: string;
+  /** HTTP status of the model list; set exactly for the HTTP kinds. */
+  httpStatus?: number;
+  /**
+   * ISO time before which no discovery starts with this credential, from
+   * `Retry-After` or `X-RateLimit-Reset`, clamped to at most one hour after
+   * the attempt.
+   */
+  retryAt?: string;
 }
+
+/**
+ * What a target discovers with: an integration connection, `settings.apiKey`,
+ * provider headers that replace the key for its probe, no key, or nothing
+ * resolved yet (the credential lookup failed and no earlier resolution is
+ * kept, or a credential switch revoked it).
+ */
+export type CredentialSource =
+  | "connection"
+  | "settings"
+  | "headers"
+  | "none"
+  | "unresolved";
 
 export interface CatalogProviderRecord {
   id: string;
@@ -160,19 +210,55 @@ export interface CatalogProviderRecord {
   probeAttempt: ProbeAttempt;
   skippedModelIds: string[];
   models: CatalogModelRecord[];
+  /** A job for the target's current store key is running. */
+  discovering: boolean;
+  /** ISO start of the latest job for the current store key. */
+  lastAttemptAt: string | null;
+  /**
+   * ISO time before which a refresh is throttled: the later of
+   * `lastAttemptAt` plus one minute and the failure's `retryAt`, or null
+   * once that has passed.
+   */
+  nextRefreshAt: string | null;
+  credentialSource: CredentialSource;
+  /**
+   * Incremented, per provider ID, whenever the target's resolved credential
+   * changes, including a change to `unresolved`. Never decreases while the
+   * same `instanceID` serves the catalog.
+   */
+  credentialEpoch: number;
+  /**
+   * The `credentialEpoch` the record's result belongs to, or null before
+   * any result. The record is current when it equals `credentialEpoch`.
+   */
+  resultEpoch: number | null;
 }
 
 export type CatalogStatus = "pending" | "running" | "complete";
+
+/**
+ * Whether scout manages the `actualyze` provider: `managed` when scout added
+ * it or it is a discovery target, `foreign` when another source defined it
+ * and it is not a target. `foreign` requires positive evidence of another
+ * definition, so it is `managed` too before the first provider fold and
+ * when adding the provider failed.
+ */
+export type BuiltInState = "managed" | "foreign";
 
 /** Output of the RPC `catalog` method. */
 export interface CatalogPayload {
   schemaVersion: typeof CATALOG_SCHEMA_VERSION;
   packageVersion: string;
+  /** Random per server plugin instance; changes on reload or restart. */
+  instanceID: string;
+  /** ISO server time when the payload was built. */
+  generatedAt: string;
   status: CatalogStatus;
   /** Start of the current or latest refresh cycle. Required while running. */
   startedAt?: string;
   /** End of the latest completed cycle. Required when complete. */
   completedAt?: string;
+  builtIn: { actualyze: BuiltInState };
   providers: CatalogProviderRecord[];
 }
 
@@ -495,23 +581,64 @@ const PROBE_ATTEMPTS = new Set<ProbeAttempt>([
   "aborted",
   "error",
 ]);
-const FAILURE_KINDS = new Set<ProviderFailureKind>([
-  "unreachable",
-  "aborted",
-  "timeout",
+const HTTP_FAILURE_KINDS = new Set<ProviderFailureKind>([
+  "unauthorized",
+  "forbidden",
+  "payment-required",
+  "rate-limited",
+  "not-found",
+  "server-error",
   "http-error",
+]);
+const FAILURE_KINDS = new Set<ProviderFailureKind>([
+  ...HTTP_FAILURE_KINDS,
+  "unreachable",
+  "timeout",
+  "aborted",
   "invalid-response",
-  "credential",
   "error",
 ]);
 
-function isProviderFailure(value: unknown): value is ProviderFailure {
+/**
+ * `httpStatus` is present exactly for the HTTP kinds and matches the kind;
+ * `retryAt` only accompanies an HTTP status.
+ */
+export function isProviderFailure(value: unknown): value is ProviderFailure {
+  if (
+    !isPlainRecord(value) ||
+    !hasAllowedKeys(value, ["kind", "at"], ["httpStatus", "retryAt"]) ||
+    !isOneOf(FAILURE_KINDS, value.kind) ||
+    !isTimestamp(value.at) ||
+    (value.retryAt !== undefined && !isTimestamp(value.retryAt))
+  )
+    return false;
+  const status = value.httpStatus;
+  if (status === undefined)
+    return !HTTP_FAILURE_KINDS.has(value.kind) && value.retryAt === undefined;
   return (
-    isPlainRecord(value) &&
-    hasExactKeys(value, ["kind", "at"]) &&
-    isOneOf(FAILURE_KINDS, value.kind) &&
-    isTimestamp(value.at)
+    typeof status === "number" &&
+    Number.isSafeInteger(status) &&
+    status >= 100 &&
+    status <= 599 &&
+    (status < 200 || status >= 300) &&
+    failureKindForStatus(status) === value.kind
   );
+}
+
+const CREDENTIAL_SOURCES = new Set<CredentialSource>([
+  "connection",
+  "settings",
+  "headers",
+  "none",
+  "unresolved",
+]);
+
+function isEpoch(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isNullableTimestamp(value: unknown): value is string | null {
+  return value === null || isTimestamp(value);
 }
 
 const PROVIDER_KEYS = [
@@ -525,12 +652,46 @@ const PROVIDER_KEYS = [
   "probeAttempt",
   "skippedModelIds",
   "models",
+  "discovering",
+  "lastAttemptAt",
+  "nextRefreshAt",
+  "credentialSource",
+  "credentialEpoch",
+  "resultEpoch",
 ] as const;
+
+/**
+ * An `unresolved` record has no credential, so it carries status fields
+ * only: no result, no models, and no job.
+ */
+function isUnresolvedConsistent(value: Record<string, unknown>): boolean {
+  return (
+    value.credentialSource !== "unresolved" ||
+    (value.lastGoodAt === null &&
+      value.failure === null &&
+      Array.isArray(value.models) &&
+      value.models.length === 0 &&
+      Array.isArray(value.skippedModelIds) &&
+      value.skippedModelIds.length === 0 &&
+      value.discovering === false &&
+      value.lastAttemptAt === null &&
+      value.nextRefreshAt === null)
+  );
+}
 
 function isProviderRecord(value: unknown): value is CatalogProviderRecord {
   if (
     !isPlainRecord(value) ||
     !hasExactKeys(value, PROVIDER_KEYS) ||
+    typeof value.discovering !== "boolean" ||
+    !isNullableTimestamp(value.lastAttemptAt) ||
+    !isNullableTimestamp(value.nextRefreshAt) ||
+    !isOneOf(CREDENTIAL_SOURCES, value.credentialSource) ||
+    !isEpoch(value.credentialEpoch) ||
+    !(
+      value.resultEpoch === null ||
+      (isEpoch(value.resultEpoch) && value.resultEpoch <= value.credentialEpoch)
+    ) ||
     !isBoundedString(value.id) ||
     !isScalarEvidence(value.endpointOrigin, "string") ||
     !isScalarEvidence(value.configuredProbe, "string") ||
@@ -551,11 +712,21 @@ function isProviderRecord(value: unknown): value is CatalogProviderRecord {
   const skippedIds = new Set(value.skippedModelIds);
   return (
     modelIds.size === value.models.length &&
-    skippedIds.size === value.skippedModelIds.length
+    skippedIds.size === value.skippedModelIds.length &&
+    isUnresolvedConsistent(value)
   );
 }
 
 const STATUSES = new Set<CatalogStatus>(["pending", "running", "complete"]);
+const BUILT_IN_STATES = new Set<BuiltInState>(["managed", "foreign"]);
+
+function isBuiltIn(value: unknown): value is CatalogPayload["builtIn"] {
+  return (
+    isPlainRecord(value) &&
+    hasExactKeys(value, ["actualyze"]) &&
+    isOneOf(BUILT_IN_STATES, value.actualyze)
+  );
+}
 
 /**
  * Bounds for the final safety scan. A valid payload nests objects six levels
@@ -593,11 +764,22 @@ function isCatalogPayload(value: unknown): value is CatalogPayload {
   if (
     !hasAllowedKeys(
       value,
-      ["schemaVersion", "packageVersion", "status", "providers"],
+      [
+        "schemaVersion",
+        "packageVersion",
+        "instanceID",
+        "generatedAt",
+        "status",
+        "builtIn",
+        "providers",
+      ],
       ["startedAt", "completedAt"],
     ) ||
     value.schemaVersion !== CATALOG_SCHEMA_VERSION ||
     !isBoundedString(value.packageVersion) ||
+    !isBoundedString(value.instanceID) ||
+    !isTimestamp(value.generatedAt) ||
+    !isBuiltIn(value.builtIn) ||
     !isOneOf(STATUSES, value.status) ||
     (value.startedAt !== undefined && !isTimestamp(value.startedAt)) ||
     (value.completedAt !== undefined && !isTimestamp(value.completedAt))

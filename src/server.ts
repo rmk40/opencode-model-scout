@@ -95,7 +95,10 @@ const plugin = {
 
     // The RPC registration, which emits events, exists only after the
     // refresher its handlers call into.
-    const rpc: { emit?: (completedAt: string) => Promise<void> } = {};
+    const rpc: {
+      emitUpdated?: (completedAt: string) => Promise<void>;
+      emitStatus?: (at: string) => Promise<void>;
+    } = {};
     const host: RefresherHost = {
       location: context.location,
       listProviders: async () => (await context.provider.list()).data,
@@ -104,7 +107,10 @@ const plugin = {
       reload: () => context.model.reload(),
       events: (signal) => hostEvents(context, signal),
       emitUpdated: async (completedAt) => {
-        await rpc.emit?.(completedAt);
+        await rpc.emitUpdated?.(completedAt);
+      },
+      emitStatus: async (at) => {
+        await rpc.emitStatus?.(at);
       },
       persist: (key, value) => context.storage.set(key, storageValue(value)),
     };
@@ -121,8 +127,9 @@ const plugin = {
       refresh: (input) =>
         Promise.resolve(refresher.refresh(refreshProviderID(input))),
     });
-    rpc.emit = (completedAt) =>
+    rpc.emitUpdated = (completedAt) =>
       registration.events.emit("updated", { completedAt });
+    rpc.emitStatus = (at) => registration.events.emit("status", { at });
 
     refresher.start();
     return () => refresher.dispose();

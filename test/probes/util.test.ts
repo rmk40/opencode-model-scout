@@ -6,6 +6,8 @@ import {
   readBody,
   readJson,
   EMPTY_RESULT,
+  fetchOutcome,
+  readJsonOutcome,
   setHeader,
 } from "../../src/probes/util";
 
@@ -311,6 +313,42 @@ describe("readBody / readJson — bounded body reads", () => {
       const result = await readJson(res as Response, 30);
       expect(result).toBeUndefined();
       expect(aborted).toHaveBeenCalled();
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("reports a stalled body after fetchOutcome as a body timeout, not an invalid body", async () => {
+    // The body rejects as soon as the fetch signal aborts, the way a real
+    // fetch body does. The header-phase timer (20 ms) must not abort it once
+    // headers have arrived; only the body-read timer (80 ms) may.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (_url, init?: RequestInit) => {
+      const signal = init?.signal as AbortSignal;
+      const body = new Promise((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => reject(new DOMException("aborted", "AbortError")),
+          { once: true },
+        );
+      });
+      body.catch(() => {});
+      return {
+        ok: true,
+        status: 200,
+        json: () => body,
+        body: { cancel: () => Promise.resolve() },
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+
+    try {
+      const outcome = await fetchOutcome("http://x/models", { timeoutMs: 20 });
+      expect(outcome.type).toBe("ok");
+      if (outcome.type !== "ok") return;
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(await readJsonOutcome(outcome.response, 80)).toEqual({
+        type: "timeout",
+      });
     } finally {
       globalThis.fetch = realFetch;
     }

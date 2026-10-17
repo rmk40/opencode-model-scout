@@ -20,7 +20,12 @@ vi.mock("../src/probes/index", async () => {
   };
 });
 
-import { discoverProvider, sanitizeProbeMeta } from "../src/discover";
+import {
+  discoverProvider,
+  MAX_RETRY_DELAY_MS,
+  retryAtFromHeaders,
+  sanitizeProbeMeta,
+} from "../src/discover";
 
 function listResponse(data: unknown, status = 200) {
   return {
@@ -113,12 +118,12 @@ describe("discoverProvider model list", () => {
     [
       "HTTP 500",
       () => mockFetch.mockResolvedValue(listResponse([], 500)),
-      "http-error",
+      "server-error",
     ],
     [
       "HTTP 401",
       () => mockFetch.mockResolvedValue(listResponse([], 401)),
-      "credential",
+      "unauthorized",
     ],
     [
       "a body without data",
@@ -163,6 +168,232 @@ describe("discoverProvider model list", () => {
       "https://api.test",
     );
     expect(JSON.stringify(result)).not.toMatch(/secret-key|pw|private|token/);
+  });
+});
+
+describe("discoverProvider failure classification", () => {
+  function statusResponse(
+    status: number,
+    headers: Record<string, string> = {},
+  ) {
+    return new Response(JSON.stringify({ error: { message: "no" } }), {
+      status,
+      headers,
+    });
+  }
+
+  it.each([
+    [401, "unauthorized"],
+    [402, "payment-required"],
+    [403, "forbidden"],
+    [404, "not-found"],
+    [429, "rate-limited"],
+    [500, "server-error"],
+    [503, "server-error"],
+    [418, "http-error"],
+  ] as const)(
+    "reports HTTP %i as %s with its status",
+    async (status, failure) => {
+      mockFetch.mockResolvedValue(statusResponse(status));
+      const result = await discoverProvider(target);
+      expect(result).toEqual({
+        ok: false,
+        failure,
+        modelListAttempt: "http-error",
+        httpStatus: status,
+      });
+    },
+  );
+
+  it.each([429, 503])(
+    "reports the Retry-After time of an HTTP %i",
+    async (status) => {
+      const before = Date.now();
+      mockFetch.mockResolvedValue(
+        statusResponse(status, { "Retry-After": "120" }),
+      );
+      const result = await discoverProvider(target);
+      const after = Date.now();
+      expect(result).toMatchObject({ ok: false, httpStatus: status });
+      const retryAt = result.ok ? undefined : result.retryAt;
+      expect(retryAt).toBeGreaterThanOrEqual(before + 120_000);
+      expect(retryAt).toBeLessThanOrEqual(after + 120_000);
+    },
+  );
+
+  it("reports no retry time for a status that does not carry one", async () => {
+    mockFetch.mockResolvedValue(statusResponse(401, { "Retry-After": "120" }));
+    const result = await discoverProvider(target);
+    expect(result).not.toHaveProperty("retryAt");
+  });
+
+  it("reports a refused connection as unreachable", async () => {
+    mockFetch.mockRejectedValue(
+      Object.assign(new TypeError("fetch failed"), {
+        cause: { code: "ECONNREFUSED" },
+      }),
+    );
+    expect(await discoverProvider(target)).toEqual({
+      ok: false,
+      failure: "unreachable",
+      modelListAttempt: "unreachable",
+    });
+  });
+
+  it("reports the list request's header timeout as timeout", async () => {
+    // No headers arrive; fetch rejects once the request timer aborts it.
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      mockFetch.mockImplementation(
+        (_url: string, init: RequestInit) =>
+          new Promise((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () =>
+              reject(new DOMException("timed out", "TimeoutError")),
+            );
+          }),
+      );
+      const pending = discoverProvider(target);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await pending).toMatchObject({ ok: false, failure: "timeout" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports a stalled list body as timeout", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      mockFetch.mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: () => new Promise(() => {}),
+      });
+      const pending = discoverProvider(target);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await pending).toMatchObject({ ok: false, failure: "timeout" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports an unreadable list body as an invalid response, not a timeout", async () => {
+    mockFetch.mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => {
+        throw new SyntaxError("Unexpected token");
+      },
+    });
+    expect(await discoverProvider(target)).toMatchObject({
+      ok: false,
+      failure: "invalid-response",
+      modelListAttempt: "invalid-response",
+    });
+  });
+});
+
+describe("retryAtFromHeaders", () => {
+  const NOW = Date.parse("2026-10-11T12:00:00.000Z");
+  const headers = (values: Record<string, string>) => new Headers(values);
+
+  it("reads Retry-After seconds as a delay", () => {
+    expect(retryAtFromHeaders(429, headers({ "Retry-After": "30" }), NOW)).toBe(
+      NOW + 30_000,
+    );
+  });
+
+  it("reads Retry-After as an HTTP date", () => {
+    expect(
+      retryAtFromHeaders(
+        503,
+        headers({ "Retry-After": "Sun, 11 Oct 2026 12:05:00 GMT" }),
+        NOW,
+      ),
+    ).toBe(NOW + 300_000);
+  });
+
+  it.each([
+    ["epoch seconds", String((NOW + 90_000) / 1000), NOW + 90_000],
+    ["epoch milliseconds", String(NOW + 90_000), NOW + 90_000],
+    ["seconds until the reset", "90", NOW + 90_000],
+  ])("reads X-RateLimit-Reset as %s on a 429", (_label, value, expected) => {
+    expect(
+      retryAtFromHeaders(429, headers({ "X-RateLimit-Reset": value }), NOW),
+    ).toBe(expected);
+  });
+
+  it("prefers Retry-After over X-RateLimit-Reset", () => {
+    expect(
+      retryAtFromHeaders(
+        429,
+        headers({ "Retry-After": "10", "X-RateLimit-Reset": "90" }),
+        NOW,
+      ),
+    ).toBe(NOW + 10_000);
+  });
+
+  it("falls back to X-RateLimit-Reset when Retry-After does not parse", () => {
+    expect(
+      retryAtFromHeaders(
+        429,
+        headers({ "Retry-After": "soon", "X-RateLimit-Reset": "90" }),
+        NOW,
+      ),
+    ).toBe(NOW + 90_000);
+  });
+
+  it("ignores X-RateLimit-Reset on a 503", () => {
+    expect(
+      retryAtFromHeaders(503, headers({ "X-RateLimit-Reset": "90" }), NOW),
+    ).toBeUndefined();
+  });
+
+  it.each([401, 402, 403, 404, 500, 502])(
+    "ignores retry headers on HTTP %i",
+    (status) => {
+      expect(
+        retryAtFromHeaders(
+          status,
+          headers({ "Retry-After": "30", "X-RateLimit-Reset": "30" }),
+          NOW,
+        ),
+      ).toBeUndefined();
+    },
+  );
+
+  it("clamps a far-future hint to one hour", () => {
+    expect(
+      retryAtFromHeaders(429, headers({ "Retry-After": "86400" }), NOW),
+    ).toBe(NOW + MAX_RETRY_DELAY_MS);
+    expect(MAX_RETRY_DELAY_MS).toBe(3_600_000);
+  });
+
+  it("clamps a past date to now", () => {
+    expect(
+      retryAtFromHeaders(
+        429,
+        headers({ "Retry-After": "Sat, 10 Oct 2026 12:00:00 GMT" }),
+        NOW,
+      ),
+    ).toBe(NOW);
+  });
+
+  it.each([
+    ["no headers", undefined],
+    ["no retry headers", headers({})],
+    ["an unparseable Retry-After", headers({ "Retry-After": "later" })],
+    ["a negative reset", headers({ "X-RateLimit-Reset": "-5" })],
+  ])("returns undefined for %s", (_label, value) => {
+    expect(retryAtFromHeaders(429, value, NOW)).toBeUndefined();
+  });
+
+  it("returns undefined when reading a header throws", () => {
+    const throwing = {
+      get: () => {
+        throw new Error("boom");
+      },
+    };
+    expect(retryAtFromHeaders(429, throwing, NOW)).toBeUndefined();
   });
 });
 

@@ -193,7 +193,7 @@ describe("jobs", () => {
     await store.settled("k");
     expect(store.served("k")?.inventory.models).toEqual([{ id: "a" }]);
     expect(store.state("k")?.failure).toMatchObject({ kind: "unreachable" });
-    expect(sub.updates).toEqual(["binding", "failure"]);
+    expect(sub.updates).toEqual(["started", "binding", "started", "failure"]);
   });
 
   it("persists a new binding through one subscriber only", async () => {
@@ -208,8 +208,8 @@ describe("jobs", () => {
     );
     await store.settled("k");
     expect(first.persisted.length + second.persisted.length).toBe(1);
-    expect(first.updates).toEqual(["binding"]);
-    expect(second.updates).toEqual(["binding"]);
+    expect(first.updates).toEqual(["started", "binding"]);
+    expect(second.updates).toEqual(["started", "binding"]);
   });
 
   it("treats a rejected run as a failure", async () => {
@@ -225,6 +225,141 @@ describe("jobs", () => {
   });
 });
 
+describe("server retry hints", () => {
+  const FIVE_MINUTES = 5 * MIN_REFRESH_INTERVAL_MS;
+
+  const rateLimited = (retryAt: number | undefined): DiscoveryResult => ({
+    ok: false,
+    failure: "rate-limited",
+    modelListAttempt: "http-error",
+    httpStatus: 429,
+    ...(retryAt === undefined ? {} : { retryAt }),
+  });
+
+  it("records the status and retry time with the failure", async () => {
+    const store = createStore(() => 0);
+    store.start(
+      "k",
+      request(async () => rateLimited(FIVE_MINUTES)),
+    );
+    await store.settled("k");
+    expect(store.state("k")).toMatchObject({
+      retryAt: FIVE_MINUTES,
+      failure: {
+        kind: "rate-limited",
+        httpStatus: 429,
+        retryAt: new Date(FIVE_MINUTES).toISOString(),
+      },
+    });
+  });
+
+  it("starts no job before the retry time, even after the minimum interval", async () => {
+    let now = 0;
+    const store = createStore(() => now);
+    store.start(
+      "k",
+      request(async () => rateLimited(FIVE_MINUTES)),
+    );
+    await store.settled("k");
+    const run = vi.fn(async () => ok(["a"]));
+    now = MIN_REFRESH_INTERVAL_MS;
+    expect(store.start("k", request(run))).toBe("throttled");
+    now = FIVE_MINUTES - 1;
+    expect(store.start("k", request(run))).toBe("throttled");
+    now = FIVE_MINUTES;
+    expect(store.start("k", request(run))).toBe("started");
+  });
+
+  it("does not delay another key", async () => {
+    const store = createStore(() => 0);
+    store.start(
+      "account-a",
+      request(async () => rateLimited(FIVE_MINUTES)),
+    );
+    await store.settled("account-a");
+    expect(
+      store.start(
+        "account-b",
+        request(async () => ok(["b"])),
+      ),
+    ).toBe("started");
+  });
+
+  it("is cleared by a successful job", async () => {
+    let now = 0;
+    const store = createStore(() => now);
+    store.start(
+      "k",
+      request(async () => rateLimited(MIN_REFRESH_INTERVAL_MS)),
+    );
+    await store.settled("k");
+    now = MIN_REFRESH_INTERVAL_MS;
+    store.start(
+      "k",
+      request(async () => ok(["a"])),
+    );
+    await store.settled("k");
+    expect(store.state("k")?.retryAt).toBeUndefined();
+    expect(store.state("k")?.failure).toBeUndefined();
+  });
+
+  it("is replaced by a later failure without a hint", async () => {
+    let now = 0;
+    const store = createStore(() => now);
+    store.start(
+      "k",
+      request(async () => rateLimited(MIN_REFRESH_INTERVAL_MS)),
+    );
+    await store.settled("k");
+    now = MIN_REFRESH_INTERVAL_MS;
+    store.start(
+      "k",
+      request(async () => ({
+        ok: false,
+        failure: "unreachable",
+        modelListAttempt: "unreachable",
+      })),
+    );
+    await store.settled("k");
+    expect(store.state("k")?.retryAt).toBeUndefined();
+    expect(store.state("k")?.failure).not.toHaveProperty("retryAt");
+  });
+
+  it("is reset by invalidation", async () => {
+    const store = createStore(() => 0);
+    store.start(
+      "k",
+      request(async () => rateLimited(FIVE_MINUTES)),
+    );
+    await store.settled("k");
+    store.invalidate("k");
+    expect(
+      store.start(
+        "k",
+        request(async () => ok(["a"])),
+      ),
+    ).toBe("started");
+  });
+
+  it("ignores a non-finite retry time", async () => {
+    let now = 0;
+    const store = createStore(() => now);
+    store.start(
+      "k",
+      request(async () => rateLimited(Number.POSITIVE_INFINITY)),
+    );
+    await store.settled("k");
+    expect(store.state("k")?.failure).not.toHaveProperty("retryAt");
+    now = MIN_REFRESH_INTERVAL_MS;
+    expect(
+      store.start(
+        "k",
+        request(async () => ok(["a"])),
+      ),
+    ).toBe("started");
+  });
+});
+
 describe("invalidation", () => {
   it("clears the binding, notifies, and lets discovery restart at once", async () => {
     const store = createStore(() => 0);
@@ -237,7 +372,7 @@ describe("invalidation", () => {
     await store.settled("k");
     store.invalidate("k");
     expect(store.served("k")).toBeUndefined();
-    expect(sub.updates).toEqual(["binding", "invalidated"]);
+    expect(sub.updates).toEqual(["started", "binding", "invalidated"]);
     expect(
       store.start(
         "k",
@@ -305,13 +440,17 @@ describe("invalidation", () => {
       "k",
       request(async () => ({
         ok: false,
-        failure: "credential",
+        failure: "unauthorized",
         modelListAttempt: "http-error",
+        httpStatus: 401,
       })),
     );
     await store.settled("k");
     expect(store.served("k")).toBeUndefined();
-    expect(store.state("k")?.failure).toMatchObject({ kind: "credential" });
+    expect(store.state("k")?.failure).toMatchObject({
+      kind: "unauthorized",
+      httpStatus: 401,
+    });
   });
 });
 
@@ -337,8 +476,8 @@ describe("subscriptions", () => {
     job.resolve(ok(["a"]));
     await store.settled("k");
     expect(store.served("k")).toBeDefined();
-    expect(second.updates).toEqual(["binding"]);
-    expect(first.updates).toEqual([]);
+    expect(second.updates).toEqual(["started", "binding"]);
+    expect(first.updates).toEqual(["started"]);
   });
 
   it("lets a new subscriber start at once after an abandoned job", async () => {
@@ -453,7 +592,25 @@ describe("sharedStore", () => {
       (globalThis as Record<symbol, unknown>)[STORE_SYMBOL],
     );
     expect(STORE_SYMBOL).toBe(
-      Symbol.for("opencode-model-scout/discovery-store/v1"),
+      Symbol.for("opencode-model-scout/discovery-store/v2"),
     );
+  });
+
+  it("does not reuse a store an older plugin version left under the previous symbol", () => {
+    const holder = globalThis as Record<symbol, unknown>;
+    const previous = Symbol.for("opencode-model-scout/discovery-store/v1");
+    const current = holder[STORE_SYMBOL];
+    const stale = createStore();
+    holder[previous] = stale;
+    delete holder[STORE_SYMBOL];
+    try {
+      const store = sharedStore();
+      expect(store).not.toBe(stale);
+      expect(holder[STORE_SYMBOL]).toBe(store);
+    } finally {
+      delete holder[previous];
+      if (current === undefined) delete holder[STORE_SYMBOL];
+      else holder[STORE_SYMBOL] = current;
+    }
   });
 });

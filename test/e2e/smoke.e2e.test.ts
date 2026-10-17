@@ -29,9 +29,12 @@ function samplePayload(): CatalogPayload {
   return {
     schemaVersion: CATALOG_SCHEMA_VERSION,
     packageVersion: "0.0.0-smoke",
+    instanceID: "smoke",
+    generatedAt: at,
     status: "complete",
     startedAt: at,
     completedAt: at,
+    builtIn: { actualyze: "managed" },
     providers: [
       {
         id: PROVIDER_ID,
@@ -87,6 +90,12 @@ function samplePayload(): CatalogPayload {
             },
           },
         ],
+        discovering: false,
+        lastAttemptAt: at,
+        nextRefreshAt: null,
+        credentialSource: "none",
+        credentialEpoch: 0,
+        resultEpoch: 0,
       },
     ],
   };

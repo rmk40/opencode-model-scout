@@ -98,6 +98,7 @@ function harness(providers: ProviderLike[], location = HERE): Harness {
     emitUpdated: async (completedAt) => {
       state.emitted.push(completedAt);
     },
+    emitStatus: async () => {},
     persist: async (key, value) => {
       state.persisted.set(key, value);
     },
@@ -344,8 +345,9 @@ describe("sync", () => {
 
     replacement.resolve({
       ok: false,
-      failure: "credential",
+      failure: "unauthorized",
       modelListAttempt: "http-error",
+      httpStatus: 401,
     });
     await flush();
     expect(state.active.has("local")).toBe(false);
@@ -436,7 +438,15 @@ describe("sync", () => {
     await refresher.sync();
     await flush();
     expect(discover).not.toHaveBeenCalled();
-    expect(refresher.catalog().providers).toEqual([]);
+    expect(refresher.catalog().providers).toEqual([
+      expect.objectContaining({
+        id: "local",
+        credentialSource: "unresolved",
+        lastGoodAt: null,
+        failure: null,
+        models: [],
+      }),
+    ]);
   });
 });
 
@@ -629,7 +639,15 @@ describe("credential switch", () => {
     await refresher.sync();
     await flush();
     expect(servedBinding(target, state)).toBeUndefined();
-    expect(refresher.catalog().providers).toEqual([]);
+    expect(refresher.catalog().providers).toEqual([
+      expect.objectContaining({
+        id: "local",
+        credentialSource: "unresolved",
+        lastGoodAt: null,
+        failure: null,
+        models: [],
+      }),
+    ]);
     expect(discover).toHaveBeenCalledTimes(1);
     // The old account's entry stays for locations that still use it.
     expect(store.served(before.key)).toBe(before);
@@ -680,7 +698,15 @@ describe("credential switch", () => {
     await pending;
     await flush();
     expect(servedBinding(target, state)).toBeUndefined();
-    expect(refresher.catalog().providers).toEqual([]);
+    expect(refresher.catalog().providers).toEqual([
+      expect.objectContaining({
+        id: "local",
+        credentialSource: "unresolved",
+        lastGoodAt: null,
+        failure: null,
+        models: [],
+      }),
+    ]);
   });
 
   it("aborts the old-credential job when this location was its only subscriber", async () => {

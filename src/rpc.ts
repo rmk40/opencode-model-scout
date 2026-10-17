@@ -37,9 +37,10 @@ export interface RefreshOutput {
   /** True when at least one selected target started or joined discovery. */
   accepted: boolean;
   /**
-   * Set when `accepted` is false: `throttled` when every selected target
-   * started discovery less than a minute ago, `no-targets` when no
-   * discovery target matched the request.
+   * Set when `accepted` is false: `throttled` when no selected target may
+   * start discovery before its record's `nextRefreshAt` (the latest start
+   * was less than a minute ago, or the server's retry hint has not passed),
+   * `no-targets` when no resolved discovery target matched the request.
    */
   reason?: RefreshRejection;
 }
@@ -52,6 +53,17 @@ export interface RefreshOutput {
 export interface UpdatedEventData {
   /** The catalog's `completedAt` when the event was published. */
   completedAt: string;
+}
+
+/**
+ * Data of the `status` event, published when a record's status fields may
+ * have changed: a job started or was joined, a job settled, or credential
+ * resolution changed a target's `credentialEpoch`. Several changes in one
+ * turn publish one event.
+ */
+export interface StatusEventData {
+  /** ISO server time when the event was published. */
+  at: string;
 }
 
 const EMPTY_INPUT = {
@@ -70,12 +82,30 @@ export const ModelScoutRpc = {
         properties: {
           schemaVersion: { type: "number", const: CATALOG_SCHEMA_VERSION },
           packageVersion: { type: "string" },
+          instanceID: { type: "string" },
+          generatedAt: { type: "string" },
           status: { type: "string", enum: ["pending", "running", "complete"] },
           startedAt: { type: "string" },
           completedAt: { type: "string" },
+          builtIn: {
+            type: "object",
+            properties: {
+              actualyze: { type: "string", enum: ["managed", "foreign"] },
+            },
+            required: ["actualyze"],
+            additionalProperties: false,
+          },
           providers: { type: "array", items: { type: "object" } },
         },
-        required: ["schemaVersion", "packageVersion", "status", "providers"],
+        required: [
+          "schemaVersion",
+          "packageVersion",
+          "instanceID",
+          "generatedAt",
+          "status",
+          "builtIn",
+          "providers",
+        ],
         additionalProperties: false,
       },
     },
@@ -102,6 +132,14 @@ export const ModelScoutRpc = {
         type: "object",
         properties: { completedAt: { type: "string" } },
         required: ["completedAt"],
+        additionalProperties: false,
+      },
+    },
+    status: {
+      schema: {
+        type: "object",
+        properties: { at: { type: "string" } },
+        required: ["at"],
         additionalProperties: false,
       },
     },
