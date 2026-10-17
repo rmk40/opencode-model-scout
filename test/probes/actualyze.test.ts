@@ -424,8 +424,8 @@ describe("probeActualyze field mapping", () => {
       ],
     });
 
+    expect(result.models.negative.modelType).toBeUndefined();
     expect(result.models.negative).toMatchObject({
-      modelType: "llm",
       vision: false,
       toolCall: false,
       reasoning: false,
@@ -439,6 +439,29 @@ describe("probeActualyze field mapping", () => {
       expect(meta.reasoning).toBeUndefined();
       expect(meta.temperature).toBeUndefined();
     }
+  });
+
+  it("classifies embedding output as an embedding model, whatever the vision flag says", async () => {
+    const embedding = (id: string, vision: boolean | null, output: string[]) =>
+      advertisedEntry(id, {
+        capabilities: { vision, tool_use: false },
+        modalities: { input: ["text"], output },
+      });
+    const result = await probe({
+      modelsResponse: [
+        embedding("embed-only", false, ["embedding"]),
+        embedding("embed-and-text", true, ["text", "embedding"]),
+        embedding("text-no-vision", false, ["text"]),
+        embedding("vision", true, ["text"]),
+      ],
+    });
+
+    expect(result.models["embed-only"].modelType).toBe("embedding");
+    expect(result.models["embed-and-text"].modelType).toBe("embedding");
+    // vision: false leaves the type to the name heuristic.
+    expect(result.models["text-no-vision"].modelType).toBeUndefined();
+    expect(result.models["text-no-vision"].vision).toBe(false);
+    expect(result.models.vision.modelType).toBe("vlm");
   });
 
   it("treats either thinking flag as reasoning", async () => {

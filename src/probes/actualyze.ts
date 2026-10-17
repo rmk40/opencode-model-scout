@@ -146,6 +146,25 @@ function readCost(cost: unknown): ProbeModelCost | undefined {
   return result;
 }
 
+/**
+ * A model whose `modalities.output` lists `embedding` is an embedding
+ * model; otherwise `vision: true` makes it a `vlm`. `vision: false` says
+ * nothing about the type, because embedding models take no images either,
+ * so the type is left to discovery's name heuristic.
+ */
+function readModelType(
+  detail: ActualyzeModelObject,
+  vision: boolean | undefined,
+): ProbeModelMeta["modelType"] {
+  const output =
+    isRecord(detail.modalities) && Array.isArray(detail.modalities.output)
+      ? (detail.modalities.output as unknown[])
+      : undefined;
+  if (output?.includes("embedding")) return "embedding";
+  if (vision === true) return "vlm";
+  return undefined;
+}
+
 function toProbeMeta(detail: ActualyzeModelObject): ProbeModelMeta {
   const meta: ProbeModelMeta = {};
   const { capabilities } = detail;
@@ -160,11 +179,8 @@ function toProbeMeta(detail: ActualyzeModelObject): ProbeModelMeta {
   if (typeof capabilities.vision === "boolean") {
     meta.vision = capabilities.vision;
   }
-  if (meta.vision === true) {
-    meta.modelType = "vlm";
-  } else if (meta.vision === false) {
-    meta.modelType = "llm";
-  }
+  const modelType = readModelType(detail, meta.vision);
+  if (modelType) meta.modelType = modelType;
   if (typeof capabilities.tool_use === "boolean") {
     meta.toolCall = capabilities.tool_use;
   }
