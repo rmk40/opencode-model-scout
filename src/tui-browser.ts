@@ -1716,10 +1716,13 @@ export function buildBrowserView(
    */
   function bannerRows(): number {
     const framed = frame ? 1 : 0;
-    const room = layout.bodyHeight - framed - MIN_LIST_ROWS;
+    // The narrow list's summary row comes out of the same rows.
+    const summary =
+      screen() === "list" && !layout.wide && !cardsShown() ? 1 : 0;
+    const room = layout.bodyHeight - framed - summary - MIN_LIST_ROWS;
     const noticeRoom = Math.min(
       noticeBannerLines().length,
-      layout.bodyHeight - framed - 1,
+      layout.bodyHeight - framed - summary - 1,
     );
     return Math.max(
       0,
@@ -2219,12 +2222,19 @@ export function buildBrowserView(
         break;
     }
     if (focus === "pane") return detailHints(row, discovery);
-    if (replacing())
-      return [
-        // First, so a narrow footer keeps it.
-        ...(cardScrolls() ? [{ title: "scroll", key: "↑↓" }] : []),
-        ...(card?.hints ?? []),
-      ];
+    if (replacing()) {
+      // The card's own keys come first: the card's action row lists the
+      // ones the footer leaves out, computed without this hint. The scroll
+      // hint shows only when every card key fits too; the "↓ N more" row
+      // and `?` also say the card scrolls.
+      const hints = [...(card?.hints ?? [])];
+      if (
+        cardScrolls() &&
+        footerShown(hints, layout.width).size === hints.length
+      )
+        hints.push({ title: "scroll", key: "↑↓" });
+      return hints;
+    }
     if (data.status === "loading") return [];
     if (data.status === "failed") return [{ title: "retry", key: "r" }];
     if (projection.rows.length === 0) {

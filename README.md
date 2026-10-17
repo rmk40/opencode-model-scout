@@ -784,8 +784,9 @@ link, links, connections, all providers, then keys. When the footer runs out
 of room it leaves out the hints that do not fit and keeps any later one that
 does; the card then lists the left-out keys in an action line at its end, in
 the same order, so every key shows once. `?` lists them all. A card longer
-than the dialog shows `↓ N more`, scrolls with `↑`, `↓`, `pgup`, `pgdn`,
-`home`, and `end`, and adds `scroll ↑↓` to the footer.
+than the dialog shows `↓ N more` and scrolls with `↑`, `↓`, `pgup`, `pgdn`,
+`home`, and `end`; the footer adds `scroll ↑↓` after the card's keys when
+there is room for all of them.
 
 Once the catalog is accessible, the model list works like `/modelscout`
 limited to Actualyze, without a provider header or provider filter. `r`

@@ -846,12 +846,38 @@ describe("small terminals", () => {
     );
   });
 
-  it("scrolls an overflowing card with the movement keys and says so in the footer", async () => {
+  it("keeps a list row under a four-line copied ID at 80x16", async () => {
+    const id = `long-${"x".repeat(270)}`;
+    const h = harness({
+      ...READY,
+      catalog: payload(record({ models: [{ ...modelRecord, id }] })),
+      hostModels: [{ ...hostModel, id }],
+    });
+    size(h, 80, 16);
+    h.context.renderer.isOsc52Supported.mockReturnValue(false);
+    await h.open();
+    await vi.waitFor(() =>
+      expect(line(h.root(), "modelscout-status")).toMatch(/Catalog accessible/),
+    );
+    h.press("y");
+    expect(line(h.root(), "modelscout-notice")).toMatch(
+      /select the text below/,
+    );
+    const banner = shownLines(h.root(), "modelscout-banner");
+    expect(banner[0]).toBe(`actualyze/${id}`.slice(0, 72));
+    const rows = shownLines(h.root(), "modelscout-list").filter(
+      (row) => row.length > 0,
+    );
+    expect(rows.length).toBeGreaterThanOrEqual(1);
+    // The body that holds the list keeps a row, and the summary its own.
+    expect(findNodeById(h.root(), "modelscout-body")?.props?.height).toBe(1);
+    expect(visible(findNodeById(h.root(), "modelscout-summary"))).toBe(true);
+  });
+
+  it("scrolls an overflowing card with the movement keys", async () => {
     const h = harness();
     size(h, 80, 20);
     await openedAt(h, /Connect an Actualyze API key/);
-    const footer = (): string => line(h.root(), "modelscout-footer");
-    expect(footer()).toMatch(/^scroll ↑↓ {2}connect key k/);
     const before = pane(h.root()).split("\n");
     expect(before.at(-1)).toMatch(/^↓ \d+ more$/);
     const down = h.press("down");
@@ -863,6 +889,37 @@ describe("small terminals", () => {
     h.press("?");
     expect(pane(h.root())).toMatch(
       /scroll the card when it runs past the dialog/,
+    );
+  });
+
+  it("shows every card key exactly once across the footer and the card at 80x20", async () => {
+    const h = harness();
+    size(h, 80, 20);
+    await openedAt(h, /Connect an Actualyze API key/);
+    // The card's action row is its last line; scroll to it.
+    h.press("end");
+    const footer = line(h.root(), "modelscout-footer");
+    const row = pane(h.root()).split("\n").at(-1) ?? "";
+    const both = `${footer}\n${row}`;
+    for (const hint of [
+      "connect key k",
+      "copy link y",
+      "links l",
+      "connections c",
+      "all providers b",
+    ])
+      expect(both.split(hint).length - 1, hint).toBe(1);
+    // Not every card key fits the footer, so the scroll hint gives way.
+    expect(footer).not.toMatch(/scroll/);
+  });
+
+  it("adds the scroll hint last, only when every card key fits the footer", async () => {
+    const h = harness();
+    size(h, 120, 16);
+    await openedAt(h, /Connect an Actualyze API key/);
+    expect(pane(h.root()).split("\n").at(-1)).toMatch(/^↓ \d+ more$/);
+    expect(line(h.root(), "modelscout-footer")).toMatch(
+      /all providers b {2}scroll ↑↓ {2}keys \?/,
     );
   });
 

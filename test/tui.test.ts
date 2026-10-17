@@ -887,6 +887,25 @@ describe("keys", () => {
     expect(listRows(root).some((row) => row.startsWith("▌"))).toBe(true);
   });
 
+  it("keeps a list row and the summary under a four-line copied ID at 80x16", async () => {
+    const id = `atlas-${"x".repeat(270)}`;
+    const h = harness({ terminalWidth: 80, terminalHeight: 16 });
+    h.setHostModels([hostModel(id, "Long ID")]);
+    const root = await h.ready();
+    h.renderer.isOsc52Supported.mockReturnValue(false);
+    // "Long ID" sorts after the catalog's "Atlas Model".
+    h.press({ name: "end" });
+    h.press({ name: "y" });
+    expect(line(root, "modelscout-notice")).toMatch(/select the text below/);
+    expect(lines(root, "modelscout-banner")[0]).toBe(
+      `atlas/${id}`.slice(0, 72),
+    );
+    // The body that holds the list keeps a row, and the summary its own.
+    expect(findNodeById(root, "modelscout-body")?.props?.height).toBe(1);
+    expect(listRows(root).filter((row) => row.length > 0).length).toBe(1);
+    expect(visible(findNodeById(root, "modelscout-summary"))).toBe(true);
+  });
+
   it("shows the second copied ID when it takes as many banner rows as the first", async () => {
     const h = harness({ terminalWidth: 80, terminalHeight: 24 });
     h.setHostModels([
