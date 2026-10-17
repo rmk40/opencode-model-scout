@@ -65,6 +65,7 @@ interface MockNode {
 interface Chunk {
   text: string;
   fg?: { name: string };
+  bg?: { name: string };
 }
 
 function findNodeById(node: unknown, id: string): MockNode | undefined {
@@ -85,9 +86,17 @@ function chunksOf(node: MockNode | undefined): Chunk[] {
     : [];
 }
 
+/**
+ * Text of a node. A focused selection is a background band without a
+ * glyph; its first column reads as "▌" here, like the bar of an unfocused
+ * selection, so tests can find the selected row either way.
+ */
 function textOf(node: MockNode | undefined): string {
   const chunks = chunksOf(node);
-  if (chunks.length > 0) return chunks.map((chunk) => chunk.text).join("");
+  if (chunks.length > 0) {
+    const text = chunks.map((chunk) => chunk.text).join("");
+    return chunks[0]?.bg !== undefined ? `▌${text.slice(1)}` : text;
+  }
   return typeof node?.props?.content === "string" ? node.props.content : "";
 }
 
@@ -1142,7 +1151,8 @@ describe("narrow layout keys", () => {
     const h = harness({ terminalWidth: 80, terminalHeight: 24 });
     const { root } = await h.ready();
     h.press({ name: "home" });
-    expect(line(root, "modelscout-summary")).toBe("Atlas · https://atlas.test");
+    // "https://" is left out; "http://" would stay to flag an endpoint without TLS.
+    expect(line(root, "modelscout-summary")).toBe("Atlas · atlas.test");
     h.press({ name: "return" });
     expect(pane(root)).toMatch(/Server type +vLLM, detected automatically/);
     h.press({ name: "backspace" });

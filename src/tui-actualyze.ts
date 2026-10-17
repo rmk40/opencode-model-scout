@@ -69,11 +69,7 @@ export function actualyzeEndpoint(baseURL: unknown): ActualyzeEndpoint {
   };
 }
 
-/** The origin as the header shows it: the host for https, the full origin otherwise. */
-export function displayOrigin(origin: string): string {
-  const url = new URL(origin);
-  return url.protocol === "https:" ? url.host : url.origin;
-}
+export { displayOrigin } from "./format";
 
 export type ActualyzeLinkID = keyof typeof ACTUALYZE_LINK_PATHS;
 
@@ -83,8 +79,9 @@ export interface ActualyzeLink {
   readonly url: string;
 }
 
+/** Page names as the Actualyze app labels them. */
 const LINK_LABELS: Readonly<Record<ActualyzeLinkID, string>> = {
-  apiKeys: "API keys",
+  apiKeys: "API Keys",
   catalog: "Catalog",
   budgets: "Budgets",
   usage: "Usage",
@@ -118,6 +115,26 @@ export function actualyzeLink(
 /** Every app page on `origin`, in links-screen order. */
 export function actualyzeLinks(origin: string): ActualyzeLink[] {
   return LINK_ORDER.map((id) => actualyzeLink(origin, id));
+}
+
+/** Columns of a link's label column when the URL shares its line. */
+export const LINK_LABEL_COLUMNS = 21;
+/** Columns before a URL on its own line under the label. */
+export const LINK_URL_INDENT = 6;
+
+/**
+ * How the links screen lays out `links` in `width` columns: the URL in a
+ * column beside each label, or, when any URL would not fit there, every URL
+ * on its own line under its label, so the list never mixes the two.
+ */
+export function linkLayout(
+  links: readonly ActualyzeLink[],
+  width: number,
+  measure: (text: string) => number = (text) => text.length,
+): "beside" | "below" {
+  return links.every((link) => LINK_LABEL_COLUMNS + measure(link.url) <= width)
+    ? "beside"
+    : "below";
 }
 
 /** The app page that helps with a failure: API keys for 401 and 403, Budgets for 402, Troubleshooting otherwise. */
@@ -415,6 +432,76 @@ export const RESULT_ROWS: ReadonlySet<ActualyzeRow> = new Set<ActualyzeRow>([
   "empty",
   "ready",
 ]);
+
+// ── Status line and hints ───────────────────────────────────────────────
+
+/** A part of the status line after its headline; whole parts with the highest `drop` go first. */
+export interface StatusPart {
+  readonly text: string;
+  readonly drop: number;
+}
+
+/** Columns before each status part: " · ". */
+const STATUS_SEPARATOR = 3;
+
+/**
+ * The status parts that fit in `width` columns after a headline of
+ * `headWidth` columns, in their order. Parts are dropped whole, the highest
+ * `drop` first and the later one on a tie, so the line never ends in a
+ * separator or a cut word.
+ */
+export function fitStatusParts<Part extends StatusPart>(
+  headWidth: number,
+  parts: readonly Part[],
+  width: number,
+  measure: (text: string) => number = (text) => text.length,
+): Part[] {
+  const kept = parts.filter((part) => part.text.length > 0);
+  const used = (): number =>
+    kept.reduce(
+      (sum, part) => sum + STATUS_SEPARATOR + measure(part.text),
+      headWidth,
+    );
+  while (kept.length > 0 && used() > width) {
+    let drop = 0;
+    for (const [index, part] of kept.entries())
+      if (part.drop >= (kept[drop]?.drop ?? 0)) drop = index;
+    kept.splice(drop, 1);
+  }
+  return kept;
+}
+
+/**
+ * Keys in the order every `/actualyze` card and footer lists them: the key
+ * action, retry, copy link, links, connections, all providers.
+ */
+export const ACTION_ORDER: readonly string[] = ["k", "r", "y", "l", "c", "b"];
+
+/** `items` sorted by `ACTION_ORDER`; keys outside it keep their place after those in it. */
+export function inActionOrder<Item extends { readonly key: string }>(
+  items: readonly Item[],
+): Item[] {
+  const rank = (item: Item): number => {
+    const index = ACTION_ORDER.indexOf(item.key);
+    return index < 0 ? ACTION_ORDER.length : index;
+  };
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => rank(a.item) - rank(b.item) || a.index - b.index)
+    .map(({ item }) => item);
+}
+
+/** The retry hint: "retry (59 s)" while a refresh waits, "retry" once it may run. */
+export function retryTitle(wait: number | undefined): string {
+  return wait === undefined ? "retry" : `retry (${wait} s)`;
+}
+
+/** The sentence that tells when `r` works. */
+export function retrySentence(wait: number | undefined): string {
+  return wait === undefined
+    ? "Retry with r."
+    : "Retry with r once the wait ends.";
+}
 
 // ── Sessions ────────────────────────────────────────────────────────────
 

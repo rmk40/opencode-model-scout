@@ -589,9 +589,11 @@ describe("the key prompt's answer", () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     try {
       await submitKey(h);
-      await vi.waitFor(() => expect(pane(h.root())).toMatch(/Saving key/));
+      await vi.waitFor(() =>
+        expect(pane(h.root())).toMatch(/OpenCode is storing the key/),
+      );
       await vi.advanceTimersByTimeAsync(14_000);
-      expect(pane(h.root())).toMatch(/Saving key/);
+      expect(pane(h.root())).toMatch(/OpenCode is storing the key/);
       await vi.advanceTimersByTimeAsync(1_500);
       await vi.waitFor(() =>
         expect(pane(h.root())).toMatch(
@@ -654,7 +656,9 @@ describe("a save that completes after the location changed", () => {
     h.connectKey.mockReturnValueOnce(save.promise);
     await openedAt(h, /Connect an Actualyze API key/);
     await submitKey(h);
-    await vi.waitFor(() => expect(pane(h.root())).toMatch(/Saving key/));
+    await vi.waitFor(() =>
+      expect(pane(h.root())).toMatch(/OpenCode is storing the key/),
+    );
 
     h.context.location = { directory: "/elsewhere" };
     h.dialog.clear.mockClear();
@@ -719,7 +723,9 @@ describe("keys under a card", () => {
     const h = harness();
     await openedAt(h, /Connect an Actualyze API key/);
     h.press("l");
-    await vi.waitFor(() => expect(pane(h.root())).toMatch(/Links ·/));
+    await vi.waitFor(() =>
+      expect(pane(h.root())).toMatch(/Actualyze app links/),
+    );
     h.press("k");
     h.press("c");
     expect(h.dialog.prompt).not.toHaveBeenCalled();
@@ -733,6 +739,191 @@ describe("keys under a card", () => {
     await openedAt(h, /Connect an Actualyze API key/);
     h.press("c");
     expect(h.dispatch).toHaveBeenCalledWith("provider.connect");
+  });
+});
+
+describe("status line", () => {
+  const chunks = (root: unknown): Array<{ text: string; fg?: unknown }> => {
+    const content = findNodeById(root, "modelscout-status")?.content;
+    return content && typeof content === "object" && "chunks" in content
+      ? (content as { chunks: Array<{ text: string; fg?: unknown }> }).chunks
+      : [];
+  };
+
+  it("colors only the glyph and writes the headline in base", async () => {
+    const h = harness({
+      ...READY,
+      catalog: payload(
+        record({
+          lastGoodAt: null,
+          models: [],
+          failure: { kind: "unauthorized", at: AT, httpStatus: 401 },
+        }),
+      ),
+      hostModels: [],
+    });
+    await openedAt(h, /Actualyze did not accept this key/);
+    const [glyph, headline] = chunks(h.root());
+    expect(glyph).toMatchObject({ text: "▲", fg: { name: "error" } });
+    expect(headline).toMatchObject({
+      text: " Key rejected (401)",
+      fg: { name: "text.base" },
+    });
+  });
+
+  it("counts the chat models the list shows, not hidden embeddings", async () => {
+    const embedding: HostModel = {
+      ...hostModel,
+      id: "embed",
+      name: "Embed",
+      capabilities: { tools: false, input: ["text"], output: ["embedding"] },
+    };
+    const h = harness({
+      ...READY,
+      catalog: payload(
+        record({
+          models: [
+            modelRecord,
+            {
+              ...modelRecord,
+              id: "embed",
+              modelType: knownScalar("embedding", "provider-probe", "reported"),
+            },
+          ],
+        }),
+      ),
+      hostModels: [hostModel, embedding],
+    });
+    await h.open();
+    await vi.waitFor(() =>
+      expect(line(h.root(), "modelscout-status")).toMatch(
+        /^● Catalog accessible · key "Laptop" · 1 model · checked/,
+      ),
+    );
+  });
+});
+
+describe("copy notice", () => {
+  it("wraps a copied link onto the rows below instead of cutting it", async () => {
+    const h = harness();
+    h.context.renderer.terminalWidth = 80;
+    await openedAt(h, /Connect an Actualyze API key/);
+    h.press("y");
+    const url = "https://app.actualyze.ai/account/settings?tab=security";
+    expect(line(h.root(), "modelscout-notice")).toBe("Copy sent to terminal:");
+    const banner = findNodeById(h.root(), "modelscout-banner");
+    const shown = (banner?.children ?? [])
+      .filter(visible)
+      .map((child) => textOf(child).trimEnd());
+    expect(shown).toContain(url);
+  });
+});
+
+describe("card action row", () => {
+  const revoked: State = {
+    ...READY,
+    catalog: payload(
+      record({
+        lastGoodAt: null,
+        models: [],
+        failure: { kind: "unauthorized", at: AT, httpStatus: 401 },
+      }),
+    ),
+    hostModels: [],
+  };
+
+  it("is left out when the footer fits every key", async () => {
+    const h = harness(revoked);
+    await openedAt(h, /Actualyze did not accept this key/);
+    const card = pane(h.root()).split("\n");
+    // Title and body only; no spacer, no action row.
+    expect(card.at(-1)).toMatch(/Actualyze environment\.$/);
+    expect(line(h.root(), "modelscout-footer")).toMatch(
+      /^another key k {2}retry r {2}copy link y {2}links l {2}connections c {2}all providers b {2}keys \?/,
+    );
+  });
+
+  it("lists only the keys the footer cannot fit, in footer order", async () => {
+    const h = harness(revoked);
+    h.context.renderer.terminalWidth = 80;
+    h.context.renderer.terminalHeight = 24;
+    await openedAt(h, /Actualyze did not accept this key/);
+    const footer = line(h.root(), "modelscout-footer");
+    expect(footer).toMatch(
+      /^another key k {2}retry r {2}copy link y {2}links l {2}keys \?/,
+    );
+    const card = pane(h.root()).split("\n");
+    expect(card.at(-2)).toBe("▌");
+    expect(card.at(-1)).toBe("▌ connections c  all providers b");
+    expect(footer).not.toMatch(/connections|all providers/);
+  });
+
+  it("titles the empty card Empty catalog, apart from the status line", async () => {
+    const h = harness({
+      ...READY,
+      catalog: payload(record({ models: [] })),
+      hostModels: [],
+    });
+    await openedAt(h, /Empty catalog/);
+    expect(line(h.root(), "modelscout-status")).toMatch(
+      /^▲ No models for this key/,
+    );
+    expect(pane(h.root())).not.toMatch(/No models for this key/);
+  });
+});
+
+describe("key list at 80x24", () => {
+  it("scrolls by whole entries and counts entries in its more lines", async () => {
+    const h = harness(READY);
+    h.context.renderer.terminalWidth = 80;
+    h.context.renderer.terminalHeight = 24;
+    await h.open();
+    await vi.waitFor(() =>
+      expect(line(h.root(), "modelscout-status")).toMatch(/Catalog accessible/),
+    );
+    h.press("?");
+    /** Entries shown (rows that start with a key) and the hidden counts. */
+    const read = () => {
+      const rows = pane(h.root())
+        .split("\n")
+        .filter((row) => row.length > 0);
+      const count = (pattern: RegExp): number =>
+        Number(pattern.exec(rows.join("\n"))?.[1] ?? 0);
+      const body = rows.filter(
+        (row, index) => index > 0 && !/^[↑↓] \d+ more$/.test(row),
+      );
+      return {
+        rows,
+        shown: body.filter((row) => /^\S/.test(row)).length,
+        above: count(/^↑ (\d+) more$/m),
+        below: count(/^↓ (\d+) more$/m),
+      };
+    };
+    /** The "/" entry wraps to two lines; it never shows without its second. */
+    const whole = (rows: string[]): boolean => {
+      const search = rows.findIndex((row) => /^\/ +search name/.test(row));
+      return search < 0 || /returns to the list/.test(rows[search + 1] ?? "");
+    };
+
+    const top = read();
+    expect(top.rows[0]).toMatch(/^Keys · Actualyze/);
+    expect(top.below).toBeGreaterThan(0);
+    expect(whole(top.rows)).toBe(true);
+
+    for (let step = 0; step < 3; step += 1) h.press("down");
+    const middle = read();
+    expect(middle.rows[0]).toMatch(/^Keys · Actualyze/);
+    expect(middle.above).toBe(3);
+    expect(whole(middle.rows)).toBe(true);
+
+    h.press("end");
+    const end = read();
+    expect(end.below).toBe(0);
+    expect(whole(end.rows)).toBe(true);
+    // Counts are entries: every view accounts for the same entries.
+    const total = top.shown + top.below;
+    expect(middle.above + middle.shown + middle.below).toBe(total);
+    expect(end.above + end.shown).toBe(total);
   });
 });
 
@@ -773,9 +964,11 @@ describe("cards", () => {
     expect(typeof cardHeight).toBe("number");
     expect(cardHeight as number).toBeLessThan(FULL_HEIGHT);
     const card = pane(h.root()).split("\n");
-    // The card's lines, one spacer row, and no padding beyond them.
-    expect(card.at(-1)).toBe("");
-    expect(card.at(-2)).not.toBe("");
+    // The pane shows the card's lines and nothing more; the body adds the
+    // one blank row before the footer.
+    expect(card.at(-1)).not.toBe("");
+    const body = findNodeById(h.root(), "modelscout-body")?.props?.height;
+    expect(body).toBe(card.length + 1);
 
     h.setState(READY);
     h.emitRpc("updated");

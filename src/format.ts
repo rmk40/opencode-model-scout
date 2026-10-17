@@ -80,6 +80,38 @@ export function formatDetailPrice(value: number): string {
   return `$${decimals < 2 ? value.toFixed(2) : fixed}`;
 }
 
+function decimalsOf(price: string): number {
+  const point = price.indexOf(".");
+  return point < 0 ? 0 : price.length - point - 1;
+}
+
+/**
+ * `in/out` with `formatPrice` per side, an unknown side as "?". When one
+ * side shows cents, the other shows cents too ("$0.15/$0.60",
+ * "$1.25/$10.00"), so a pair reads as one figure; a side with more digits
+ * (three significant digits under 0.1) keeps them. Both unknown is empty.
+ */
+export function formatPricePair(
+  input: number | undefined,
+  output: number | undefined,
+): string {
+  if (input === undefined && output === undefined) return "";
+  const side = (value: number | undefined): string =>
+    value === undefined ? "?" : formatPrice(value);
+  let left = side(input);
+  let right = side(output);
+  const matchable = (value: number | undefined, text: string): boolean =>
+    value !== undefined && text.startsWith("$");
+  if (matchable(input, left) && matchable(output, right)) {
+    const target = Math.max(decimalsOf(left), decimalsOf(right)) > 0 ? 2 : 0;
+    if (decimalsOf(left) < target)
+      left = `$${(input as number).toFixed(target)}`;
+    if (decimalsOf(right) < target)
+      right = `$${(output as number).toFixed(target)}`;
+  }
+  return `${left}/${right}`;
+}
+
 /**
  * The list's `in/out` price cell, unpadded, at most `width` columns. An
  * unknown side is "?", and both unknown is empty. `tiered` adds a `+` for
@@ -94,14 +126,22 @@ export function formatPriceCell(
 ): string {
   if (input === undefined && output === undefined) return "";
   const columns = Math.max(0, Math.floor(width));
-  const side = (value: number | undefined): string =>
-    value === undefined ? "?" : formatPrice(value);
-  const pair = `${side(input)}/${side(output)}`;
+  const pair = formatPricePair(input, output);
   const full = tiered ? `${pair}+` : pair;
   if (full.length <= columns) return full;
   if (pair.length <= columns) return pair;
   if (columns === 0) return "";
   return `${pair.slice(0, columns - 1)}…`;
+}
+
+/**
+ * An endpoint origin for display: without "https://", while "http://"
+ * stays visible because it marks an endpoint without TLS.
+ */
+export function displayOrigin(origin: string): string {
+  return origin.startsWith("https://")
+    ? origin.slice("https://".length)
+    : origin;
 }
 
 /** Format bytes as human-readable: 20285680936 → "18.9 GB" */

@@ -3,6 +3,8 @@ import type { RGBA } from "@opentui/core";
 /** Color roles that view code tags text with; `tui-theme` maps them to tokens. */
 export type ThemeRole =
   | "base"
+  /** `base`, bold: card titles and the key list's keys. */
+  | "strong"
   | "muted"
   | "faint"
   | "selected"
@@ -36,6 +38,7 @@ export type RolePalette = Readonly<Record<ThemeRole, RoleColor>>;
 
 /** Roles rendered bold in addition to their color. */
 export const BOLD_ROLES: ReadonlySet<ThemeRole> = new Set<ThemeRole>([
+  "strong",
   "group",
   "brand",
 ]);
@@ -100,6 +103,7 @@ export function rolePalette(source: ThemeSource): RolePalette {
   const { text, background } = tokens;
   return {
     base: text.base,
+    strong: text.base,
     muted: text.muted,
     faint: isColor(text.faint) ? text.faint : text.muted,
     selected: text.action.primary.focused,

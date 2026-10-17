@@ -203,7 +203,7 @@ node scripts/live-tui.mjs --screenshots "$TMPDIR/scout-shots" # save PNG and tex
 | `--scenario <name>`    | Run only this scenario. Repeat it to run several.                                             |
 | `--size 120x36\|80x24` | Run at one terminal size. Repeatable. Without it, both sizes run.                             |
 | `--theme dark\|light`  | Run with one theme mode, written to the scratch `cli.json`. Repeatable. Without it, both run. |
-| `--screenshots <dir>`  | Save each `screenshot` step as a PNG and a text snapshot in `<dir>`.                          |
+| `--screenshots <dir>`  | Save each `screenshot` step as a PNG and a text snapshot (line N is screen row N) in `<dir>`. |
 | `--list`               | Print the scenarios and exit.                                                                 |
 
 Each run connects the scenario's synthetic key, if it has one, through the
@@ -239,13 +239,13 @@ To add a scenario, append an entry to `SCENARIOS` in `scripts/live-tui.mjs`:
   sizes: ["120x36"], // optional subset of the sizes
   steps: [
     { command: "/actualyze" },
-    { wait: /Catalog rate limited · retry in \d+ s/, timeout: 30_000 },
+    { wait: "Catalog rate limited (429)", timeout: 30_000 },
     { expectColor: { color: "brand", text: "ACTUALYZE" } },
     {
       label: "the wait is longer than Retry-After",
       run: async (ctx) => {
         const text = await ctx.session.text();
-        const seconds = Number(/retry in (\d+) s/.exec(text)?.[1]);
+        const seconds = Number(/retry \((\d+) s\) r/.exec(text)?.[1]);
         if (!(seconds > 30)) throw new Error(`countdown ${seconds}`);
       },
     },
@@ -260,19 +260,19 @@ To add a scenario, append an entry to `SCENARIOS` in `scripts/live-tui.mjs`:
 }
 ```
 
-| Step                                      | Effect                                                                                      |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `{ command: "/name" }`                    | Type a slash command and press `enter`                                                      |
-| `{ wait: text }`                          | Wait until a string or `RegExp` is on screen (default 15 seconds; `timeout` changes it)     |
-| `{ waitGone: text }`                      | Wait until it is gone                                                                       |
-| `{ expect: text }`, `{ expectNot: text }` | Check that it is, or is not, on the current screen                                          |
-| `{ expectColor: { color, text } }`        | Check text drawn in exactly that foreground; `"brand"` is the Actualyze purple of the theme |
-| `{ type: "abc" }`, `{ press: "esc" }`     | Type text or press a key; `press` also takes a chord such as `["ctrl", "p"]`                |
-| `{ submitKey: "ok" }`                     | Type the scenario's synthetic key and press `enter`                                         |
-| `{ resize: "across" }`                    | Resize across 120 columns; `"restore"` returns to the run's size                            |
-| `{ screenshot: "label" }`                 | Save a screenshot when `--screenshots` is set                                               |
-| `{ sleep: 500 }`                          | Pause                                                                                       |
-| `{ run: async (ctx) => {} }`              | Anything else; throw to fail the step                                                       |
+| Step                                      | Effect                                                                                       |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------- |
+| `{ command: "/name" }`                    | Type a slash command and press `enter`                                                       |
+| `{ wait: text }`                          | Wait until a string or `RegExp` is on screen (default 15 seconds; `timeout` changes it)      |
+| `{ waitGone: text }`                      | Wait until it is gone                                                                        |
+| `{ expect: text }`, `{ expectNot: text }` | Check that it is, or is not, on the current screen                                           |
+| `{ expectColor: { color, text } }`        | Check text drawn in exactly that foreground; `"brand"` is the Actualyze purple of the theme  |
+| `{ type: "abc" }`, `{ press: "esc" }`     | Type text or press a key; `press` also takes a chord such as `["ctrl", "p"]`                 |
+| `{ submitKey: "ok" }`                     | Type the scenario's synthetic key and press `enter`                                          |
+| `{ resize: "across" }`                    | Resize across 120 columns; `"wide"` makes it 140, and `"restore"` returns to the run's size  |
+| `{ screenshot: "label" }`                 | Save a screenshot when `--screenshots` is set, named after the terminal size at capture time |
+| `{ sleep: 500 }`                          | Pause                                                                                        |
+| `{ run: async (ctx) => {} }`              | Anything else; throw to fail the step                                                        |
 
 Every step can carry a `label` for the report. A new `connect` value must be
 a key of `ACTUALYZE_MOCK_SCENARIOS` in `scripts/live-harness.mjs`; add the

@@ -15,7 +15,9 @@ import {
   helpLines,
   modelDetailLines,
   modelEvidenceLines,
+  helpLayout,
   modelSummaryLine,
+  NBSP,
   needsAttention,
   providerDetailLines,
   providerEvidenceLines,
@@ -398,7 +400,7 @@ describe("modelDetailLines", () => {
     expect(flat(lines)).toContain(
       "Max output Not reported; OpenCode fits output to the remaining context",
     );
-    expect(roleOf(lines, "OpenCode uses")).toBe("faint");
+    expect(roleOf(lines, "Not reported; OpenCode")).toBe("faint");
   });
 
   it("labels inferred limits and an assumed output limit", () => {
@@ -412,13 +414,13 @@ describe("modelDetailLines", () => {
         }),
       ),
     );
-    expect(lines).toContain("Context       128K tokens (inferred)");
-    expect(lines).toContain("Max output    16K tokens (assumed)");
+    expect(lines).toContain("Context        128K tokens (inferred)");
+    expect(lines).toContain("Max output     16K tokens (assumed)");
   });
 
   it("says Not reported for a context no source states", () => {
     expect(text(detail(model({ context: undefined })))).toContain(
-      "Context       Not reported",
+      "Context        Not reported",
     );
   });
 
@@ -435,18 +437,18 @@ describe("modelDetailLines", () => {
         }),
       ),
     );
-    expect(lines).toContain("Supports      tools, PDFs");
-    expect(lines).toContain("Assumed       temperature (OpenCode default)");
+    expect(lines).toContain("Supports       tools, PDFs");
+    expect(lines).toContain("Assumed        temperature (OpenCode default)");
     expect(lines.join("\n")).toMatch(
       /Inferred +reasoning \(from models\.dev or/,
     );
-    expect(lines).toContain("Not supported images");
-    expect(lines).toContain("Not reported  audio, video");
+    expect(lines).toContain("Not supported  images");
+    expect(lines).toContain("Not reported   audio, video");
   });
 
   it("treats a host denial of temperature as unsupported", () => {
     const lines = text(detail(model({ hostTemperature: false })));
-    expect(lines).toContain("Not supported temperature");
+    expect(lines).toContain("Not supported  temperature");
   });
 
   it("shows an embedding model's type instead of output and capabilities", () => {
@@ -483,9 +485,9 @@ describe("modelDetailLines", () => {
         }),
       ),
     );
-    expect(lines).toContain("Price per 1M  $3.00 in · $15.00 out");
-    expect(lines).toContain("Cache per 1M  $0.30 read · write not reported");
-    expect(lines).toContain("Above 200K    $6.00 in · $22.50 out");
+    expect(lines).toContain("Price per 1M   $3.00 in · $15.00 out");
+    expect(lines).toContain("Cache per 1M   $0.30 read · write not reported");
+    expect(lines).toContain("Above 200K     $6.00 in · $22.50 out");
   });
 
   it("keeps a tier's cache prices on its own threshold line", () => {
@@ -505,18 +507,29 @@ describe("modelDetailLines", () => {
         }),
       ),
     );
-    expect(lines).toContain(
-      "Above 200K    $6.00 in · $22.50 out · cache $0.60",
-    );
-    expect(lines).toContain("              read · $7.50 write");
-    expect(lines).toContain("Above 1M      cache $1.20 read · write not");
-    expect(lines).toContain("              reported");
+    expect(lines).toContain("Above 200K     $6.00 in · $22.50 out · cache");
+    expect(lines).toContain("               $0.60 read · $7.50 write");
+    expect(lines).toContain("Above 1M       cache $1.20 read · write");
+    expect(lines).toContain("               not reported");
   });
 
   it("says Not reported for an unpriced model", () => {
     const lines = detail(model());
-    expect(text(lines)).toContain("Price per 1M  Not reported");
+    expect(text(lines)).toContain("Price per 1M   Not reported");
     expect(roleOf(lines, "Not reported")).toBe("faint");
+  });
+
+  it("keeps http:// visible and puts a long endpoint on its own line", () => {
+    const lines = text(
+      modelDetailLines(
+        group({ provider: "Mock compat", endpoint: "http://127.0.0.1:47932" }),
+        model(),
+        { width: 49, current: false },
+      ),
+    );
+    expect(lines).toContain("Provider       Mock compat");
+    expect(lines).toContain("               http://127.0.0.1:47932");
+    expect(lines.some((line) => line.trimEnd().endsWith("·"))).toBe(false);
   });
 
   it("shows the provider with its origin but no scheme, and notes a model hidden from the picker", () => {
@@ -525,19 +538,52 @@ describe("modelDetailLines", () => {
         model({ enabled: false, family: "llama", quantization: "Q4_K_M" }),
       ),
     );
-    expect(lines).toContain("Provider      Atlas · atlas.test");
-    expect(lines).toContain("Family        llama · Q4_K_M");
-    expect(lines).toContain(
-      "Picker        Hidden from OpenCode's model picker",
-    );
+    expect(lines).toContain("Provider       Atlas · atlas.test");
+    expect(lines).toContain("Family         llama · Q4_K_M");
+    expect(lines).toContain("Picker         Hidden from OpenCode's");
+    expect(lines).toContain("               model picker");
   });
 });
 
 describe("modelSummaryLine", () => {
-  const summary = (row: ModelRow): string =>
-    modelSummaryLine(row)
+  const summary = (row: ModelRow, width = 200): string =>
+    modelSummaryLine(row, width)
       .map((segment) => segment.text)
       .join("");
+  const priced = (): ModelRow =>
+    model({
+      cost: {
+        input: knownScalar(0.15, "unmatched-host", "unmatched"),
+        output: knownScalar(0.6, "unmatched-host", "unmatched"),
+        cacheRead: unknownScalar(),
+        cacheWrite: unknownScalar(),
+      },
+      capabilities: {
+        toolCall: CONFIRMED,
+        reasoning: CONFIRMED,
+        temperature: unknownCapability(),
+      },
+    });
+
+  it("leaves out whole items that do not fit and counts them in +N", () => {
+    const full = summary(priced());
+    expect(full).toBe(
+      "Model One · $0.15/$0.60 per 1M · 16K out · tools, reasoning",
+    );
+    // One column short of the last capability: it goes, counted as +1.
+    expect(summary(priced(), full.length - 1)).toBe(
+      "Model One · $0.15/$0.60 per 1M · 16K out · tools +1",
+    );
+    expect(summary(priced(), 40)).toBe("Model One · $0.15/$0.60 per 1M +3");
+    // A name that alone is too wide is cut; nothing else follows.
+    expect(summary(priced(), 6)).toBe("Model…");
+  });
+
+  it("shows the context and says the price is not reported for an unpriced model", () => {
+    expect(summary(model({ context: 131_072 }))).toMatch(
+      /^Model One · 131K · price not reported · /,
+    );
+  });
 
   it("puts name, price, output, then confirmed capabilities", () => {
     expect(
@@ -560,13 +606,13 @@ describe("modelSummaryLine", () => {
   });
 
   it("calls an embedding model one and skips output and capabilities", () => {
-    expect(summary(model({ type: "embedding" }))).toBe(
-      "Model One · embedding model",
+    expect(summary(model({ type: "embedding" }))).toMatch(
+      / · price not reported · embedding model$/,
     );
   });
 
   it("leaves out an output limit no source reports", () => {
-    expect(summary(model({ output: undefined }))).toBe("Model One");
+    expect(summary(model({ output: undefined }))).not.toMatch(/ out/);
   });
 });
 
@@ -655,13 +701,13 @@ describe("providerDetailLines", () => {
       retryInSeconds: 30,
     });
     expect(lines[2]).toMatch(/^▲ Catalog rate limited · retry in 30 s/);
-    expect(lines).toContain("Refresh       available in 30 s");
+    expect(lines).toContain("Refresh        available in 30 s");
   });
 
   it("shows ready with its age and r now", () => {
     const lines = detail(record());
     expect(lines).toContain("● Ready · checked 10 min ago");
-    expect(lines).toContain("Refresh       r now");
+    expect(lines).toContain("Refresh        r now");
   });
 
   it.each([
@@ -672,7 +718,7 @@ describe("providerDetailLines", () => {
     ["unresolved", "not resolved yet"],
   ] as const)("names the %s credential source", (source, words) => {
     expect(detail(record({ credentialSource: source }))).toContain(
-      `Key           ${words}`,
+      `Key            ${words}`,
     );
   });
 
@@ -687,9 +733,9 @@ describe("providerDetailLines", () => {
         ],
       }),
     });
-    expect(lines).toContain("Server type   vLLM, detected automatically");
-    expect(lines).toContain("Models        2 chat · 1 embedding");
-    expect(lines).toContain("Unchanged     1 declared in your config");
+    expect(lines).toContain("Server type    vLLM, detected automatically");
+    expect(lines).toContain("Models         2 chat · 1 embedding");
+    expect(lines).toContain("Unchanged      1 declared in your config");
   });
 
   it.each([
@@ -698,7 +744,7 @@ describe("providerDetailLines", () => {
     [{}, "OpenAI-compatible, no probe"],
   ])("describes the server type for %j", (probes, words) => {
     expect(detail(record(), { group: group(probes) })).toContain(
-      `Server type   ${words}`,
+      `Server type    ${words}`,
     );
   });
 
@@ -712,7 +758,7 @@ describe("providerDetailLines", () => {
         ],
       }),
     });
-    expect(lines).toContain("Models        none");
+    expect(lines).toContain("Models         none");
     expect(
       lines.filter((line) => line.includes("discovery catalog")),
     ).toHaveLength(1);
@@ -746,10 +792,10 @@ describe("modelEvidenceLines", () => {
     expect(lines.join("\n")).toMatch(/Tools +supported +OpenCode default/);
     expect(lines.join("\n")).toMatch(/Reasoning +not reported +—/);
     expect(lines.join("\n")).toMatch(/Input price +not reported +—/);
-    expect(lines).toContain("Origin        discovered by scout");
-    expect(lines).toContain("Probe         vllm → vllm");
-    expect(lines).toContain("Endpoint      https://atlas.test");
-    expect(lines).toContain("Conflicts     none");
+    expect(lines).toContain("Origin         discovered by scout");
+    expect(lines).toContain("Probe          vllm → vllm");
+    expect(lines).toContain("Endpoint       https://atlas.test");
+    expect(lines).toContain("Conflicts      none");
   });
 
   it.each([
@@ -771,8 +817,8 @@ describe("modelEvidenceLines", () => {
         72,
       ),
     );
-    expect(lines).toContain("Conflicts     first conflict");
-    expect(lines).toContain("              second conflict");
+    expect(lines).toContain("Conflicts      first conflict");
+    expect(lines).toContain("               second conflict");
     expect(lines.some((line) => /^Probe {9}/.test(line))).toBe(false);
   });
 });
@@ -802,32 +848,73 @@ describe("providerEvidenceLines", () => {
         72,
       ),
     );
-    expect(lines).toContain(`Failure       rate-limited (429) at ${AT}`);
-    expect(lines).toContain("Retry after   2026-10-11T08:01:30.000Z");
-    expect(lines).toContain("Next refresh  2026-10-11T08:01:30.000Z");
-    expect(lines).toContain("Skipped       2 model IDs");
-    expect(lines).toContain("Epochs        credential 1 · result none");
+    expect(lines).toContain(`Failure        rate-limited (429) at ${AT}`);
+    expect(lines).toContain("Retry after    2026-10-11T08:01:30.000Z");
+    expect(lines).toContain("Next refresh   2026-10-11T08:01:30.000Z");
+    expect(lines).toContain("Skipped        2 model IDs");
+    expect(lines).toContain("Epochs         credential 1 · result none");
   });
 
   it("says any time and none when nothing is throttled or failed", () => {
     const lines = text(providerEvidenceLines(group(), record(), 72));
-    expect(lines).toContain("Next refresh  any time");
-    expect(lines).toContain("Failure       none");
+    expect(lines).toContain("Next refresh   any time");
+    expect(lines).toContain("Failure        none");
     expect(lines.some((line) => line.startsWith("Retry after"))).toBe(false);
   });
 });
 
 describe("wrapText and helpLines", () => {
-  it("breaks at spaces and keeps a word longer than the line whole", () => {
+  it("breaks at spaces and cuts a word longer than the line across lines", () => {
     expect(wrapText("one two three", 7)).toEqual(["one two", "three"]);
     expect(wrapText("supercalifragilistic", 5)).toEqual([
-      "supercalifragilistic",
+      "super",
+      "calif",
+      "ragil",
+      "istic",
     ]);
     expect(wrapText("", 10)).toEqual([""]);
   });
 
+  it("pulls the previous word down so the last line never holds one word alone", () => {
+    expect(wrapText("one two three four", 13)).toEqual([
+      "one two",
+      "three four",
+    ]);
+    // The previous line keeps at least one word.
+    expect(wrapText("alpha beta", 6)).toEqual(["alpha", "beta"]);
+    // A long last word, such as a URL, may stand alone.
+    expect(wrapText("a b c verylongword", 13)).toEqual([
+      "a b c",
+      "verylongword",
+    ]);
+    expect(wrapText("Copy sent: https://example.test/x", 22)).toEqual([
+      "Copy sent:",
+      "https://example.test/x",
+    ]);
+  });
+
+  it("keeps words joined by a non-breaking space together and shows a space", () => {
+    expect(wrapText(`Create a key (Read${NBSP}&${NBSP}Write) now`, 20)).toEqual(
+      ["Create a key", "(Read & Write) now"],
+    );
+  });
+
   it("turns control characters into spaces instead of line breaks", () => {
     expect(wrapText("a\nb", 10)).toEqual(["a b"]);
+  });
+
+  it("gives each entry's wrapped line count under a pinned title", () => {
+    const layout = helpLayout(
+      "Keys",
+      [
+        { keys: "x", action: "clear search and filters now" },
+        { keys: "y", action: "copy" },
+      ],
+      41,
+    );
+    expect(layout.pinned).toBe(2);
+    expect(layout.entries).toEqual([2, 1]);
+    expect(layout.lines).toHaveLength(2 + 3);
   });
 
   it("wraps a long action under itself, past the key column", () => {

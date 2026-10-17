@@ -149,9 +149,9 @@ function dropColumns(
 
 /**
  * Spans for one row at `width` columns. A selected row in a focused list
- * takes the `selected` color on a `selectedBg` band across the full width;
- * in an unfocused list it keeps its colors and only shows the bar, in
- * `muted`.
+ * takes the `selected` color on a `selectedBg` band across the full width,
+ * which marks it without the bar; in an unfocused list it keeps its colors
+ * and shows the bar, in `muted`.
  */
 export function rowSpans(
   row: ListRow,
@@ -162,16 +162,11 @@ export function rowSpans(
   const columns = Math.max(0, Math.floor(width));
   let segments = fitSegments(row.segments, columns);
   const highlighted = state.selected && state.focused;
-  const showBar = state.selected && state.bar && columns > 0;
+  const showBar = state.selected && !highlighted && state.bar && columns > 0;
   if (showBar) segments = dropColumns(segments, 1);
 
   const spans: StyledSpan[] = [];
-  if (showBar)
-    spans.push({
-      text: SELECTION_BAR,
-      fg: highlighted ? palette.selected : palette.muted,
-      ...(highlighted ? { bg: palette.selectedBg } : {}),
-    });
+  if (showBar) spans.push({ text: SELECTION_BAR, fg: palette.muted });
   for (const segment of segments)
     spans.push({
       text: segment.text,

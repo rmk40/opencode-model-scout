@@ -4,15 +4,17 @@ import type {
   CatalogProviderRecord,
   ScalarEvidence,
 } from "./catalog-evidence";
-import { formatContextCell, PRICE_CELL_WIDTH } from "./format";
+import { displayOrigin, formatContextCell, PRICE_CELL_WIDTH } from "./format";
 import {
   capabilityCell,
+  helpLayout,
   helpLines,
   modelDetailLines,
   modelEvidenceLines,
   modelSummaryLine,
   needsAttention,
   paragraph,
+  wrapText,
   priceCell,
   providerDetailLines,
   providerEvidenceLines,
@@ -399,6 +401,26 @@ export function modelRowSegments(
   ];
 }
 
+/** Status glyphs whose color carries the state. */
+const STATUS_GLYPHS = new Set(["●", "○", "▲"]);
+
+/**
+ * A status label as segments: a leading status glyph takes the state's
+ * color and the words stay in base, which reads on every theme.
+ */
+export function glyphSegments(label: {
+  readonly text: string;
+  readonly role: ForegroundRole;
+}): Segment[] {
+  const glyph = label.text.slice(0, 1);
+  if (!STATUS_GLYPHS.has(glyph) || label.text[1] !== " ")
+    return [{ text: label.text, role: label.role }];
+  return [
+    { text: glyph, role: label.role },
+    { text: label.text.slice(1), role: "base" },
+  ];
+}
+
 /** A provider header: `▾`/`▸`, the name, and count and status at the right edge. */
 export function providerRowSegments(
   group: ProviderGroup,
@@ -415,13 +437,12 @@ export function providerRowSegments(
   const right: Segment[] = [
     { text: count, role: "muted" },
     ...(status
-      ? [
-          { text: GAP, role: "base" as const },
-          { text: status.text, role: status.role },
-        ]
+      ? [{ text: GAP, role: "base" as const }, ...glyphSegments(status)]
       : []),
   ];
-  const nameColumns = Math.max(4, width - GUTTER - 1 - segmentsWidth(right));
+  // The last column matches the price cell's tier column, so the status
+  // ends where the price digits do.
+  const nameColumns = Math.max(4, width - GUTTER - 2 - segmentsWidth(right));
   return [
     { text: " ", role: "base" },
     { text: collapsed ? "▸" : "▾", role: "muted" },
@@ -429,6 +450,7 @@ export function providerRowSegments(
     { text: padText(group.provider, nameColumns), role: "group" },
     { text: " ", role: "base" },
     ...right,
+    { text: " ", role: "base" },
   ];
 }
 
@@ -662,16 +684,13 @@ export function filterSummary(
   scope: BrowserScope,
   groups: readonly ProviderGroup[],
   embeddingsHidden: number,
-  compact: boolean,
 ): string {
   const filters = nav.filters;
   const parts: string[] = [TYPE_WORDS[filters.type]];
   if (scope.kind === "all")
     parts.push(
       filters.provider === "all"
-        ? compact
-          ? "all"
-          : "all providers"
+        ? "all providers"
         : (groups.find((group) => group.id === filters.provider)?.provider ??
             filters.provider),
     );
@@ -714,28 +733,66 @@ export function footerSegments(
   keysHint = true,
 ): Segment[] {
   const close = hintSegments({ title: "close", key: "esc" });
-  const keys = keysHint ? hintSegments({ title: "keys", key: "?" }) : [];
-  const budget = width - segmentsWidth(close) - 2;
+  const all: FooterHint[] = keysHint
+    ? [...hints, { title: "keys", key: "?" }]
+    : [...hints];
+  const shown = footerShown(hints, width, keysHint);
   const left: Segment[] = [];
-  for (const hint of hints) {
-    const next = [
-      ...left,
-      ...(left.length > 0 ? [{ text: GAP, role: "base" as const }] : []),
-      ...hintSegments(hint),
-    ];
-    const withKeys =
-      keys.length > 0
-        ? [...next, { text: GAP, role: "base" as const }, ...keys]
-        : next;
-    if (segmentsWidth(withKeys) > budget) break;
-    left.splice(0, left.length, ...next);
+  for (const [index, hint] of all.entries()) {
+    if (index < hints.length && !shown.has(index)) continue;
+    if (left.length > 0) left.push({ text: GAP, role: "base" });
+    left.push(...hintSegments(hint));
   }
-  if (keys.length > 0)
-    left.push(
-      ...(left.length > 0 ? [{ text: GAP, role: "base" as const }] : []),
-      ...keys,
-    );
   return justify(left, close, width);
+}
+
+/**
+ * Indexes of `hints` the footer shows at `width` columns, beside "keys ?"
+ * (unless `keysHint` is false) and "close esc".
+ */
+export function footerShown(
+  hints: readonly FooterHint[],
+  width: number,
+  keysHint = true,
+): Set<number> {
+  const close = hintSegments({ title: "close", key: "esc" });
+  const widths = hints.map((hint) => segmentsWidth(hintSegments(hint)));
+  if (keysHint)
+    widths.push(segmentsWidth(hintSegments({ title: "keys", key: "?" })));
+  const fitted = fitFooterHints(
+    widths,
+    width - segmentsWidth(close) - FOOTER_CLOSE_GAP,
+    keysHint ? widths.length - 1 : undefined,
+  );
+  return new Set([...fitted].filter((index) => index < hints.length));
+}
+
+/** Fewest columns between the last hint and "close esc". */
+const FOOTER_CLOSE_GAP = 4;
+
+/**
+ * Which hints fit in `budget` columns, by index. Hints count in list order,
+ * earlier first; one that does not fit is skipped and later, shorter ones
+ * still get a chance, so the order on screen never changes. `required` is
+ * always kept. Hints are separated by two columns.
+ */
+export function fitFooterHints(
+  widths: readonly number[],
+  budget: number,
+  required?: number,
+): Set<number> {
+  const shown = new Set<number>();
+  const gap = GAP.length;
+  let used = required !== undefined ? (widths[required] ?? 0) : 0;
+  if (required !== undefined) shown.add(required);
+  for (const [index, columns] of widths.entries()) {
+    if (index === required) continue;
+    const next = used + (shown.size > 0 ? gap : 0) + columns;
+    if (next > budget) continue;
+    shown.add(index);
+    used = next;
+  }
+  return shown;
 }
 
 /** `left` at the start and `right` at the end of `width` columns; `left` is cut when both do not fit. */
@@ -807,9 +864,14 @@ function finitePositive(value: unknown, fallback: number): number {
     : fallback;
 }
 
+/** The row the host's dialog panel adds above the content. */
+const HOST_TOP_ROWS = 1;
+
 /**
- * Dialog width `min(116, cols - 2)` with side padding 3, content height
- * `min(30, rows - 4)`; the detail pane sits beside the list from 120 columns.
+ * Dialog width `min(116, cols - 2)` with side padding 3. Content height
+ * `min(30, rows - 5)`: with the row the host adds above it, the dialog
+ * takes at most `rows - 4` rows, so the centered panel leaves rows free
+ * above and below. The detail pane sits beside the list from 120 columns.
  */
 export function browserLayout(columns: number, rows: number): BrowserLayout {
   const cols = finitePositive(columns, 80);
@@ -820,7 +882,7 @@ export function browserLayout(columns: number, rows: number): BrowserLayout {
   );
   const height = Math.max(
     CHROME_ROWS + 2,
-    Math.min(MAX_CONTENT_ROWS, lines - 4),
+    Math.min(MAX_CONTENT_ROWS, lines - 4 - HOST_TOP_ROWS),
   );
   const wide = cols >= WIDE_MIN_COLUMNS;
   const listWidth = wide ? WIDE_LIST_COLUMNS : width;
@@ -837,15 +899,37 @@ export function browserLayout(columns: number, rows: number): BrowserLayout {
   };
 }
 
+/**
+ * Columns of a list row's content. The selection band spans the whole list
+ * width, so the last column is padding inside the band.
+ */
+export function rowColumns(layout: BrowserLayout): number {
+  return Math.max(1, layout.listWidth - 1);
+}
+
 // ── Text pane ───────────────────────────────────────────────────────────
+
+/**
+ * How a pane's lines group: `pinned` heading lines that never scroll, then
+ * blocks of `blocks[i]` lines each, which scroll and show only whole.
+ * Without a layout every line is its own block.
+ */
+export interface PaneLayout {
+  readonly pinned: number;
+  readonly blocks: readonly number[];
+}
 
 interface TextPane {
   readonly root: TuiNode<"box">;
-  /** `highlight` lists lines painted as selected; the pane scrolls to show the first. */
+  /**
+   * `highlight` lists lines painted as selected; the pane scrolls to show
+   * the first. `layout` groups the lines into blocks.
+   */
   setLines(
     lines: readonly Line[],
     keepOffset?: boolean,
     highlight?: readonly number[],
+    layout?: PaneLayout,
   ): void;
   setViewport(width: number, height: number): void;
   scroll(move: ListMove): void;
@@ -893,13 +977,43 @@ function createTextPane(
     },
     ...slots,
   );
-  const maxOffset = (): number => Math.max(0, lines.length - height);
+  let pinned = 0;
+  /** Lines per block after the pinned lines. */
+  let blocks: readonly number[] = [];
+  const shown = (): PaneWindow => blockWindow(blocks, height - pinned, offset);
+  /** What each slot shows: a line and its index, or an indicator (index -1). */
+  const layoutSlots = (view: PaneWindow): { line?: Line; index: number }[] => {
+    const shownSlots: { line?: Line; index: number }[] = [];
+    for (let index = 0; index < Math.min(pinned, height); index += 1)
+      shownSlots.push({ line: lines[index], index });
+    if (view.above > 0)
+      shownSlots.push({
+        line: [{ text: `↑ ${view.above} more`, role: "muted" }],
+        index: -1,
+      });
+    let first = pinned;
+    for (let block = 0; block < view.offset; block += 1)
+      first += blocks[block] ?? 0;
+    for (let index = first; index < first + view.rows; index += 1)
+      shownSlots.push({ line: lines[index], index });
+    if (view.below > 0) {
+      while (shownSlots.length < height - 1) shownSlots.push({ index: -1 });
+      shownSlots.push({
+        line: [{ text: `↓ ${view.below} more`, role: "muted" }],
+        index: -1,
+      });
+    }
+    return shownSlots;
+  };
   const paint = (): void => {
     const colors = palette();
+    const view = shown();
+    offset = view.offset;
+    const shownSlots = layoutSlots(view);
     for (const [slot, node] of slots.entries()) {
       if (slot >= height) continue;
-      const line = lines[offset + slot];
-      const selected = highlighted.has(offset + slot);
+      const { line, index } = shownSlots[slot] ?? { index: -1 };
+      const selected = highlighted.has(index);
       renderer.setStyledText(
         node,
         line
@@ -914,17 +1028,31 @@ function createTextPane(
   };
   return {
     root,
-    setLines(next, keepOffset = false, highlight = []) {
+    setLines(next, keepOffset = false, highlight = [], layout) {
       lines = next;
       highlighted = new Set(highlight);
-      offset = keepOffset ? Math.min(offset, maxOffset()) : 0;
-      const first = highlight[0];
-      if (first !== undefined) {
-        const last = highlight[highlight.length - 1] ?? first;
-        if (first < offset) offset = first;
-        else if (last >= offset + height)
-          offset = Math.min(maxOffset(), last - height + 1);
+      const sum = (layout?.blocks ?? []).reduce(
+        (total, size) => total + size,
+        0,
+      );
+      // A layout that does not cover the lines falls back to one block per line.
+      if (layout && layout.pinned + sum === next.length) {
+        pinned = layout.pinned;
+        blocks = layout.blocks;
+      } else {
+        pinned = 0;
+        blocks = next.map(() => 1);
       }
+      offset = keepOffset ? shown().offset : 0;
+      const first = highlight[0];
+      if (first !== undefined && pinned === 0)
+        offset = revealLines(
+          lines.length,
+          height,
+          offset,
+          first,
+          highlight[highlight.length - 1] ?? first,
+        );
       paint();
     },
     setViewport(nextWidth, nextHeight) {
@@ -936,28 +1064,141 @@ function createTextPane(
       if (previous !== height)
         for (const [slot, node] of slots.entries())
           renderer.set(node, "visible", slot < height);
-      offset = Math.min(offset, maxOffset());
       paint();
     },
     scroll(move) {
-      const page = Math.max(1, height - 1);
-      const next =
-        move === "up"
-          ? offset - 1
-          : move === "down"
-            ? offset + 1
-            : move === "pageup"
-              ? offset - page
-              : move === "pagedown"
-                ? offset + page
-                : move === "home"
-                  ? 0
-                  : maxOffset();
-      offset = Math.min(Math.max(0, next), maxOffset());
+      offset = scrollBlocks(blocks, height - pinned, offset, move);
       paint();
     },
     repaint: paint,
   };
+}
+
+/**
+ * What a text pane of `height` rows shows from block `offset`: the first
+ * block shown, how many lines of whole blocks fit (all rows when nothing
+ * is hidden), and how many blocks are hidden above and below. While blocks
+ * are hidden, a row at the top or the bottom gives way to an "↑ N more" or
+ * "↓ N more" line. A block taller than the room left shows cut, alone.
+ */
+export interface PaneWindow {
+  readonly offset: number;
+  readonly rows: number;
+  readonly above: number;
+  readonly below: number;
+}
+
+export function blockWindow(
+  sizes: readonly number[],
+  height: number,
+  offset: number,
+): PaneWindow {
+  const rows = Math.max(1, Math.floor(height));
+  const total = sizes.reduce((sum, size) => sum + size, 0);
+  if (total <= rows) return { offset: 0, rows, above: 0, below: 0 };
+  const fit = (
+    start: number,
+    room: number,
+  ): { count: number; lines: number } => {
+    let lines = 0;
+    let count = 0;
+    for (let block = start; block < sizes.length; block += 1) {
+      const size = sizes[block] ?? 0;
+      if (lines + size > room) break;
+      lines += size;
+      count += 1;
+    }
+    return { count, lines };
+  };
+  // The last offset: the earliest block from which the rest fits under the ↑ row.
+  let last = sizes.length - 1;
+  let tail = 0;
+  for (let block = sizes.length - 1; block >= 0; block -= 1) {
+    tail += sizes[block] ?? 0;
+    if (tail > rows - 1) break;
+    last = block;
+  }
+  const start = Math.min(Math.max(0, Math.floor(offset)), Math.max(0, last));
+  const top = start > 0 ? 1 : 0;
+  let shown = fit(start, rows - top);
+  if (start + shown.count < sizes.length) shown = fit(start, rows - top - 1);
+  if (shown.count === 0) {
+    const room = rows - top - (start + 1 < sizes.length ? 1 : 0);
+    shown = { count: 1, lines: Math.max(1, room) };
+  }
+  return {
+    offset: start,
+    rows: shown.lines,
+    above: start,
+    below: sizes.length - start - shown.count,
+  };
+}
+
+/** `blockWindow` for `total` lines of one block each. */
+export function paneWindow(
+  total: number,
+  height: number,
+  offset: number,
+): PaneWindow {
+  return blockWindow(lineBlocks(total), height, offset);
+}
+
+function lineBlocks(total: number): number[] {
+  return Array.from({ length: Math.max(0, total) }, () => 1);
+}
+
+/** The block offset after one scroll move; a page keeps one block of overlap. */
+export function scrollBlocks(
+  sizes: readonly number[],
+  height: number,
+  offset: number,
+  move: ListMove,
+): number {
+  const current = blockWindow(sizes, height, offset);
+  const count = sizes.length - current.offset - current.below;
+  const page = Math.max(1, count - 1);
+  const next =
+    move === "up"
+      ? current.offset - 1
+      : move === "down"
+        ? current.offset + 1
+        : move === "pageup"
+          ? current.offset - page
+          : move === "pagedown"
+            ? current.offset + page
+            : move === "home"
+              ? 0
+              : sizes.length;
+  return blockWindow(sizes, height, next).offset;
+}
+
+/** `scrollBlocks` for `total` lines of one block each. */
+export function scrollPane(
+  total: number,
+  height: number,
+  offset: number,
+  move: ListMove,
+): number {
+  return scrollBlocks(lineBlocks(total), height, offset, move);
+}
+
+/** An offset that shows lines `first` through `last`, moving as little as possible. */
+function revealLines(
+  total: number,
+  height: number,
+  offset: number,
+  first: number,
+  last: number,
+): number {
+  let start = paneWindow(total, height, offset).offset;
+  for (let pass = 0; pass < 3; pass += 1) {
+    const view = paneWindow(total, height, start);
+    if (first < view.offset) start = first;
+    else if (last >= view.offset + view.rows)
+      start = view.offset + (last - (view.offset + view.rows) + 1);
+    else return view.offset;
+  }
+  return paneWindow(total, height, start).offset;
 }
 
 // ── View ────────────────────────────────────────────────────────────────
@@ -1138,7 +1379,7 @@ export function buildBrowserView(
   let layout = browserLayout(terminal.terminalWidth, terminal.terminalHeight);
   let projection = projectBrowser(data, nav, {
     scope,
-    width: layout.listWidth,
+    width: rowColumns(layout),
     current: options.current(),
   });
   let screens: BrowserScreen[] = ["list"];
@@ -1151,6 +1392,8 @@ export function buildBrowserView(
   const frame = options.frame;
   /** The frame's card, read again whenever data, layout, or the frame change. */
   let card: BrowserFrameCard | undefined;
+  /** Rows the list, pane, and separator show; set by `applyScreen`. */
+  let contentRows = 1;
 
   const screen = (): BrowserScreen => screens[screens.length - 1] ?? "list";
   const replacing = (): boolean => card?.placement === "replace";
@@ -1323,7 +1566,7 @@ export function buildBrowserView(
     const wanted = selectionKey(nav.selected);
     projection = projectBrowser(data, nav, {
       scope,
-      width: layout.listWidth,
+      width: rowColumns(layout),
       current: options.current(),
     });
     list.setRows(projection.rows);
@@ -1366,11 +1609,19 @@ export function buildBrowserView(
    * screen, then the frame's card when it sits above the list.
    */
   function bannerLines(): Line[] {
-    const lines: Line[] = notice?.detail
-      ? hardWrap(notice.detail, layout.width).map((part) => [
+    const wrapped = noticeText();
+    // A wrapped notice continues in base, or muted when it is a muted note.
+    const continued: ForegroundRole =
+      wrapped?.role === "muted" ? "muted" : "base";
+    const lines: Line[] = (wrapped?.lines.slice(1) ?? []).map((part) => [
+      { text: part, role: continued },
+    ]);
+    if (notice?.detail)
+      lines.push(
+        ...hardWrap(notice.detail, layout.width).map((part) => [
           { text: part, role: "base" as const },
-        ])
-      : [];
+        ]),
+      );
     if (screen() === "list" && card?.placement === "above")
       lines.push(...card.lines);
     return lines;
@@ -1390,10 +1641,15 @@ export function buildBrowserView(
   function bodyRows(): number {
     const summary = screen() === "list" && !layout.wide && !cardsShown();
     const framed = frame ? 1 : 0;
-    const hidden = replacing() ? 2 : 0;
+    const hidden = searchHidden() ? 2 : 0;
     return (
       layout.bodyHeight - (summary ? 1 : 0) - framed + hidden - bannerRows()
     );
+  }
+
+  /** The key list and a replacing card have no use for search and filters. */
+  function searchHidden(): boolean {
+    return replacing() || screen() === "help";
   }
 
   /**
@@ -1425,18 +1681,22 @@ export function buildBrowserView(
     const summary = listScreen && !layout.wide && !cards;
     const fullBody = bodyRows();
     // A replacing card and the key list over it take the rows they need
-    // plus one before the footer; the list views keep the full height.
+    // plus the blank row before the footer; the list views keep the full
+    // height.
     const bodyHeight =
       replacing() && (listScreen || current === "help")
         ? Math.min(fullBody, paneLines(layout.width).length + 1)
         : fullBody;
+    // A blank row stays between the body and the footer, except under the
+    // narrow list, where the summary line sits there.
+    contentRows = Math.max(1, bodyHeight - (summary ? 0 : 1));
     const rootHeight = layout.height - (fullBody - bodyHeight);
     renderer.set(root, "height", rootHeight);
     renderer.set(root, "maxHeight", rootHeight);
     const bannerHeight = bannerRows();
     renderer.set(statusLine, "visible", frame !== undefined);
-    renderer.set(searchRow, "visible", !replacing());
-    renderer.set(filterLine, "visible", !replacing());
+    renderer.set(searchRow, "visible", !searchHidden());
+    renderer.set(filterLine, "visible", !searchHidden());
     renderer.set(banner.root, "visible", bannerHeight > 0);
     banner.setViewport(layout.width, Math.max(1, bannerHeight));
     banner.setLines(bannerHeight > 0 ? bannerLines() : []);
@@ -1450,10 +1710,10 @@ export function buildBrowserView(
     );
     renderer.set(filterList.root, "visible", current === "filters");
     renderer.set(summaryLine, "visible", summary);
-    list.setViewport(layout.listWidth, bodyHeight);
-    pane.setViewport(split ? layout.paneWidth : layout.width, bodyHeight);
-    filterList.setViewport(layout.width, Math.min(12, bodyHeight));
-    renderer.set(separator, "height", bodyHeight);
+    list.setViewport(layout.listWidth, contentRows);
+    pane.setViewport(split ? layout.paneWidth : layout.width, contentRows);
+    filterList.setViewport(layout.width, Math.min(12, contentRows));
+    renderer.set(separator, "height", contentRows);
     if (current === "filters") paintFilters();
     if (!keepOffset) paneKey = undefined;
     paintPane();
@@ -1463,7 +1723,7 @@ export function buildBrowserView(
   function paintSeparator(): void {
     renderer.setStyledText(separator, [
       {
-        text: Array.from({ length: bodyRows() }, () => " │ ").join("\n"),
+        text: Array.from({ length: contentRows }, () => " │ ").join("\n"),
         fg: palette().rule,
       },
     ]);
@@ -1541,7 +1801,15 @@ export function buildBrowserView(
     const key = `${view}\u0000${replacing() ? "card" : (list.selected()?.row.key ?? "")}`;
     const highlight =
       current === "list" && replacing() ? card?.highlight : undefined;
-    pane.setLines(paneLines(width), keepOffset || key === paneKey, highlight);
+    const keep = keepOffset || key === paneKey;
+    if (current === "help") {
+      // The key list scrolls by whole entries under its title.
+      const help = helpLayout(helpTitle(), helpEntries(), width);
+      pane.setLines(help.lines, keep, undefined, {
+        pinned: help.pinned,
+        blocks: help.entries,
+      });
+    } else pane.setLines(paneLines(width), keep, highlight);
     paneKey = key;
   }
 
@@ -1687,53 +1955,67 @@ export function buildBrowserView(
     if (projection.attention > 0)
       right.push(
         { text: " · ", role: "muted" },
-        { text: `${projection.attention} needs attention`, role: "warn" },
+        ...glyphSegments({
+          text: `▲ ${projection.attention} needs attention`,
+          role: "warn",
+        }),
       );
     if (projection.discovering > 0)
       right.push(
         { text: " · ", role: "muted" },
-        { text: "○ checking", role: "info" },
+        ...glyphSegments({ text: "○ checking", role: "info" }),
       );
     return justify(left, right, layout.width);
   }
 
   function filterSegments(): Segment[] {
-    const compact = !layout.wide;
     const summary = filterSummary(
       nav,
       scope,
       data.groups,
       projection.embeddingsHidden,
-      compact,
     );
     const narrowing = hasNarrowing(nav);
-    return justify(
-      [{ text: `Filters: ${summary}`, role: "muted" }],
-      [
-        { text: `sort ${SORT_NAMES[nav.sort]} · `, role: "muted" },
-        { text: "clear", role: narrowing ? "base" : "disabled" },
-        { text: " ", role: "base" },
-        { text: "x", role: narrowing ? "key" : "disabled" },
-      ],
-      layout.width,
-    );
+    const right: Segment[] = [
+      { text: `sort ${SORT_NAMES[nav.sort]} · `, role: "muted" },
+      { text: "clear", role: narrowing ? "base" : "disabled" },
+      { text: " ", role: "base" },
+      { text: "x", role: narrowing ? "key" : "disabled" },
+    ];
+    // The "Filters:" label goes first when the summary needs the room.
+    const labeled = `Filters: ${summary}`;
+    const text =
+      textWidth(labeled) + 1 + segmentsWidth(right) <= layout.width
+        ? labeled
+        : summary;
+    return justify([{ text, role: "muted" }], right, layout.width);
   }
 
-  function noticeSegments(): Segment[] {
-    if (notice) return [{ text: notice.text, role: notice.role }];
+  /** The notice row's text, wrapped: the first line shows on the row, the rest in the banner. */
+  function noticeText(): { lines: string[]; role: NoticeRole } | undefined {
+    const wrap = (text: string, role: NoticeRole) => ({
+      lines: wrapText(text, layout.width),
+      role,
+    });
+    if (notice) return wrap(notice.text, notice.role);
     if (data.status === "ready" && data.serverNotice)
-      return [
-        {
-          text: `▲ ${data.serverNotice}. Showing OpenCode's model list.`,
-          role: "warn",
-        },
-      ];
+      return wrap(
+        `▲ ${data.serverNotice}. Showing OpenCode's model list.`,
+        "warn",
+      );
     if (
       data.catalog?.status === "pending" &&
       data.catalog.providers.length === 0
     )
-      return [{ text: "○ Discovery is starting", role: "info" }];
-    return [];
+      return wrap("○ Discovery is starting", "info");
+    return undefined;
+  }
+
+  function noticeSegments(): Segment[] {
+    const shown = noticeText();
+    return shown
+      ? glyphSegments({ text: shown.lines[0] ?? "", role: shown.role })
+      : [];
   }
 
   function paintSummary(): void {
@@ -1742,12 +2024,14 @@ export function buildBrowserView(
     paintLine(
       summaryLine,
       row?.model
-        ? modelSummaryLine(row.model)
+        ? modelSummaryLine(row.model, layout.width)
         : row
           ? [
               { text: row.group.provider, role: "base" },
               {
-                text: row.group.endpoint ? ` · ${row.group.endpoint}` : "",
+                text: row.group.endpoint
+                  ? ` · ${displayOrigin(row.group.endpoint)}`
+                  : "",
                 role: "muted",
               },
             ]
@@ -2231,10 +2515,11 @@ export function buildBrowserView(
       applyScreen(true);
     },
     setNotice(next) {
-      const banner = notice?.detail !== undefined || next?.detail !== undefined;
+      const before = bannerLines().length;
       notice = next;
-      // A notice with detail changes the banner, and so the body's height.
-      if (banner) applyScreen(true);
+      // A notice that wraps or has detail changes the banner, and so the
+      // body's height.
+      if (bannerLines().length !== before) applyScreen(true);
       else paintLine(noticeLine, noticeSegments());
     },
     tick() {

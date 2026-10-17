@@ -86,12 +86,20 @@ function findNodeById(node: unknown, id: string): MockNode | undefined {
 }
 
 /** Text of a node, from its StyledText chunks or its plain content. */
+/**
+ * Text of a node. A focused selection is a background band without a
+ * glyph; its first column reads as "▌" here, like the bar of an unfocused
+ * selection, so tests can find the selected row either way.
+ */
 function textOf(node: MockNode | undefined): string {
   const content = node?.content;
-  if (content && typeof content === "object" && "chunks" in content)
-    return (content as { chunks: Array<{ text: string }> }).chunks
-      .map((chunk) => chunk.text)
-      .join("");
+  if (content && typeof content === "object" && "chunks" in content) {
+    const chunks = (
+      content as { chunks: Array<{ text: string; bg?: unknown }> }
+    ).chunks;
+    const text = chunks.map((chunk) => chunk.text).join("");
+    return chunks[0]?.bg !== undefined ? `▌${text.slice(1)}` : text;
+  }
   return typeof node?.props?.content === "string" ? node.props.content : "";
 }
 
@@ -656,7 +664,7 @@ describe("layout", () => {
     h.resize(80, 24);
     expect(findNodeById(root, "modelscout-browser")?.props).toMatchObject({
       width: 78,
-      height: 20,
+      height: 19,
     });
     expect(visible(findNodeById(root, "modelscout-pane"))).toBe(false);
     expect(line(root, "modelscout-summary")).toMatch(/^Atlas Model/);
@@ -683,7 +691,9 @@ describe("layout", () => {
     h.press({ name: "down" });
     h.press({ name: "return" });
     for (let step = 0; step < 3; step += 1) h.press({ name: "down" });
-    const first = (): string | undefined => lines(root, "modelscout-pane")[0];
+    // The top row says how many lines are hidden above; the first shown line follows.
+    expect(lines(root, "modelscout-pane")[0]).toBe("↑ 3 more");
+    const first = (): string | undefined => lines(root, "modelscout-pane")[1];
     expect(first()).toMatch(/^Context/);
 
     h.resize(80, 16);

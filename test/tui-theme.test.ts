@@ -88,6 +88,7 @@ describe("rolePalette", () => {
   it("maps every role to its dialog-surface token", () => {
     expect(rolePalette(source(tokens()))).toEqual({
       base: C.base,
+      strong: C.base,
       muted: C.muted,
       faint: C.faint,
       selected: C.actionFocused,

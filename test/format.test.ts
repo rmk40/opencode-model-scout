@@ -10,6 +10,7 @@ import {
   formatNumber,
   formatPrice,
   formatPriceCell,
+  formatPricePair,
 } from "../src/format";
 
 describe("formatNumber", () => {
@@ -153,7 +154,17 @@ describe("formatPriceCell", () => {
 
   it("joins input and output prices", () => {
     expect(formatPriceCell(3, 15, false)).toBe("$3/$15");
-    expect(formatPriceCell(1.25, 10, false)).toBe("$1.25/$10");
+    expect(formatPriceCell(2.5, 10, false)).toBe("$2.50/$10.00");
+  });
+
+  it("gives both sides cents when one side shows cents", () => {
+    expect(formatPricePair(0.15, 0.6)).toBe("$0.15/$0.60");
+    expect(formatPricePair(1.25, 10)).toBe("$1.25/$10.00");
+    expect(formatPricePair(12.5, 3)).toBe("$12.50/$3.00");
+    expect(formatPricePair(1, 5)).toBe("$1/$5");
+    // Three significant digits stay; the other side gets cents.
+    expect(formatPricePair(0.075, 0.3)).toBe("$0.075/$0.30");
+    expect(formatPricePair(0.15, undefined)).toBe("$0.15/?");
   });
 
   it("adds + for context-priced tiers", () => {

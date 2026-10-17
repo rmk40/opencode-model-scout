@@ -207,9 +207,10 @@ describe("rowSpans", () => {
     expect(spansWidth(spans)).toBe(8);
   });
 
-  it("puts the bar in the first column of a focused selection and bands the full width", () => {
+  it("marks a focused selection with a band across the full width and no bar", () => {
     const spans = rowSpans(row, PALETTE, 24, focusedSelection);
-    expect(spansText(spans)).toBe(`${SELECTION_BAR}● Atlas Chat  200K     `);
+    expect(spansText(spans)).toBe(" ● Atlas Chat  200K     ");
+    expect(spans.some((span) => span.text === SELECTION_BAR)).toBe(false);
     expect(spansWidth(spans)).toBe(24);
     for (const span of spans) expect(span.bg).toBe("selectedBg");
     for (const span of spans.slice(0, -1)) expect(span.fg).toBe("selected");
@@ -241,7 +242,7 @@ describe("rowSpans", () => {
       { key: "k", segments: [{ text: "日本", role: "base" }] },
       PALETTE,
       4,
-      focusedSelection,
+      unfocusedSelection,
     );
     expect(spansText(spans)).toBe(`${SELECTION_BAR} 本`);
     expect(spansWidth(spans)).toBe(4);
@@ -252,7 +253,7 @@ describe("rowSpans", () => {
       { key: "k", segments: [{ text: " Atlas Chat Model", role: "base" }] },
       PALETTE,
       10,
-      focusedSelection,
+      unfocusedSelection,
     );
     expect(spansText(spans)).toBe(`${SELECTION_BAR}Atlas Ch…`);
     expect(spansWidth(spans)).toBe(10);
@@ -545,9 +546,8 @@ describe("createRowList", () => {
     expect(list.selected()).toEqual({ row: GROUPED[1], index: 1 });
     expect(onSelect).toHaveBeenCalledWith(GROUPED[1], 1);
     expect(h.line(0)).toBe("H0");
-    expect(h.line(1)).toBe(`${SELECTION_BAR}a`.padEnd(12));
+    expect(h.line(1)).toBe(" a".padEnd(12));
     expect(h.chunks("list-row-1")[0]).toMatchObject({
-      text: SELECTION_BAR,
       fg: "selected",
       bg: "selectedBg",
     });
@@ -573,10 +573,7 @@ describe("createRowList", () => {
     list.move("down");
 
     expect(list.position()).toEqual(at(3, 1));
-    expect([h.line(0), h.line(2)]).toEqual([
-      " b",
-      `${SELECTION_BAR}d`.padEnd(12),
-    ]);
+    expect([h.line(0), h.line(2)]).toEqual([" b", " d".padEnd(12)]);
     expect(h.created.length).toBe(nodes);
   });
 
@@ -680,7 +677,7 @@ describe("createRowList", () => {
       expect(h.node("list").props).toMatchObject({ width: 6, height: 2 });
       expect(h.node("list-row-1").props.visible).toBe(true);
       expect(h.node("list-row-2").props.visible).toBe(false);
-      expect(h.line(0)).toBe(`${SELECTION_BAR}a`.padEnd(6));
+      expect(h.line(0)).toBe(" a".padEnd(6));
     });
 
     it("caps a larger viewport at the capacity", () => {
@@ -698,7 +695,7 @@ describe("createRowList", () => {
       list.select("c");
       list.setViewport(12, 1);
       expect(list.position()).toEqual(at(2, 2));
-      expect(h.line(0)).toBe(`${SELECTION_BAR}c`.padEnd(12));
+      expect(h.line(0)).toBe(" c".padEnd(12));
     });
   });
 

@@ -7,13 +7,21 @@ import type {
 } from "./catalog-evidence";
 import {
   compactCount,
+  displayOrigin as displayEndpoint,
   formatBytes,
   formatDetailPrice,
   formatNumber,
-  formatPrice,
+  formatPricePair,
   formatPriceCell,
+  PRICE_CELL_WIDTH,
 } from "./format";
-import { padText, sanitizeInline, textWidth, type Segment } from "./tui-list";
+import {
+  padText,
+  sanitizeInline,
+  sliceColumns,
+  textWidth,
+  type Segment,
+} from "./tui-list";
 import {
   modelCertainty,
   type CapabilityName,
@@ -26,29 +34,67 @@ import type { ForegroundRole } from "./tui-theme";
 /** One rendered line: role-tagged segments, left to right. */
 export type Line = readonly Segment[];
 
-const LABEL_COLUMNS = 14;
+/** "Not supported" plus a two-column gap. */
+const LABEL_COLUMNS = 15;
 
 function seg(text: string, role: ForegroundRole = "base"): Segment {
   return { text, role };
 }
 
-/** Split `text` into lines of at most `width` columns, breaking at spaces. */
+/** A non-breaking space: words joined by it stay on one line. */
+export const NBSP = "\u00a0";
+
+/** `word` cut into pieces of at most `columns`, by grapheme. */
+function breakWord(word: string, columns: number): string[] {
+  const pieces: string[] = [];
+  let rest = word;
+  while (textWidth(rest) > columns) {
+    const piece = sliceColumns(rest, columns) || rest.slice(0, 1);
+    pieces.push(piece);
+    rest = rest.slice(piece.length);
+  }
+  if (rest) pieces.push(rest);
+  return pieces;
+}
+
+/**
+ * Split `text` into lines of at most `width` columns, breaking at spaces;
+ * a word longer than a line is cut across lines, so nothing is truncated.
+ * Words joined by `NBSP` stay together. When the last line would hold a
+ * single short word (under a third of the line), the previous line's last
+ * word moves down to join it.
+ */
 export function wrapText(text: string, width: number): string[] {
   const columns = Math.max(1, Math.floor(width));
-  const words = sanitizeInline(text).split(" ").filter(Boolean);
-  const lines: string[] = [];
-  let current = "";
+  const words = sanitizeInline(text)
+    .split(" ")
+    .filter(Boolean)
+    .flatMap((word) => breakWord(word, columns));
+  const lines: string[][] = [];
+  let current: string[] = [];
   for (const word of words) {
-    const next = current ? `${current} ${word}` : word;
-    if (textWidth(next) <= columns) {
-      current = next;
+    const next = [...current, word].join(" ");
+    if (current.length === 0 || textWidth(next) <= columns) {
+      current.push(word);
       continue;
     }
-    if (current) lines.push(current);
-    current = word;
+    lines.push(current);
+    current = [word];
   }
-  if (current) lines.push(current);
-  return lines.length > 0 ? lines : [""];
+  if (current.length > 0) lines.push(current);
+  const last = lines[lines.length - 1];
+  const previous = lines[lines.length - 2];
+  // A long word such as a URL may stand alone; a short one may not.
+  const short = textWidth(last?.[0] ?? "") * 3 < columns;
+  if (last?.length === 1 && short && previous && previous.length > 1) {
+    const moved = [previous[previous.length - 1] ?? "", ...last];
+    if (textWidth(moved.join(" ")) <= columns) {
+      previous.pop();
+      lines[lines.length - 1] = moved;
+    }
+  }
+  const joined = lines.map((line) => line.join(" ").split(NBSP).join(" "));
+  return joined.length > 0 ? joined : [""];
 }
 
 /** A wrapped paragraph in one role. */
@@ -311,14 +357,21 @@ function knownNumber(
   return evidence?.state === "known" ? evidence.value : undefined;
 }
 
-/** The model's list price cell, unpadded. */
-export function priceCell(model: ModelRow, width?: number): string {
-  return formatPriceCell(
+/**
+ * The model's list price cell, exactly `width` columns: the pair right
+ * aligned in all but the last column, which holds the tier `+` or a space,
+ * so the digits of every row line up whether or not a row has tiers.
+ */
+export function priceCell(model: ModelRow, width = PRICE_CELL_WIDTH): string {
+  const columns = Math.max(1, Math.floor(width));
+  const pair = formatPriceCell(
     knownNumber(model.cost?.input),
     knownNumber(model.cost?.output),
-    (model.priceTiers?.length ?? 0) > 0,
-    width,
+    false,
+    columns - 1,
   );
+  const tiered = pair !== "" && (model.priceTiers?.length ?? 0) > 0;
+  return `${padText(pair, columns - 1, "right")}${tiered ? "+" : " "}`;
 }
 
 function pricePair(
@@ -485,10 +538,18 @@ export function modelDetailLines(
   }
   lines.push([]);
 
-  const provider = group.endpoint
-    ? `${group.provider} · ${group.endpoint.replace(/^https?:\/\//, "")}`
+  const endpoint = group.endpoint ? displayEndpoint(group.endpoint) : undefined;
+  const provider = endpoint
+    ? `${group.provider} · ${endpoint}`
     : group.provider;
-  lines.push(...labeled("Provider", provider, width));
+  // When name and endpoint do not share a line, the endpoint gets its own
+  // line rather than a line ending in "·".
+  if (endpoint && textWidth(provider) > width - LABEL_COLUMNS)
+    lines.push(
+      ...labeled("Provider", group.provider, width),
+      ...labeled("", endpoint, width),
+    );
+  else lines.push(...labeled("Provider", provider, width));
   const descriptors = [
     model.family,
     model.parameterSize,
@@ -511,30 +572,49 @@ export function modelDetailLines(
 }
 
 /**
- * The one-line summary under the list below 120 columns: name, price,
- * output limit, then capabilities, so a cut at the right edge loses the
- * capability list first; the row already shows `T I R`.
+ * The one-line summary under the list below 120 columns: name, then price
+ * (or context and "price not reported"), output limit, and capabilities.
+ * Items that do not fit in `width` are left out whole and counted in a
+ * trailing "+N"; the name is cut only when it alone is too wide.
  */
-export function modelSummaryLine(model: ModelRow): Line {
-  const parts: string[] = [model.name];
+export function modelSummaryLine(model: ModelRow, width: number): Line {
+  /** `separator` comes before the item: " · " between facts, ", " within the capability list. */
+  const items: { text: string; separator: string }[] = [];
+  const fact = (text: string): void => {
+    items.push({ text, separator: " · " });
+  };
   const input = knownNumber(model.cost?.input);
   const output = knownNumber(model.cost?.output);
+  const contextKnown =
+    model.context !== undefined &&
+    modelCertainty(model).context !== "not-reported";
   if (input !== undefined || output !== undefined)
-    parts.push(
-      `${input === undefined ? "?" : formatPrice(input)}/${output === undefined ? "?" : formatPrice(output)} per 1M`,
-    );
-  if (model.type === "embedding") parts.push("embedding model");
+    fact(`${formatPricePair(input, output)} per 1M`);
+  else {
+    if (contextKnown && model.context !== undefined)
+      fact(compactCount(model.context));
+    fact("price not reported");
+  }
+  if (model.type === "embedding") fact("embedding model");
   else {
     const certainty = modelCertainty(model).output;
     if (model.output !== undefined && certainty !== "not-reported")
-      parts.push(`${compactCount(model.output)} out`);
-    const supports = capabilitiesBy(model, "confirmed");
-    if (supports.length > 0) parts.push(supports.join(", "));
+      fact(`${compactCount(model.output)} out`);
+    for (const [index, name] of capabilitiesBy(model, "confirmed").entries())
+      items.push({ text: name, separator: index === 0 ? " · " : ", " });
   }
-  return [
-    seg(parts[0] ?? "", "base"),
-    seg(parts.length > 1 ? ` · ${parts.slice(1).join(" · ")}` : "", "muted"),
-  ];
+  const columns = Math.max(1, Math.floor(width));
+  const name =
+    textWidth(model.name) > columns ? padText(model.name, columns) : model.name;
+  const pieces = items.map((item) => `${item.separator}${item.text}`);
+  // The most leading items that fit together with "+N" for the rest.
+  for (let count = pieces.length; count >= 0; count -= 1) {
+    const shown = pieces.slice(0, count).join("");
+    const more = count < pieces.length ? ` +${pieces.length - count}` : "";
+    if (textWidth(name) + textWidth(shown) + textWidth(more) <= columns)
+      return [seg(name, "base"), seg(`${shown}${more}`, "muted")];
+  }
+  return [seg(name, "base")];
 }
 
 // ── Provider details ────────────────────────────────────────────────────
@@ -958,21 +1038,42 @@ export interface HelpEntry {
   readonly action: string;
 }
 
-/** The key list screen. */
+/**
+ * The key list screen: `pinned` heading lines (the title and a blank row),
+ * then the entries, with the number of lines each entry wrapped to, so the
+ * screen can scroll by whole entries.
+ */
+export interface HelpLayout {
+  readonly lines: Line[];
+  readonly pinned: number;
+  readonly entries: number[];
+}
+
+export function helpLayout(
+  title: string,
+  entries: readonly HelpEntry[],
+  width: number,
+): HelpLayout {
+  const keyColumns = 25;
+  const lines: Line[] = [[seg(title, "strong")], []];
+  const sizes: number[] = [];
+  for (const entry of entries) {
+    const parts = wrapText(entry.action, Math.max(8, width - keyColumns));
+    for (const [index, part] of parts.entries())
+      lines.push([
+        seg(padText(index === 0 ? entry.keys : "", keyColumns), "strong"),
+        seg(part, "base"),
+      ]);
+    sizes.push(parts.length);
+  }
+  return { lines, pinned: 2, entries: sizes };
+}
+
+/** The key list screen's lines; see `helpLayout`. */
 export function helpLines(
   title: string,
   entries: readonly HelpEntry[],
   width: number,
 ): Line[] {
-  const keyColumns = 25;
-  const lines: Line[] = [[seg(title, "base")], []];
-  for (const entry of entries) {
-    const parts = wrapText(entry.action, Math.max(8, width - keyColumns));
-    for (const [index, part] of parts.entries())
-      lines.push([
-        seg(padText(index === 0 ? entry.keys : "", keyColumns), "key"),
-        seg(part, "base"),
-      ]);
-  }
-  return lines;
+  return helpLayout(title, entries, width).lines;
 }

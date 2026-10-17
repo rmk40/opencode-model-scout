@@ -43,6 +43,7 @@
 //       { type: "abc" }, { press: "esc" }, { press: ["ctrl", "p"] },
 //       { submitKey: "revoked" },     // type the synthetic key, press enter
 //       { resize: "across" },         // cross 120 columns; "restore" undoes it
+//       { resize: "wide" },           // 140 columns at the run's row count
 //       { waitGone: "Model Scout" },
 //       { screenshot: "label" },      // saved only with --screenshots
 //       { sleep: 500 },
@@ -97,37 +98,78 @@ const CATALOG_SETTLE_MS = 30_000;
  * to the footer that ends in `close esc`, and the blank rows just above the
  * footer.
  */
-function dialogRows(text) {
-  const lines = text.split("\n");
-  const top = lines.findIndex((line) => line.includes("● ACTUALYZE"));
-  const bottom = lines.findIndex(
-    (line, index) => index > top && /close esc\s*$/.test(line.trimEnd()),
-  );
-  if (top < 0 || bottom < 0) throw new Error("no /actualyze dialog on screen");
-  let blank = 0;
-  for (let index = bottom - 1; index > top && !lines[index].trim(); index -= 1)
-    blank += 1;
-  return { span: bottom - top + 1, blank };
+/** The screen's rows from the terminal data, so index N is screen row N. */
+function screenRows(session) {
+  const data = session.getTerminalData();
+  return data.lines
+    .slice(0, data.rows)
+    .map((line) => line.spans.map((span) => span.text).join(""));
 }
 
-/** A card-only state takes the rows it needs: at most two blank rows before the footer. */
+/**
+ * Where a dialog sits: the row of its header (matching `header`), the row
+ * of its footer (ending in `close esc`), and the blank rows just above the
+ * footer.
+ */
+function dialogRows(rows, header = /● ACTUALYZE/) {
+  const top = rows.findIndex((line) => header.test(line));
+  const bottom = rows.findIndex(
+    (line, index) => index > top && /close esc\s*$/.test(line.trimEnd()),
+  );
+  if (top < 0 || bottom < 0) throw new Error("no dialog on screen");
+  let blank = 0;
+  for (let index = bottom - 1; index > top && !rows[index].trim(); index -= 1)
+    blank += 1;
+  return { top, bottom, span: bottom - top + 1, blank };
+}
+
+/** A card-only state takes the rows it needs: one blank row before the footer. */
 const COMPACT_CARD = {
   label: "the card is not padded with empty rows",
   run: async (ctx) => {
-    const { blank } = dialogRows(await ctx.session.text());
-    if (blank > 2) throw new Error(`${blank} blank rows above the footer`);
+    const { blank } = dialogRows(screenRows(ctx.session));
+    if (blank > 1) throw new Error(`${blank} blank rows above the footer`);
   },
 };
 
-/** The list views keep the full dialog height, `min(30, rows - 4)` content rows. */
+/**
+ * The dialog fits: with the row the host adds above the header and the
+ * padding row below the footer it takes at most `rows - 4` rows, leaves at
+ * least one row below, and sits centered within a row.
+ */
+function checkDialogFits(ctx, rows, header) {
+  const { top, bottom } = dialogRows(rows, header);
+  const first = top - 1;
+  const last = bottom + 1;
+  const height = last - first + 1;
+  const above = first;
+  const below = rows.length - 1 - last;
+  if (height > rows.length - 4)
+    throw new Error(`dialog takes ${height} rows of ${rows.length}`);
+  if (below < 1) throw new Error("no row left below the dialog");
+  if (Math.abs(above - below) > 1)
+    throw new Error(`${above} rows above the dialog, ${below} below`);
+  return bottom - top + 1;
+}
+
+/** The list views keep the full dialog height, `min(30, rows - 5)` content rows. */
 const FULL_LIST = {
   label: "the list view takes the full dialog height",
   run: async (ctx) => {
-    const { span } = dialogRows(await ctx.session.text());
+    const rows = screenRows(ctx.session);
+    const span = checkDialogFits(ctx, rows);
     // Header through footer: the content rows less the bottom padding row.
-    const want = Math.min(30, ctx.size.rows - 4) - 1;
+    const want = Math.min(30, rows.length - 5) - 1;
     if (span !== want)
       throw new Error(`dialog spans ${span} rows, not ${want}`);
+  },
+};
+
+/** `/modelscout` fits the screen like `/actualyze`'s list view. */
+const MODELSCOUT_FITS = {
+  label: "the /modelscout dialog fits within rows - 4, centered",
+  run: async (ctx) => {
+    checkDialogFits(ctx, screenRows(ctx.session), /^\s+Model Scout\s/);
   },
 };
 
@@ -164,11 +206,20 @@ const SCENARIOS = [
       { wait: "Mock compat" },
       { wait: "Mock Llama 3.1 8B" },
       { expect: "Mock Tiered Pro" },
+      MODELSCOUT_FITS,
       { screenshot: "open" },
       { resize: "across" },
       { wait: "Model Scout", label: "dialog still open after resize" },
       { expect: "Mock compat" },
       { screenshot: "resized" },
+      { resize: "restore" },
+      { wait: "Model Scout" },
+      { expect: "Mock compat" },
+      { screenshot: "restored" },
+      { resize: "wide" },
+      { wait: "Model Scout", label: "dialog still open at 140 columns" },
+      { expect: "Mock compat" },
+      { screenshot: "resized-wide" },
       { resize: "restore" },
       { wait: "Model Scout" },
       { press: "esc" },
@@ -221,7 +272,7 @@ const SCENARIOS = [
       { expect: /connect key k/ },
       { screenshot: "no-key" },
       { press: "l" },
-      { wait: "Links ·" },
+      { wait: "Actualyze app links" },
       {
         expect: "https://app.actualyze.ai/account/settings?tab=security",
       },
@@ -229,8 +280,8 @@ const SCENARIOS = [
       { press: "down" },
       { press: "y" },
       {
-        // At 80 columns the notice ends in "…" after the path.
-        wait: /Copy sent to terminal: https:\/\/app\.actualyze\.ai\/control\/catalog|OSC 52\) is unavailable/,
+        // The whole link shows; at 80 columns it wraps onto the row below.
+        wait: /Copy sent to terminal:\s+https:\/\/app\.actualyze\.ai\/control\/catalog\?tab=consume|OSC 52\) is unavailable/,
         label: "y copies the selected Catalog link",
       },
       { screenshot: "links" },
@@ -294,8 +345,10 @@ const SCENARIOS = [
       { press: "k" },
       { wait: "Actualyze API key" },
       { submitKey: "slow" },
-      { wait: "Key saved. Checking the current connection" },
-      { expect: "no inference request" },
+      { wait: "Checking the current connection" },
+      { expect: "Key saved" },
+      // The card bar starts the wrapped line at 80 columns.
+      { expect: /no inference\s+(▌\s+)?request is sent/ },
       { screenshot: "checking" },
       { wait: "did not answer in time", timeout: 45_000 },
       { press: "esc" },
@@ -314,12 +367,12 @@ const SCENARIOS = [
       COMPACT_CARD,
       { expect: "Actualyze did not accept this key" },
       { expect: /another key k/ },
-      { expect: /copy API keys link y/ },
+      { expect: /copy link y/ },
       { expect: /connections c/ },
       { expectColor: { color: "brand", text: "ACTUALYZE" } },
       { screenshot: "revoked" },
       { press: "l" },
-      { wait: "Links ·" },
+      { wait: "Actualyze app links" },
       { screenshot: "links-after-401" },
       { press: "esc" },
       { waitGone: "ACTUALYZE" },
@@ -350,7 +403,7 @@ const SCENARIOS = [
       { command: "/actualyze" },
       { wait: "Budget or entitlement blocked (402)", timeout: 30_000 },
       { expect: "No balance or reset date" },
-      { expect: /copy Budgets link y/ },
+      { expect: /copy link y/ },
       { screenshot: "budget" },
       { press: "esc" },
       { waitGone: "ACTUALYZE" },
@@ -364,15 +417,18 @@ const SCENARIOS = [
     connect: "throttled",
     steps: [
       { command: "/actualyze" },
-      { wait: /Catalog rate limited · retry in \d+ s/, timeout: 30_000 },
+      { wait: "Catalog rate limited (429)", timeout: 30_000 },
+      { wait: /retry \(\d+ s\) r/ },
+      { expectNot: /rate limited \(429\) · retry/ },
       { expect: "not inference" },
+      { expect: "Retry with r once the wait ends" },
       { screenshot: "throttled" },
       {
         label: "the countdown decreases",
         run: async (ctx) => {
           const read = async () =>
             Number(
-              /retry in (\d+) s/.exec(await ctx.session.text())?.[1] ?? NaN,
+              /retry \((\d+) s\) r/.exec(await ctx.session.text())?.[1] ?? NaN,
             );
           const first = await read();
           await sleep(3_000);
@@ -393,7 +449,7 @@ const SCENARIOS = [
     steps: [
       { command: "/actualyze" },
       { wait: "Actualyze server error (503)", timeout: 30_000 },
-      { expect: /retry( in \d+ s)? r/ },
+      { expect: /retry( \(\d+ s\))? r/ },
       { screenshot: "server-error" },
       { press: "esc" },
       { waitGone: "ACTUALYZE" },
@@ -408,7 +464,8 @@ const SCENARIOS = [
     steps: [
       { command: "/actualyze" },
       { wait: "did not answer in time", timeout: 45_000 },
-      { expectNot: "Can't reach" },
+      { expectNot: "Could not reach" },
+      { expectNot: /http:\/\/127\.0\.0\.1:\d+ did not answer/ },
       { screenshot: "slow" },
       { press: "esc" },
       { waitGone: "ACTUALYZE" },
@@ -421,7 +478,7 @@ const SCENARIOS = [
     connect: "ok",
     steps: [
       { command: "/actualyze" },
-      { wait: "Can't reach", timeout: 30_000 },
+      { wait: "Could not reach the endpoint", timeout: 30_000 },
       { expect: "custom endpoint" },
       { screenshot: "unreachable" },
       { press: "esc" },
@@ -430,13 +487,15 @@ const SCENARIOS = [
   },
   {
     name: "actualyze-empty",
-    description: "an empty catalog: accessible, no models for this key",
+    description:
+      "an empty catalog: a warning, not a green ready state, that names the empty list",
     actualyze: "mock",
     connect: "empty",
     steps: [
       { command: "/actualyze" },
-      { wait: "no models for this key", timeout: 30_000 },
-      { expect: "Catalog accessible" },
+      { wait: "No models for this key", timeout: 30_000 },
+      { expect: "empty list" },
+      { expectNot: "Catalog accessible" },
       { screenshot: "empty" },
       { press: "esc" },
       { waitGone: "ACTUALYZE" },
@@ -454,15 +513,6 @@ const SCENARIOS = [
       { wait: "Claude Haiku" },
       { expectNot: /Connected|inference works/ },
       { expect: /another key k/ },
-      {
-        label: "the status line lists k, l, c, and b where they fit",
-        run: async (ctx) => {
-          if (ctx.size.cols < 120) return;
-          const text = await ctx.session.text();
-          for (const hint of ["links l", "connections c", "all providers b"])
-            if (!text.includes(hint)) throw new Error(`no "${hint}"`);
-        },
-      },
       { screenshot: "readonly" },
       { press: "?" },
       { wait: "Keys · Actualyze" },
@@ -493,7 +543,7 @@ const SCENARIOS = [
       { expectColor: { color: "brand", text: "ACTUALYZE" } },
       { screenshot: "custom-endpoint" },
       { press: "l" },
-      { wait: "Links ·" },
+      { wait: "Actualyze app links" },
       { ...COMPACT_CARD, label: "the dialog shrinks from the list to links" },
       { expect: /http:\/\/127\.0\.0\.1:\d+\/account\/settings\?tab=security/ },
       { expectNot: "https://app.actualyze.ai" },
@@ -747,7 +797,9 @@ async function runStep(step, ctx) {
               cols: ctx.size.cols >= 120 ? 100 : 130,
               rows: ctx.size.rows,
             }
-          : step.resize;
+          : step.resize === "wide"
+            ? { cols: 140, rows: ctx.size.rows }
+            : step.resize;
     session.resize(size);
     await session.waitIdle();
   } else if ("screenshot" in step) {
@@ -761,18 +813,33 @@ async function runStep(step, ctx) {
   }
 }
 
+/**
+ * Save the screen as `<scenario>-<cols>x<rows>-<theme>-<label>` .png and
+ * .txt, named after the terminal size at capture time, so a capture after
+ * a resize says which size it shows. The text comes from the same terminal
+ * data as the image, one line per screen row, so line N is row N.
+ */
 async function saveScreenshot(ctx, label) {
   if (!ctx.screenshotsDir) return;
-  const base = path.join(ctx.screenshotsDir, `${ctx.runName}-${label}`);
-  const text = await ctx.session.text({ trimEnd: true });
+  await ctx.session.waitIdle();
+  const data = ctx.session.getTerminalData();
+  const name = `${ctx.scenario.name}-${data.cols}x${data.rows}-${ctx.theme}-${label}`;
+  const base = path.join(ctx.screenshotsDir, name);
+  const rows = data.lines.slice(0, data.rows).map((line) =>
+    line.spans
+      .map((span) => span.text)
+      .join("")
+      .trimEnd(),
+  );
+  while (rows.length > 0 && rows[rows.length - 1] === "") rows.pop();
   const render = await imageRenderer();
-  const image = await render(ctx.session.getTerminalData(), {
+  const image = await render(data, {
     fontSize: 14,
     lineHeight: 1.5,
     paddingX: 16,
     paddingY: 16,
   });
-  await writeFile(`${base}.txt`, `${text}\n`);
+  await writeFile(`${base}.txt`, `${rows.join("\n")}\n`);
   await writeFile(`${base}.png`, image);
   ctx.screenshots.push(`${base}.txt`, `${base}.png`);
 }

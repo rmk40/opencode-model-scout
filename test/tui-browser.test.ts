@@ -9,13 +9,16 @@ import {
   type CatalogProviderRecord,
 } from "../src/catalog-evidence";
 import {
+  blockWindow,
   browserLayout,
   cycleFilter,
   DEFAULT_FILTERS,
   DEFAULT_NAV,
   filterSummary,
   filterFields,
+  fitFooterHints,
   footerSegments,
+  glyphSegments,
   hasNarrowing,
   initialSelection,
   justify,
@@ -23,10 +26,13 @@ import {
   modelKey,
   modelRowSegments,
   nextSort,
+  paneWindow,
   projectBrowser,
   providerKey,
   providerRowSegments,
   refreshWaitSeconds,
+  scrollBlocks,
+  scrollPane,
   sortModels,
   type BrowserData,
   type NavState,
@@ -551,10 +557,18 @@ describe("browserLayout", () => {
     expect(browserLayout(80, 24)).toMatchObject({
       wide: false,
       width: 72,
-      height: 20,
+      height: 19,
       listWidth: 72,
     });
     expect(browserLayout(119, 36).wide).toBe(false);
+  });
+
+  it("keeps the dialog, with the row the host adds above it, within rows - 4", () => {
+    for (const rows of [24, 30, 34, 35, 36, 50]) {
+      const { height } = browserLayout(120, rows);
+      expect(height + 1).toBeLessThanOrEqual(rows - 4);
+    }
+    expect(browserLayout(120, 50).height).toBe(30);
   });
 });
 
@@ -569,11 +583,11 @@ describe("filters", () => {
 
   it("summarizes the active filters and hidden embeddings", () => {
     const state = nav({ filters: { ...DEFAULT_FILTERS, tools: true } });
-    expect(filterSummary(state, ALL, [], 2, false)).toBe(
+    expect(filterSummary(state, ALL, [], 2)).toBe(
       "chat · all providers · tools · 2 embeddings hidden",
     );
     expect(
-      filterSummary(state, { kind: "provider", providerID: "a" }, [], 1, true),
+      filterSummary(state, { kind: "provider", providerID: "a" }, [], 1),
     ).toBe("chat · tools · 1 embedding hidden");
   });
 });
@@ -804,7 +818,7 @@ describe("projectBrowser filters", () => {
       nav({ query: "alpha" }),
       scope,
     );
-    expect(text(projection.rows[0]?.segments ?? [])).toMatch(/1\/2 models$/);
+    expect(text(projection.rows[0]?.segments ?? [])).toMatch(/1\/2 models $/);
   });
 
   it("marks the current model in its row", () => {
@@ -1087,11 +1101,26 @@ describe("row segments", () => {
         ),
       );
       expect(header).toHaveLength(width);
-      expect(header).toMatch(/^ ▸ Team gateway +3 models {2}▲ key rejected$/);
+      expect(header).toMatch(/^ ▸ Team gateway +3 models {2}▲ key rejected $/);
+      // The last column of the price cell is reserved for the tier "+".
       expect(text(modelRowSegments(priced("m", 3, 15), width, false))).toMatch(
-        new RegExp(`^.{${width - 6}}\\$3/\\$15$`),
+        new RegExp(`^.{${width - 7}}\\$3/\\$15 $`),
       );
     }
+  });
+
+  it("lines up price digits whether or not a row has tiers", () => {
+    const plain = text(modelRowSegments(priced("m", 3, 15), 58, false));
+    const tiered = text(
+      modelRowSegments(
+        { ...priced("t", 3, 15), priceTiers: [{ above: 200_000, input: 6 }] },
+        58,
+        false,
+      ),
+    );
+    expect(plain.endsWith("$3/$15 ")).toBe(true);
+    expect(tiered.endsWith("$3/$15+")).toBe(true);
+    expect(plain.indexOf("$3/$15")).toBe(tiered.indexOf("$3/$15"));
   });
 
   it("shows a singular count and no status without a record", () => {
@@ -1105,7 +1134,7 @@ describe("row segments", () => {
           40,
         ),
       ),
-    ).toMatch(/^ ▾ p +1 model$/);
+    ).toMatch(/^ ▾ p +1 model $/);
   });
 });
 
@@ -1147,14 +1176,12 @@ describe("filter screen helpers", () => {
       },
     });
     expect(
-      filterSummary(state, ALL, [group("atlas", [], "Atlas Cloud")], 0, false),
+      filterSummary(state, ALL, [group("atlas", [], "Atlas Cloud")], 0),
     ).toBe(
       "all types · Atlas Cloud · tools · images · reasoning · priced · incl. assumed",
     );
-    expect(filterSummary(state, ALL, [], 0, true)).toMatch(
-      /^all types · atlas/,
-    );
-    expect(filterSummary(nav(), ALL, [], 0, true)).toBe("chat · all");
+    expect(filterSummary(state, ALL, [], 0)).toMatch(/^all types · atlas/);
+    expect(filterSummary(nav(), ALL, [], 0)).toBe("chat · all providers");
   });
 });
 
@@ -1176,6 +1203,30 @@ describe("footer and justify", () => {
     ).toMatch(/^keys \? +close esc$/);
   });
 
+  it("leaves at least four columns before close esc", () => {
+    // "aa x  keys ?" is 12 columns and "close esc" 9: 25 leaves a 4-column gap.
+    const hints = [{ title: "aa", key: "x" }];
+    expect(text(footerSegments(hints, 25))).toBe("aa x  keys ?    close esc");
+    expect(text(footerSegments(hints, 24))).toMatch(/^keys \? +close esc$/);
+  });
+
+  it("skips a hint that does not fit and keeps later ones that do, in order", () => {
+    const hints = [
+      { title: "first", key: "1" },
+      { title: "a much longer second", key: "2" },
+      { title: "third", key: "3" },
+    ];
+    const line = text(footerSegments(hints, 45));
+    expect(line).toMatch(/^first 1 {2}third 3 {2}keys \? +close esc$/);
+    expect(line).toHaveLength(45);
+  });
+
+  it("fits hints by priority: earlier first, the required one always", () => {
+    expect([...fitFooterHints([5, 20, 5], 12)]).toEqual([0, 2]);
+    expect([...fitFooterHints([5, 5, 5], 12, 2)].sort()).toEqual([0, 2]);
+    expect([...fitFooterHints([30], 10, 0)]).toEqual([0]);
+  });
+
   it("cuts the left side with an ellipsis to keep the right side whole", () => {
     const line = text(
       justify(
@@ -1186,6 +1237,119 @@ describe("footer and justify", () => {
     );
     expect(line).toHaveLength(20);
     expect(line).toMatch(/^Model Scou…\s+3 models$/);
+  });
+});
+
+describe("status glyphs", () => {
+  it("colors only a leading status glyph and keeps the words in base", () => {
+    expect(glyphSegments({ text: "▲ key rejected", role: "error" })).toEqual([
+      { text: "▲", role: "error" },
+      { text: " key rejected", role: "base" },
+    ]);
+    expect(glyphSegments({ text: "● ready", role: "ok" })[0]).toEqual({
+      text: "●",
+      role: "ok",
+    });
+  });
+
+  it("leaves text without a status glyph in its role", () => {
+    expect(glyphSegments({ text: "Refresh skipped", role: "muted" })).toEqual([
+      { text: "Refresh skipped", role: "muted" },
+    ]);
+  });
+});
+
+describe("text pane blocks", () => {
+  // Entries of 1, 2, 1, 3, and 2 lines: 9 lines.
+  const sizes = [1, 2, 1, 3, 2];
+
+  it("shows only whole blocks and counts hidden blocks, not lines", () => {
+    // 6 rows: blocks 0-2 take 4 lines; block 3 (3 lines) does not fit with ↓.
+    expect(blockWindow(sizes, 6, 0)).toEqual({
+      offset: 0,
+      rows: 4,
+      above: 0,
+      below: 2,
+    });
+    // From block 1: ↑ row, blocks 1-2 (3 lines), ↓ row; block 3 would not fit.
+    expect(blockWindow(sizes, 6, 1)).toEqual({
+      offset: 1,
+      rows: 3,
+      above: 1,
+      below: 2,
+    });
+  });
+
+  it("stops at the first offset from which the rest fits under the ↑ row", () => {
+    // Blocks 3-4 take 5 lines, which fit under ↑ in 6 rows.
+    expect(blockWindow(sizes, 6, 99)).toEqual({
+      offset: 3,
+      rows: 5,
+      above: 3,
+      below: 0,
+    });
+  });
+
+  it("shows a block taller than the room alone rather than nothing", () => {
+    expect(blockWindow([5, 1], 3, 0)).toMatchObject({
+      offset: 0,
+      above: 0,
+      below: 1,
+    });
+  });
+
+  it("scrolls by whole blocks", () => {
+    expect(scrollBlocks(sizes, 6, 0, "down")).toBe(1);
+    expect(scrollBlocks(sizes, 6, 1, "up")).toBe(0);
+    expect(scrollBlocks(sizes, 6, 0, "end")).toBe(3);
+    // A page moves by the blocks shown less one, keeping one in view.
+    expect(scrollBlocks(sizes, 6, 0, "pagedown")).toBe(2);
+  });
+});
+
+describe("text pane window", () => {
+  it("shows everything without indicators when the lines fit", () => {
+    expect(paneWindow(5, 8, 3)).toEqual({
+      offset: 0,
+      rows: 8,
+      above: 0,
+      below: 0,
+    });
+  });
+
+  it("gives the last row to a ↓ indicator at the top of long text", () => {
+    expect(paneWindow(20, 8, 0)).toEqual({
+      offset: 0,
+      rows: 7,
+      above: 0,
+      below: 13,
+    });
+  });
+
+  it("shows both indicators in the middle and only ↑ at the end", () => {
+    expect(paneWindow(20, 8, 5)).toEqual({
+      offset: 5,
+      rows: 6,
+      above: 5,
+      below: 9,
+    });
+    // At the end the last line shows under the ↑ row.
+    expect(paneWindow(20, 8, 99)).toEqual({
+      offset: 13,
+      rows: 7,
+      above: 13,
+      below: 0,
+    });
+  });
+
+  it("scrolls by line and by page, within the text", () => {
+    expect(scrollPane(20, 8, 0, "down")).toBe(1);
+    expect(scrollPane(20, 8, 0, "up")).toBe(0);
+    expect(scrollPane(20, 8, 0, "pagedown")).toBe(6);
+    expect(scrollPane(20, 8, 6, "pageup")).toBe(1);
+    expect(scrollPane(20, 8, 3, "end")).toBe(13);
+    expect(scrollPane(20, 8, 13, "home")).toBe(0);
+    expect(scrollPane(5, 8, 0, "down")).toBe(0);
   });
 });
 

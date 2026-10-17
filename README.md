@@ -514,8 +514,9 @@ name, and models within each provider by name until you change the sort.
 ```
  ▾ Actualyze                             4 models  ● ready
    Claude Haiku 4.5           200K  T I R            $1/$5
-▌● Claude Sonnet 4.5          200K  T I R           $3/$15
-   GPT OSS 120B               131K  T · R       $0.15/$0.6
+ ● Claude Sonnet 4.5          200K  T I R           $3/$15
+   GPT OSS 120B               131K  T · R      $0.15/$0.60
+   Mock Tiered Pro            400K  T I R           $3/$15+
  ▾ Studio oMLX                           2 models  ● ready
    Gemma 3 12B               ~200K  · I ·
    Qwen3 Coder 30B            262K  t · ·
@@ -528,8 +529,9 @@ name, and models within each provider by name until you change the sort.
   `○ waiting` until discovery has a result for the current key, or a failure
   such as `▲ key rejected`, `▲ rate limited`, or `▲ unreachable`. A failing
   provider keeps the models from its last good discovery.
-- **`●`** before a model name marks the model the prompt uses now. `▌` marks
-  the selected row.
+- **`●`** before a model name marks the model the prompt uses now. A colored
+  band marks the selected row; while focus is elsewhere, such as in the
+  details pane, a `▌` marks it instead.
 - **Context** is the context window. `~200K`, dimmed, means no source
   reported one and OpenCode uses its default of 200,000 tokens.
 - **`T I R`** stand for tool calls, image input, and reasoning. An uppercase
@@ -537,8 +539,8 @@ name, and models within each provider by name until you change the sort.
   letter is assumed from an OpenCode default or inferred from models.dev or
   the model name. `·` means not reported or not supported.
 - **Prices** are USD per million tokens, input/output, and `?` marks an
-  unknown side. A trailing `+` means the price rises above a context size;
-  the details list every tier.
+  unknown side. When one side shows cents, so does the other. A trailing `+`
+  means the price rises above a context size; the details list every tier.
 
 The title line counts providers and models and says how many providers need
 attention. Embedding models are hidden by default, and the filter line says
@@ -546,9 +548,12 @@ how many, for example `1 embedding hidden`.
 
 At 120 columns and wider, the details of the selected row sit in a pane
 beside the list. In a narrower terminal, a one-line summary of the selected
-model sits under the list, and `enter` opens the details on their own
-screen. Resizing the terminal switches between the two layouts without
-closing the dialog.
+model sits under the list (facts that do not fit are counted as `+N`), and
+`enter` opens the details on their own screen. Details and the key list that
+run longer than the dialog scroll (the key list by whole entries), with `↑ N more` and `↓ N more` at the
+edges. Resizing the terminal switches between the two layouts without
+closing the dialog. The dialog takes at most `rows - 4` rows, so it leaves
+room above and below it.
 
 The first open selects the prompt's current model, or the first chat model
 when the current one is not listed. Search, filters, sort, collapsed
@@ -725,28 +730,33 @@ refused on every chat request.
 
 ### States
 
-| Status line                                                         | What it means                                                                                                                             | What to do                                                                                                                          |
-| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `Not connected`                                                     | OpenCode has no Actualyze key.                                                                                                            | Create a key in the app, then press `k` and paste it. The card lists the steps.                                                     |
-| `○ Saving key in OpenCode…`                                         | You submitted a key and OpenCode has not confirmed it yet.                                                                                | Wait. Closing the dialog does not undo a completed save.                                                                            |
-| `▲ OpenCode did not confirm the key was saved`                      | Saving failed or took longer than 15 seconds. OpenCode may have stored the key anyway.                                                    | Check with `c` before trying again with `k`.                                                                                        |
-| `○ Key saved. Checking the current connection…`                     | The key is saved and scout has no result for it yet. After 20 seconds the line reads "Still checking. The key is saved."                  | Wait. No inference request is sent.                                                                                                 |
-| `○ Checking the connection…`                                        | A key is connected and scout is still resolving it.                                                                                       | Wait.                                                                                                                               |
-| `○ Loading models…`                                                 | The first model list for this key is on its way.                                                                                          | Wait.                                                                                                                               |
-| `● Catalog accessible · key "Work" · 11 models · checked 2 min ago` | The model list answered. The Actualyze models are listed below.                                                                           | Browse them; `m` opens the model picker.                                                                                            |
-| `● Catalog accessible · key "Work" · no models for this key`        | The key works, but its team has no model access yet.                                                                                      | Ask a workspace admin. `y` copies the Catalog link.                                                                                 |
-| `▲ Key rejected (401)`                                              | Actualyze answers this way for a revoked or expired key, a key without the inference scope, and a key from another Actualyze environment. | `k` for another key, `y` to copy the API keys link, `c` for connections.                                                            |
-| `▲ Access denied (403)`                                             | Actualyze refused the model list request for this key.                                                                                    | Check the key's permissions and model access with your administrator, or use `k` for another key.                                   |
-| `▲ Budget or entitlement blocked (402)`                             | Actualyze refused the catalog request. The key cannot read a balance or reset date.                                                       | `y` copies the Budgets link; that page may need an admin role.                                                                      |
-| `▲ Catalog rate limited · retry in 42 s`                            | The model list is rate limited. This is a catalog limit, not an inference quota.                                                          | `r` works once the wait ends; otherwise Model Scout checks again on its next scheduled refresh, or when settings or the key change. |
-| `▲ Can't reach app.actualyze.ai`                                    | The connection failed.                                                                                                                    | Check the network, VPN, proxy, and `settings.baseURL`, then press `r`.                                                              |
-| `▲ app.actualyze.ai did not answer in time`                         | The model list timed out.                                                                                                                 | Check the network or the endpoint, then press `r`.                                                                                  |
-| `▲ Actualyze server error (503)`                                    | Actualyze failed to list its models.                                                                                                      | Try again later with `r`.                                                                                                           |
-| `▲ No model list at this endpoint (404)`                            | The base URL points at the wrong path.                                                                                                    | Make `settings.baseURL` end in `/openai/v1`.                                                                                        |
-| `▲ Unexpected answer (…)`                                           | Another HTTP status, or an answer that is not a model list.                                                                               | Check `settings.baseURL`.                                                                                                           |
-| `▲ Discovery was interrupted` or `▲ Discovery failed`               | The check did not finish.                                                                                                                 | It runs again on the next refresh; `r` retries now.                                                                                 |
-| `▲ Discovery status unavailable`                                    | Scout's server half did not answer, so only the connection OpenCode reports is known.                                                     | `k` and `c` still work.                                                                                                             |
-| `Not managed by Model Scout`                                        | Another plugin or a models.dev catalog defines the `actualyze` provider, so scout does not discover it.                                   | Add `"probe": "actualyze"` to `providers.actualyze.settings` to opt in.                                                             |
+| Status line                                                         | What it means                                                                                                                            | What to do                                                                                                                               |
+| ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `○ Not connected`                                                   | OpenCode has no Actualyze key.                                                                                                           | Create a key in the app, then press `k` and paste it. The card lists the steps.                                                          |
+| `○ Saving key…`                                                     | You submitted a key and OpenCode has not confirmed it yet.                                                                               | Wait. Closing the dialog does not undo a completed save.                                                                                 |
+| `▲ Save not confirmed`                                              | Saving failed or took longer than 15 seconds. OpenCode may have stored the key anyway.                                                   | Check with `c` before trying again with `k`.                                                                                             |
+| `○ Checking the current connection…`                                | The key is saved and scout has no result for it yet. After 20 seconds the line reads "Still checking the current connection…".           | Wait. No inference request is sent.                                                                                                      |
+| `○ Checking the connection…`                                        | A key is connected and scout is still resolving it.                                                                                      | Wait.                                                                                                                                    |
+| `○ Loading models…`                                                 | The first model list for this key is on its way.                                                                                         | Wait.                                                                                                                                    |
+| `● Catalog accessible · key "Work" · 11 models · checked 2 min ago` | The model list answered. The count is chat models, as in `/modelscout`; the filter row reports hidden embeddings.                        | Browse them; `m` opens the model picker.                                                                                                 |
+| `▲ No models for this key`                                          | The catalog answered with an empty list: the key works, but its team has no model access yet.                                            | Ask a workspace admin. `y` copies the Catalog link.                                                                                      |
+| `▲ Key rejected (401)`                                              | Actualyze answers this way for a revoked or expired key, a key without the inference scope, or a key from another Actualyze environment. | `k` for another key, `y` to copy the API Keys link, `c` for connections.                                                                 |
+| `▲ Access denied (403)`                                             | Actualyze refused the model list request for this key.                                                                                   | Check the key's permissions and model access with your administrator, or use `k` for another key.                                        |
+| `▲ Budget or entitlement blocked (402)`                             | Actualyze did not allow the model list request. The key cannot read a balance or reset date.                                             | `y` copies the Budgets link; that page may need an admin role.                                                                           |
+| `▲ Catalog rate limited (429)`                                      | The model list is rate limited. This is a catalog limit, not an inference quota. The footer shows the wait: `retry (42 s) r`.            | Retry with `r` once the wait ends; otherwise Model Scout checks again on its next scheduled refresh, or when settings or the key change. |
+| `▲ Could not reach the endpoint`                                    | The connection failed. The header shows the endpoint.                                                                                    | Check the network, VPN, proxy, and `providers.actualyze.settings.baseURL`, then retry with `r`.                                          |
+| `▲ Endpoint did not answer in time`                                 | The model list request timed out.                                                                                                        | Check the network or the endpoint, then retry with `r`.                                                                                  |
+| `▲ Actualyze server error (503)`                                    | Actualyze failed to list its models.                                                                                                     | Retry with `r`.                                                                                                                          |
+| `▲ No model list at this endpoint (404)`                            | The base URL points at the wrong path.                                                                                                   | Make `settings.baseURL` end in `/openai/v1`.                                                                                             |
+| `▲ Unexpected answer (…)`                                           | Another HTTP status, or an answer that is not a model list.                                                                              | Check `settings.baseURL`.                                                                                                                |
+| `▲ Discovery was interrupted` or `▲ Discovery failed`               | The check did not finish.                                                                                                                | It runs again on the next refresh; `r` retries now.                                                                                      |
+| `▲ Discovery status unavailable`                                    | Scout's server half did not answer, so only the connection OpenCode reports is known.                                                    | `k` and `c` still work; `r` reads the catalog again.                                                                                     |
+| `○ Not managed by Model Scout`                                      | Another plugin or a models.dev catalog defines the `actualyze` provider, so scout does not discover it.                                  | Add `"probe": "actualyze"` to `providers.actualyze.settings` to opt in.                                                                  |
+
+The glyph carries the state's color; the words stay in the theme's text
+color. When the line is too narrow, the age goes first and then the key
+label, whole, so the line never ends in a cut word. Each card under the
+status line starts with a title and gives the details below it.
 
 After a failure, a key that had a good catalog before keeps it: the card sits
 above the models from the last good check. When the key comes from
@@ -763,18 +773,20 @@ discovery uses those headers, not the connected key.
 | `c`   | Open OpenCode's connections; pick Actualyze there to switch, rename, or remove keys |
 | `l`   | Open the [links screen](#links)                                                     |
 | `y`   | On a card, copy the link it names; in the model list, copy `provider/model`         |
-| `r`   | Check the catalog again; during a wait the hint is dimmed and reads "retry in N s"  |
+| `r`   | Check the catalog again; during a wait the hint is dimmed and reads "retry (N s)"   |
 | `b`   | Open `/modelscout`                                                                  |
 | `?`   | List the keys                                                                       |
 | `esc` | Close                                                                               |
 
 While a card fills the dialog, only the keys it offers, `?`, and `esc` work.
-The footer lists every key the card offers, including the ones in the card's
-own action lines; at narrow widths the last hints drop off the footer, and
-`?` lists them all.
-Once the catalog is accessible, the model list works like `/modelscout`
-limited to Actualyze, without a provider header or provider filter, and the
-status line lists `c`, `b`, `l`, and `k` where they fit.
+The footer lists the card's keys in one order: the key action, retry, copy
+link, links, connections, all providers, then keys. When the footer runs out
+of room it leaves out the hints that do not fit and keeps any later one that
+does; the card then lists the left-out keys in an action line at its end, in
+the same order, so every key shows once. `?` lists them all. Once the catalog is
+accessible, the model list works like `/modelscout` limited to Actualyze,
+without a provider header or provider filter; the footer and `?` list `k`,
+`l`, `c`, and `b`.
 
 `k` works only when the provider reads its key from the `actualyze`
 integration and that integration offers a plain key method. Otherwise the
@@ -787,8 +799,8 @@ OpenCode's connections.
 while you type, because OpenCode's prompt does not mask input. Press `enter`
 to submit. Model Scout trims the key, hands it once to OpenCode to store
 under the Actualyze integration, and drops it; it never stores, logs, or
-shows the key itself. `/actualyze` then comes back, shows "Saving key in
-OpenCode…", and checks the catalog with the new key.
+shows the key itself. `/actualyze` then comes back, shows "Saving key…",
+and checks the catalog with the new key.
 
 Pressing `esc` in the prompt cancels and closes `/actualyze`. Submitting an
 empty prompt returns to `/actualyze` unchanged. If Model Scout reloads while
@@ -804,7 +816,7 @@ a toast says "OpenCode did not confirm the Actualyze key was saved".
 
 | Link            | Path                                 |
 | --------------- | ------------------------------------ |
-| API keys        | `/account/settings?tab=security`     |
+| API Keys        | `/account/settings?tab=security`     |
 | Catalog         | `/control/catalog?tab=consume`       |
 | Budgets         | `/management/budgets`                |
 | Usage           | `/observability?tab=inference`       |
@@ -812,7 +824,7 @@ a toast says "OpenCode did not confirm the Actualyze key was saved".
 
 `↑`, `↓`, `home`, and `end` choose a link, `enter` or `y` copies it the same
 way `/modelscout` copies (see [Copying](#copying)), and `backspace` or `l`
-returns. After a failure the matching link is selected first: API keys for
+returns. After a failure the matching link is selected first: API Keys for
 401 and 403, Budgets for 402, and Troubleshooting for the rest. Budgets may
 need an admin role in Actualyze. Model Scout cannot open a browser, so copy
 the link and paste it into one. When `settings.baseURL` is not an http or

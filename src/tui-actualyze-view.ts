@@ -20,14 +20,21 @@ import {
   deriveActualyzeState,
   displayOrigin,
   failureLink,
+  fitStatusParts,
   hasInventory,
+  inActionOrder,
   integrationFacts,
   isCurrent,
   keyLabel,
+  LINK_LABEL_COLUMNS,
   LINK_ORDER,
+  LINK_URL_INDENT,
   linkLabel,
+  linkLayout,
   reducePending,
   RESULT_ROWS,
+  retrySentence,
+  retryTitle,
   submitEvent,
   type ActiveConnection,
   type ActualyzeEndpoint,
@@ -36,9 +43,11 @@ import {
   type IntegrationFacts,
   type PendingMarker,
   type SessionTracker,
+  type StatusPart,
 } from "./tui-actualyze";
 import {
   findRecord,
+  footerShown,
   justify,
   refreshWaitSeconds,
   type BrowserData,
@@ -49,7 +58,13 @@ import {
   type FooterHint,
   type FrameKeyView,
 } from "./tui-browser";
-import { relativeAge, wrapText, type HelpEntry, type Line } from "./tui-detail";
+import {
+  NBSP,
+  relativeAge,
+  wrapText,
+  type HelpEntry,
+  type Line,
+} from "./tui-detail";
 import { keyMove, padText, textWidth, type Segment } from "./tui-list";
 import {
   openBrowser,
@@ -70,13 +85,11 @@ const ACTUALYZE_SCOPE: BrowserScope = {
 const SAVE_TIMEOUT_MS = 15_000;
 /** How long reading the integration and provider stores may take. */
 const FACTS_TIMEOUT_MS = 10_000;
-/** After this long in "checking", the card says the key is saved anyway. */
+/** After this long in "checking", the status says it is still checking. */
 const STILL_CHECKING_MS = 20_000;
-/** Content width from which card actions share one line. */
-const INLINE_ACTIONS_COLUMNS = 100;
 
 const KEY_VISIBLE =
-  "The key is visible while you type. OpenCode stores it; Model Scout never shows it again.";
+  "The key is visible while you type; OpenCode stores it and Model Scout never shows it.";
 
 // ── Session state ───────────────────────────────────────────────────────
 
@@ -462,92 +475,109 @@ function seg(text: string, role: ForegroundRole = "base"): Segment {
   return { text, role };
 }
 
-function hostOf(view: ViewState): string {
-  const origin = view.endpoint?.origin;
-  return origin ? displayOrigin(origin) : "the endpoint";
+/**
+ * What a failed model list means: the status headline, the card's title
+ * and body, and the color of the glyph and the card bar. The endpoint is
+ * in the header, so no headline repeats it.
+ */
+interface FailureCopy {
+  readonly headline: string;
+  readonly title: string;
+  readonly body: string;
+  readonly role: ForegroundRole;
 }
 
-/** Headline, explanation, and color for a failed model list. */
+const BASE_URL_SETTING = "providers.actualyze.settings.baseURL";
+
 function failureCopy(
   failure: ProviderFailure,
-  view: ViewState,
-  retryIn: number | undefined,
-): { headline: string; body: string; role: ForegroundRole } {
+  wait: number | undefined,
+): FailureCopy {
   const status = failure.httpStatus;
+  const retry = retrySentence(wait);
   switch (failure.kind) {
     case "unauthorized":
       return {
         headline: "Key rejected (401)",
-        body: "Actualyze did not accept this key. It answers the same way for a revoked or expired key, a key without the inference scope, and a key from another Actualyze environment.",
+        title: "Actualyze did not accept this key",
+        body: "It answers the same way for a revoked or expired key, a key without the inference scope, or a key from another Actualyze environment.",
         role: "error",
       };
     case "forbidden":
       return {
         headline: "Access denied (403)",
-        body: "Actualyze refused the model list request for this key. Check the key's permissions and model access with your administrator.",
+        title: "Actualyze refused the model list request",
+        body: "Check the key's permissions and model access with your administrator.",
         role: "error",
       };
     case "payment-required":
       return {
         headline: "Budget or entitlement blocked (402)",
-        body: "Actualyze did not allow this catalog request. No balance or reset date is available through this key; Budgets in the app shows them, and may need an admin role.",
+        title: "Actualyze did not allow the model list request",
+        body: "No balance or reset date is available through this key. The Budgets page in the app shows them; it may need an admin role.",
         role: "warn",
       };
     case "rate-limited":
       return {
-        headline:
-          retryIn === undefined
-            ? "Catalog rate limited (429)"
-            : `Catalog rate limited · retry in ${retryIn} s`,
-        body: "This limits the model list only, not inference. r works once the wait ends; otherwise Model Scout checks again on its next scheduled refresh, or when settings or the key change.",
+        headline: "Catalog rate limited (429)",
+        title: "The model list is rate limited, not inference",
+        body: `${wait === undefined ? "Retry with r" : "Retry with r once the wait ends"}; otherwise Model Scout checks again on its next scheduled refresh, or when settings or the key change.`,
         role: "warn",
       };
     case "unreachable":
       return {
-        headline: `Can't reach ${hostOf(view)}`,
-        body: "Check your network, VPN, or proxy, and settings.baseURL of providers.actualyze, then press r.",
+        headline: "Could not reach the endpoint",
+        title: "The connection failed",
+        body: `Check your network, VPN, or proxy, and ${BASE_URL_SETTING}. ${retry}`,
         role: "warn",
       };
     case "timeout":
       return {
-        headline: `${hostOf(view)} did not answer in time`,
-        body: "The model list timed out. Check your network or the endpoint, then press r.",
+        headline: "Endpoint did not answer in time",
+        title: "The model list request timed out",
+        body: `Check your network or the endpoint. ${retry}`,
         role: "warn",
       };
     case "server-error":
       return {
         headline: `Actualyze server error (${status ?? "5xx"})`,
-        body: "Actualyze failed to list models. Try again later.",
+        title: "Actualyze failed to list models",
+        body: `This is on Actualyze's side. ${retry}`,
         role: "warn",
       };
     case "not-found":
       return {
         headline: "No model list at this endpoint (404)",
-        body: "settings.baseURL should end in /openai/v1.",
+        title: "The base URL may be wrong",
+        body: `The setting ${BASE_URL_SETTING} should end in /openai/v1.`,
         role: "warn",
       };
     case "http-error":
       return {
         headline: `Unexpected answer (${status ?? "HTTP"})`,
-        body: "The model list request did not succeed.",
+        title: "The model list request did not succeed",
+        body: retry,
         role: "warn",
       };
     case "invalid-response":
       return {
         headline: "Unexpected answer (not a model list)",
-        body: "The endpoint answered, but not with a model list. Check settings.baseURL.",
+        title: "The endpoint did not send a model list",
+        body: `Check ${BASE_URL_SETTING}. ${retry}`,
         role: "warn",
       };
     case "aborted":
       return {
         headline: "Discovery was interrupted",
-        body: "It runs again on the next refresh; r retries now.",
+        title: "Discovery stopped before it finished",
+        body: `It runs again on the next refresh. ${retry}`,
         role: "warn",
       };
     case "error":
       return {
         headline: "Discovery failed",
-        body: "It runs again on the next refresh; r retries now.",
+        title: "Discovery stopped with an error",
+        body: `It runs again on the next refresh. ${retry}`,
         role: "warn",
       };
   }
@@ -589,108 +619,158 @@ function checkedAge(
   return age ? `checked ${age}` : undefined;
 }
 
-function statusSegments(view: ViewState, now: number): Segment[] {
+/** A status part with its color; see `fitStatusParts`. */
+interface ColoredPart extends StatusPart {
+  readonly role: ForegroundRole;
+}
+
+/** Drop order of status parts: the age goes first, then the key label. */
+const DROP_AGE = 3;
+const DROP_KEY = 2;
+const DROP_DETAIL = 1;
+
+/**
+ * The status line: a glyph in the state's color, the headline in base,
+ * then parts that fit, each after " · ". Whole parts are dropped when the
+ * line is too narrow, the age first and the key label next.
+ */
+function statusLine(
+  glyph: string,
+  glyphRole: ForegroundRole,
+  headline: string,
+  parts: readonly (ColoredPart | undefined)[],
+  width: number,
+): Segment[] {
+  const head = [seg(glyph, glyphRole), seg(` ${headline}`)];
+  const fitted = fitStatusParts(
+    textWidth(`${glyph} ${headline}`),
+    parts.filter((part): part is ColoredPart => part !== undefined),
+    width,
+    textWidth,
+  );
+  return [
+    ...head,
+    ...fitted.flatMap((part) => [
+      seg(" · ", "muted"),
+      seg(part.text, part.role),
+    ]),
+  ];
+}
+
+/** Chat models of the Actualyze group, as `/modelscout` counts them. */
+function chatModelCount(data: BrowserData): number {
+  const group = data.groups.find((item) => item.id === ACTUALYZE_PROVIDER_ID);
+  return (
+    group?.models.filter((model) => model.type !== "embedding").length ?? 0
+  );
+}
+
+function statusSegments(
+  view: ViewState,
+  now: number,
+  width: number,
+): Segment[] {
   const { state, data } = view;
   const record = state.record;
   const key = keyLabel(view.connection, record?.credentialSource);
-  const keyPart = key ? `key ${key}` : undefined;
-  const join = (head: Segment, ...parts: (string | undefined)[]): Segment[] => {
-    const rest = parts.filter((part): part is string => Boolean(part));
-    return rest.length > 0
-      ? [head, seg(` · ${rest.join(" · ")}`, "muted")]
-      : [head];
-  };
+  const keyPart: ColoredPart | undefined = key
+    ? { text: `key ${key}`, role: "muted", drop: DROP_KEY }
+    : undefined;
+  const age = checkedAge(record, now);
+  const agePart: ColoredPart | undefined = age
+    ? { text: age, role: "muted", drop: DROP_AGE }
+    : undefined;
+  const line = (
+    glyph: string,
+    role: ForegroundRole,
+    headline: string,
+    ...parts: (ColoredPart | undefined)[]
+  ): Segment[] => statusLine(glyph, role, headline, parts, width);
   if (data.status === "failed")
-    return [seg("▲ OpenCode's model lists did not load", "error")];
+    return line("▲", "error", "OpenCode's model lists did not load");
   switch (state.row) {
     case "saving":
-      return [seg("○ Saving key in OpenCode…", "info")];
+      return line("○", "info", "Saving key…");
     case "unconfirmed":
-      return [seg("▲ OpenCode did not confirm the key was saved", "error")];
+      return line("▲", "error", "Save not confirmed");
     case "server-unavailable":
-      return join(
-        seg("▲ Discovery status unavailable", "warn"),
-        keyPart ?? (view.connected === false ? "not connected" : undefined),
+      return line(
+        "▲",
+        "warn",
+        "Discovery status unavailable",
+        keyPart ??
+          (view.connected === false
+            ? { text: "not connected", role: "muted", drop: DROP_KEY }
+            : undefined),
       );
     case "not-managed":
-      return join(seg("Not managed by Model Scout", "muted"), keyPart);
+      return line("○", "muted", "Not managed by Model Scout", keyPart);
     case "checking":
-      return [seg(`○ ${checkingText(view.pending, now)}`, "info")];
+      return line("○", "info", checkingHeadline(view.pending, now));
     case "no-key":
-      return [seg("Not connected", "muted")];
+      return line("○", "muted", "Not connected");
     case "resolving":
-      return join(seg("○ Checking the connection…", "info"), keyPart);
+      return data.status === "loading"
+        ? line("○", "info", "Loading…")
+        : line("○", "info", "Checking the connection…", keyPart);
     case "discovering":
-      return join(seg("○ Loading models…", "info"), keyPart);
+      return line("○", "info", "Loading models…", keyPart);
     case "failure": {
       if (!record?.failure) return [];
       const copy = failureCopy(
         record.failure,
-        view,
         refreshWaitSeconds(record, data, now),
       );
-      return join(
-        seg(`▲ ${copy.headline}`, copy.role),
-        keyPart,
-        checkedAge(record, now),
-      );
+      return line("▲", copy.role, copy.headline, keyPart, agePart);
     }
     case "empty":
-      return join(
-        seg("● Catalog accessible", "ok"),
-        keyPart,
-        "no models for this key",
-        checkedAge(record, now),
-      );
+      return line("▲", "warn", "No models for this key", keyPart, agePart);
     case "ready": {
-      const count = record?.models.length ?? 0;
-      const segments = join(
-        seg("● Catalog accessible", "ok"),
+      const count = chatModelCount(data);
+      return line(
+        "●",
+        "ok",
+        "Catalog accessible",
         keyPart,
-        `${count} ${count === 1 ? "model" : "models"}`,
-        checkedAge(record, now),
+        {
+          text: `${count} ${count === 1 ? "model" : "models"}`,
+          role: "muted",
+          drop: DROP_DETAIL,
+        },
+        agePart,
+        record?.discovering
+          ? { text: "○ checking", role: "info", drop: DROP_DETAIL }
+          : undefined,
       );
-      return record?.discovering
-        ? [...segments, seg(" · ", "muted"), seg("○ checking", "info")]
-        : segments;
     }
   }
 }
 
-function checkingText(pending: PendingMarker | undefined, now: number): string {
+function checkingHeadline(
+  pending: PendingMarker | undefined,
+  now: number,
+): string {
   const savedAt = pending?.savedAt ?? now;
   return now - savedAt >= STILL_CHECKING_MS
-    ? "Still checking. The key is saved."
-    : "Key saved. Checking the current connection…";
+    ? "Still checking the current connection…"
+    : "Checking the current connection…";
 }
 
 // ── Cards ───────────────────────────────────────────────────────────────
 
+/** A key a card offers; the card's action row and the footer show the same title. */
 interface CardAction {
   readonly key: string;
-  /** Footer title. */
   readonly title: string;
-  /** Text in the card, before the key; defaults to the title. */
-  readonly label?: string;
-  /** Text in the card after the key. */
-  readonly suffix?: string;
   readonly enabled?: boolean;
-  /** Shown inside the card as well as in the footer. */
-  readonly primary?: boolean;
   readonly help: string;
 }
 
-function keyAction(
-  view: ViewState,
-  primary: boolean,
-  label?: string,
-): CardAction {
+function keyAction(view: ViewState): CardAction {
   return {
     key: "k",
     title: view.connected ? "another key" : "connect key",
-    ...(label ? { label } : {}),
     enabled: view.keyAllowed,
-    primary,
     help: KEY_HELP,
   };
 }
@@ -700,31 +780,22 @@ const KEY_HELP =
 const CONNECTIONS_HELP =
   "OpenCode's connections (pick Actualyze): switch, rename, or remove keys";
 
-function copyAction(link: ActualyzeLinkID, primary: boolean): CardAction {
-  const name = linkLabel(link);
+function copyAction(link: ActualyzeLinkID): CardAction {
   return {
     key: "y",
     title: "copy link",
-    label: `copy ${name} link`,
-    primary,
-    help: `copy the ${name} link`,
+    help: `copy the ${linkLabel(link)} link`,
   };
 }
 
 const LINKS_ACTION: CardAction = {
   key: "l",
   title: "links",
-  help: "app links: API keys, catalog, budgets, usage, troubleshooting",
+  help: "app links: API Keys, Catalog, Budgets, Usage, Troubleshooting",
 };
 
-function connectionsAction(primary: boolean): CardAction {
-  return {
-    key: "c",
-    title: "connections",
-    suffix: " (pick Actualyze)",
-    primary,
-    help: CONNECTIONS_HELP,
-  };
+function connectionsAction(): CardAction {
+  return { key: "c", title: "connections", help: CONNECTIONS_HELP };
 }
 
 const BROWSE_ACTION: CardAction = {
@@ -733,14 +804,23 @@ const BROWSE_ACTION: CardAction = {
   help: "every provider (/modelscout)",
 };
 
-function retryAction(wait: number | undefined, primary: boolean): CardAction {
+function retryAction(wait: number | undefined): CardAction {
   return {
     key: "r",
-    title: wait === undefined ? "retry" : `retry in ${wait} s`,
+    title: retryTitle(wait),
     enabled: wait === undefined,
-    primary,
     help: "check the catalog again",
   };
+}
+
+/** One footer-style hint: the title, then the key; dimmed when disabled. */
+function actionSegments(action: CardAction): Segment[] {
+  const enabled = action.enabled !== false;
+  return [
+    seg(action.title, enabled ? "base" : "disabled"),
+    seg(" "),
+    seg(action.key, enabled ? "key" : "disabled"),
+  ];
 }
 
 /** Lines of a card with a bar in `role` down its left edge. */
@@ -750,7 +830,8 @@ class CardWriter {
 
   constructor(
     private readonly role: ForegroundRole,
-    private readonly width: number,
+    /** The content width, which the footer shares. */
+    readonly width: number,
   ) {
     this.inner = Math.max(8, width - 2);
   }
@@ -763,6 +844,12 @@ class CardWriter {
     this.lines.push([seg("▌", this.role)]);
   }
 
+  /** The card's title, bold. */
+  title(text: string): void {
+    for (const part of wrapText(text, this.inner))
+      this.push([seg(part, "strong")]);
+  }
+
   text(body: string, role: ForegroundRole = "base"): void {
     for (const part of wrapText(body, this.inner)) this.push([seg(part, role)]);
   }
@@ -773,38 +860,32 @@ class CardWriter {
     const parts = wrapText(body, this.inner - indent);
     for (const [index, part] of parts.entries())
       this.push([seg(padText(index === 0 ? number : "", indent)), seg(part)]);
-    if (extra) this.push([seg(" ".repeat(indent)), seg(extra, "muted")]);
+    if (extra)
+      for (const part of wrapText(extra, this.inner - indent))
+        this.push([seg(" ".repeat(indent)), seg(part, "muted")]);
   }
 
+  /**
+   * `actions`, already in `ACTION_ORDER`, with the footer's titles and its
+   * two-column gaps: on one line when they fit, else one per line.
+   */
   actions(actions: readonly CardAction[]): void {
-    const shown = actions.filter((action) => action.primary);
-    if (shown.length === 0) return;
-    const parts = shown.map((action): Segment[] => {
-      const enabled = action.enabled !== false;
-      return [
-        seg(action.label ?? action.title, enabled ? "base" : "disabled"),
-        seg(" "),
-        seg(action.key, enabled ? "key" : "disabled"),
-        ...(action.suffix
-          ? [seg(action.suffix, enabled ? "muted" : "disabled")]
-          : []),
-      ];
-    });
+    if (actions.length === 0) return;
+    const parts = actions.map(actionSegments);
     const inline = parts.flatMap((part, index) =>
-      index === 0 ? part : [seg("   "), ...part],
+      index === 0 ? part : [seg("  "), ...part],
     );
     const inlineWidth = inline.reduce(
       (sum, part) => sum + textWidth(part.text),
       0,
     );
-    if (this.width >= INLINE_ACTIONS_COLUMNS && inlineWidth <= this.inner)
-      this.push(inline);
+    if (inlineWidth <= this.inner) this.push(inline);
     else for (const part of parts) this.push(part);
   }
 }
 
 function hints(actions: readonly CardAction[]): FooterHint[] {
-  return actions.map((action) => ({
+  return inActionOrder(actions).map((action) => ({
     title: action.title,
     key: action.key,
     enabled: action.enabled !== false,
@@ -812,14 +893,40 @@ function hints(actions: readonly CardAction[]): FooterHint[] {
 }
 
 function helpFor(actions: readonly CardAction[]): HelpEntry[] {
-  return actions.map((action) => ({ keys: action.key, action: action.help }));
+  return inActionOrder(actions).map((action) => ({
+    keys: action.key,
+    action: action.help,
+  }));
 }
 
+/**
+ * The keys of a card the footer cannot fit at `width` columns, in footer
+ * order; the card lists them in its own action row, so nothing appears
+ * twice and nothing is out of sight.
+ */
+function overflowActions(
+  actions: readonly CardAction[],
+  width: number,
+): CardAction[] {
+  const ordered = inActionOrder(actions);
+  const shown = footerShown(hints(ordered), width);
+  return ordered.filter((_, index) => !shown.has(index));
+}
+
+/**
+ * A card that replaces the list. Its action row, after a spacer, holds only
+ * the keys the footer cannot fit; with none it has no row.
+ */
 function replaceCard(
   writer: CardWriter,
   actions: readonly CardAction[],
   refresh = false,
 ): BrowserFrameCard {
+  const overflow = overflowActions(actions, writer.width);
+  if (overflow.length > 0) {
+    writer.blank();
+    writer.actions(overflow);
+  }
   return {
     placement: "replace",
     lines: writer.lines,
@@ -835,13 +942,12 @@ const HEADERS_NOTICE =
 function noKeyCard(view: ViewState, width: number): BrowserFrameCard {
   const writer = new CardWriter("muted", width);
   const origin = view.endpoint?.origin;
-  writer.text(
-    "Connect an Actualyze API key to use your team's models in OpenCode.",
-  );
+  writer.title("Connect an Actualyze API key");
+  writer.text("Your team's Actualyze models then show up in OpenCode.");
   writer.blank();
   writer.step(
     "1",
-    "Create a key in Account Settings → Security → API Keys (Read & Write).",
+    `Create a key in Account Settings → Security → API${NBSP}Keys (Read${NBSP}&${NBSP}Write).`,
     origin ? actualyzeLink(origin, "apiKeys").url : undefined,
   );
   if (view.keyAllowed) writer.step("2", `Press k and paste it. ${KEY_VISIBLE}`);
@@ -852,14 +958,14 @@ function noKeyCard(view: ViewState, width: number): BrowserFrameCard {
     );
   writer.blank();
   writer.text(
-    "From a shell: opencode auth login actualyze, or ACTUALYZE_API_KEY on the background service.",
+    "From a shell: opencode auth login actualyze, or set ACTUALYZE_API_KEY for the background service.",
     "muted",
   );
   const actions = [
-    keyAction(view, false),
-    ...(origin ? [copyAction("apiKeys", false)] : []),
+    keyAction(view),
+    ...(origin ? [copyAction("apiKeys")] : []),
     LINKS_ACTION,
-    connectionsAction(false),
+    connectionsAction(),
     BROWSE_ACTION,
   ];
   return replaceCard(writer, actions);
@@ -874,14 +980,15 @@ function failureCard(
   linkable: boolean,
 ): BrowserFrameCard {
   const wait = refreshWaitSeconds(record, view.data, now);
-  const copy = failureCopy(failure, view, wait);
+  const copy = failureCopy(failure, wait);
   const above = hasInventory(record);
   const writer = new CardWriter(copy.role, width);
+  writer.title(copy.title);
   writer.text(copy.body);
   const note = keySourceNote(view, record);
   if (note) writer.text(note, "muted");
   if (above) {
-    const count = record.models.length;
+    const count = chatModelCount(view.data);
     const age = relativeAge(record.lastGoodAt, now);
     writer.text(
       `Showing ${count} ${count === 1 ? "model" : "models"} from the last good check${age ? `, ${age}` : ""}. Links are under l.`,
@@ -890,16 +997,16 @@ function failureCard(
     return { placement: "above", lines: writer.lines };
   }
   const link = failureLink(failure.kind);
-  const copyLink = linkable ? [copyAction(link, true)] : [];
+  const copyLink = linkable ? [copyAction(link)] : [];
   let actions: CardAction[];
   switch (failure.kind) {
     case "unauthorized":
     case "forbidden":
       actions = [
-        keyAction(view, true),
+        keyAction(view),
         ...copyLink,
-        connectionsAction(true),
-        retryAction(wait, false),
+        connectionsAction(),
+        retryAction(wait),
         LINKS_ACTION,
         BROWSE_ACTION,
       ];
@@ -907,34 +1014,32 @@ function failureCard(
     case "payment-required":
       actions = [
         ...copyLink,
-        keyAction(view, true),
-        retryAction(wait, true),
+        keyAction(view),
+        retryAction(wait),
         LINKS_ACTION,
-        connectionsAction(false),
+        connectionsAction(),
         BROWSE_ACTION,
       ];
       break;
     case "rate-limited":
       actions = [
-        retryAction(wait, true),
+        retryAction(wait),
         LINKS_ACTION,
-        keyAction(view, false),
-        connectionsAction(false),
+        keyAction(view),
+        connectionsAction(),
         BROWSE_ACTION,
       ];
       break;
     default:
       actions = [
-        retryAction(wait, true),
+        retryAction(wait),
         ...copyLink,
-        keyAction(view, false),
+        keyAction(view),
         LINKS_ACTION,
-        connectionsAction(false),
+        connectionsAction(),
         BROWSE_ACTION,
       ];
   }
-  writer.blank();
-  writer.actions(actions);
   return replaceCard(writer, actions, true);
 }
 
@@ -951,7 +1056,7 @@ function describe(
   width: number,
   now: number,
 ): Described {
-  const status = statusSegments(view, now);
+  const status = statusSegments(view, now, width);
   if (session.links) return { status, ...linksCard(session, view, width) };
   // Host lists that failed to load keep the browser's own card and retry.
   if (view.data.status === "failed")
@@ -995,7 +1100,7 @@ function describeRow(
   switch (state.row) {
     case "saving": {
       const writer = new CardWriter("info", width);
-      writer.text("Saving key in OpenCode…");
+      writer.title("OpenCode is storing the key");
       writer.text(
         "Closing this dialog does not undo a completed save.",
         "muted",
@@ -1004,23 +1109,23 @@ function describeRow(
     }
     case "unconfirmed": {
       const writer = new CardWriter("error", width);
+      writer.title("OpenCode did not confirm the key was saved");
       writer.text(
-        "OpenCode did not confirm the key was saved. Check connections before trying again.",
+        "It may have stored the key before the error. Check connections before trying again.",
       );
       const actions = [
-        connectionsAction(true),
-        keyAction(view, true, "try again"),
+        keyAction(view),
+        connectionsAction(),
         LINKS_ACTION,
         BROWSE_ACTION,
       ];
-      writer.blank();
-      writer.actions(actions);
       return done(replaceCard(writer, actions));
     }
     case "server-unavailable": {
       const writer = new CardWriter("warn", width);
+      writer.title("Model Scout's server half did not answer");
       writer.text(
-        "Model Scout's server half did not answer, so the catalog status is unknown. Connecting a key still works.",
+        "The catalog status is unknown. Connecting a key still works.",
       );
       const key = keyLabel(view.connection, undefined);
       writer.text(
@@ -1031,48 +1136,41 @@ function describeRow(
             : "The connection is not known yet.",
         "muted",
       );
-      if (session.pending?.phase === "saved") writer.text("Key saved.", "ok");
+      if (session.pending?.phase === "saved") writer.text("Key saved.");
       const actions = [
-        keyAction(view, true),
-        connectionsAction(true),
+        keyAction(view),
+        connectionsAction(),
         // Discovery refresh needs the server half; `r` reads the catalog again.
-        retryAction(refreshWaitSeconds(record, data, now), false),
+        retryAction(refreshWaitSeconds(record, data, now)),
         LINKS_ACTION,
         BROWSE_ACTION,
       ];
-      writer.blank();
-      writer.actions(actions);
       return done(replaceCard(writer, actions));
     }
     case "not-managed": {
       const writer = new CardWriter("muted", width);
+      writer.title("Another definition of actualyze is in use");
       writer.text(
         "Another plugin or a models.dev catalog defines the actualyze provider, so Model Scout does not discover its models.",
       );
       writer.text(
         'To opt in, add "probe": "actualyze" to providers.actualyze.settings in opencode.json.',
-        "muted",
       );
       return done(
-        replaceCard(writer, [
-          connectionsAction(false),
-          LINKS_ACTION,
-          BROWSE_ACTION,
-        ]),
+        replaceCard(writer, [connectionsAction(), LINKS_ACTION, BROWSE_ACTION]),
       );
     }
     case "checking": {
       const writer = new CardWriter("info", width);
-      writer.text(checkingText(view.pending, now));
+      writer.title("Key saved");
       writer.text(
-        "Model Scout lists the models this key can reach; no inference request is sent.",
-        "muted",
+        "Model Scout is listing the models this key can reach; no inference request is sent.",
       );
       return done(
         replaceCard(writer, [
           LINKS_ACTION,
-          keyAction(view, false),
-          connectionsAction(false),
+          keyAction(view),
+          connectionsAction(),
           BROWSE_ACTION,
         ]),
       );
@@ -1081,32 +1179,35 @@ function describeRow(
       return done(noKeyCard(view, width), "apiKeys");
     case "resolving": {
       const writer = new CardWriter("info", width);
-      writer.text(
-        data.status === "loading"
-          ? "Reading models from OpenCode and Model Scout…"
-          : "Checking the connection…",
-      );
+      if (data.status === "loading") {
+        writer.title("Reading models");
+        writer.text(
+          "Model Scout is reading OpenCode's model lists and its own catalog.",
+        );
+      } else {
+        writer.title("Waiting for discovery");
+        writer.text(
+          "Model Scout is waiting for discovery with the current key.",
+        );
+      }
       return done(
         replaceCard(writer, [
           LINKS_ACTION,
-          keyAction(view, false),
-          connectionsAction(false),
+          keyAction(view),
+          connectionsAction(),
           BROWSE_ACTION,
         ]),
       );
     }
     case "discovering": {
       const writer = new CardWriter("info", width);
-      writer.text("Loading models…");
-      writer.text(
-        "Model Scout is reading the catalog this key can reach.",
-        "muted",
-      );
+      writer.title("Reading the catalog");
+      writer.text("Model Scout is reading the models this key can reach.");
       return done(
         replaceCard(writer, [
           LINKS_ACTION,
-          keyAction(view, false),
-          connectionsAction(false),
+          keyAction(view),
+          connectionsAction(),
           BROWSE_ACTION,
         ]),
       );
@@ -1125,22 +1226,20 @@ function describeRow(
       return done(card, card.placement === "replace" ? link : undefined);
     }
     case "empty": {
-      const writer = new CardWriter("muted", width);
-      writer.text("Catalog accessible · no models for this key");
+      const wait = refreshWaitSeconds(record, data, now);
+      const writer = new CardWriter("warn", width);
+      writer.title("Empty catalog");
       writer.text(
-        "The key works, but its team cannot use any models yet. Ask a workspace admin for model access.",
-        "muted",
+        `The catalog answered with an empty list: this key's team cannot use any models yet. Ask a workspace admin for model access. ${retrySentence(wait)}`,
       );
       const actions = [
-        retryAction(refreshWaitSeconds(record, data, now), true),
-        ...(origin ? [copyAction("catalog", true)] : []),
-        keyAction(view, true),
+        retryAction(wait),
+        ...(origin ? [copyAction("catalog")] : []),
+        keyAction(view),
         LINKS_ACTION,
-        connectionsAction(false),
+        connectionsAction(),
         BROWSE_ACTION,
       ];
-      writer.blank();
-      writer.actions(actions);
       return done(replaceCard(writer, actions, true), "catalog");
     }
     case "ready":
@@ -1150,41 +1249,42 @@ function describeRow(
 
 // ── Links ───────────────────────────────────────────────────────────────
 
-const LINK_LABEL_COLUMNS = 21;
-
 function linksCard(
   session: Session,
   view: ViewState,
   width: number,
 ): { card: BrowserFrameCard; link: ActualyzeLinkID | undefined } {
   const origin = view.endpoint?.origin;
-  const lines: Line[] = [
-    [seg("Links · enter or y copies the selected link", "muted")],
-    [],
-  ];
+  const paragraph = (text: string, role: ForegroundRole = "base"): Line[] =>
+    wrapText(text, width).map((part) => [seg(part, role)]);
+  const lines: Line[] = [...paragraph("Actualyze app links", "strong")];
   const highlight: number[] = [];
+  // The links screen's own keys, in its own order rather than the cards'.
   const actions: CardAction[] = [
     { key: "enter", title: "copy", help: "copy the selected link" },
     { key: "backspace", title: "back", help: "back; l does the same" },
     BROWSE_ACTION,
   ];
+  const footer = (shown: readonly CardAction[]): FooterHint[] =>
+    shown.map((action) => ({ title: action.title, key: action.key }));
   const help: HelpEntry[] = [
     { keys: "↑ ↓ home end", action: "choose a link" },
-    ...helpFor(actions),
+    ...actions.map((action) => ({ keys: action.key, action: action.help })),
     { keys: "y", action: "copy the selected link" },
   ];
   if (!origin) {
-    lines.push([
-      seg(
-        "No app links: settings.baseURL of providers.actualyze is not an http(s) URL.",
+    lines.push(
+      [],
+      ...paragraph(
+        "No app links: providers.actualyze.settings.baseURL is not an http(s) URL.",
         "warn",
       ),
-    ]);
+    );
     return {
       card: {
         placement: "replace",
         lines,
-        hints: hints(actions.slice(1)),
+        hints: footer(actions.slice(1)),
         help,
       },
       link: undefined,
@@ -1192,33 +1292,47 @@ function linksCard(
   }
   const links = actualyzeLinks(origin);
   const index = Math.min(Math.max(0, session.linkIndex), links.length - 1);
+  // Two-line rows take twice the rows, so that layout leaves out the blank
+  // row under the title and the second note to fit 80x24.
+  const beside = linkLayout(links, width, textWidth) === "beside";
+  if (beside) lines.push([]);
   for (const [position, link] of links.entries()) {
     const label = `   ${link.label}`;
     const start = lines.length;
-    if (LINK_LABEL_COLUMNS + textWidth(link.url) <= width)
+    if (beside)
       lines.push([
         seg(padText(label, LINK_LABEL_COLUMNS)),
         seg(link.url, "muted"),
       ]);
-    else lines.push([seg(label)], [seg(`      ${link.url}`, "muted")]);
+    else
+      lines.push(
+        [seg(label)],
+        ...wrapText(link.url, width - LINK_URL_INDENT).map((part) => [
+          seg(" ".repeat(LINK_URL_INDENT)),
+          seg(part, "muted"),
+        ]),
+      );
     if (position === index)
       for (let line = start; line < lines.length; line += 1)
         highlight.push(line);
   }
   lines.push([]);
-  lines.push([seg("Budgets may need an admin role in Actualyze.", "muted")]);
-  lines.push([
-    seg(
-      "Copying sends the link to your terminal's clipboard; Model Scout cannot open a browser.",
-      "muted",
-    ),
-  ]);
+  lines.push(
+    ...paragraph("Budgets may need an admin role in Actualyze.", "muted"),
+  );
+  if (beside)
+    lines.push(
+      ...paragraph(
+        "Enter or y copies the selected link to your terminal's clipboard; Model Scout cannot open a browser.",
+        "muted",
+      ),
+    );
   return {
     card: {
       placement: "replace",
       lines,
       highlight,
-      hints: hints(actions),
+      hints: footer(actions),
       help,
     },
     link: links[index]?.id,
@@ -1313,11 +1427,7 @@ function createFrame(session: Session): BrowserFrame {
   };
   return {
     header: (data, width) => headerSegments(viewState(session, data), width),
-    status: (data, width, now) => {
-      const { status, card } = read(data, width, now);
-      if (card?.placement === "replace") return status;
-      return justify(status, frameKeyHints(session, status, width), width);
-    },
+    status: (data, width, now) => read(data, width, now).status,
     card: (data, width, now) => read(data, width, now).card,
     route: (key, view) => routeFrameKey(session, key, view),
   };
@@ -1359,45 +1469,6 @@ function extraActions(session: Session): BrowserExtraAction[] {
       run: () => session.openModelScout(),
     },
   ];
-}
-
-/**
- * `c`, `b`, `l`, and `k` at the right of the status line in the list views,
- * as many as fit: the footer drops caller hints first when it runs out of
- * room, and `?` lists all four.
- */
-function frameKeyHints(
-  session: Session,
-  left: readonly Segment[],
-  width: number,
-): Segment[] {
-  const used = left.reduce((sum, part) => sum + textWidth(part.text), 0);
-  // `c` and `b` first: the footer lists `k` and `l` before them.
-  const items: [string, string, boolean][] = [
-    ["connections", "c", true],
-    ["all providers", "b", true],
-    ["links", "l", true],
-    [
-      session.facts?.integration.connection ? "another key" : "connect key",
-      "k",
-      keyAllowed(session),
-    ],
-  ];
-  const right: Segment[] = [];
-  let columns = 0;
-  for (const [title, key, enabled] of items) {
-    const gap = right.length > 0 ? 2 : 0;
-    const next = gap + textWidth(title) + 1 + key.length;
-    if (used + 2 + columns + next > width) break;
-    if (gap) right.push(seg("  "));
-    right.push(
-      seg(title, enabled ? "muted" : "disabled"),
-      seg(" "),
-      seg(key, enabled ? "key" : "disabled"),
-    );
-    columns += next;
-  }
-  return right;
 }
 
 type SaveOutcome = "saved" | "unconfirmed";

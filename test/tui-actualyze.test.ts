@@ -16,10 +16,15 @@ import {
   deriveActualyzeState,
   displayOrigin,
   failureLink,
+  fitStatusParts,
   hasInventory,
+  inActionOrder,
   integrationFacts,
   keyLabel,
+  linkLayout,
   reducePending,
+  retrySentence,
+  retryTitle,
   submitEvent,
   type ActualyzeInputs,
   type ActualyzeRow,
@@ -163,7 +168,7 @@ describe("links", () => {
       ]),
     ).toEqual([
       [
-        "API keys",
+        "API Keys",
         "https://actualyze.dev.example/account/settings?tab=security",
       ],
       ["Catalog", "https://actualyze.dev.example/control/catalog?tab=consume"],
@@ -586,6 +591,77 @@ describe("state table", () => {
         "ready",
       ].sort(),
     );
+  });
+});
+
+describe("status line parts", () => {
+  const parts = [
+    { text: 'key "Laptop"', drop: 2 },
+    { text: "5 models", drop: 1 },
+    { text: "checked 2 min ago", drop: 3 },
+  ];
+  const texts = (width: number): string[] =>
+    fitStatusParts(20, parts, width).map((part) => part.text);
+
+  it("keeps every part that fits, in order", () => {
+    // 20 + 3+12 + 3+8 + 3+17 = 66.
+    expect(texts(66)).toEqual([
+      'key "Laptop"',
+      "5 models",
+      "checked 2 min ago",
+    ]);
+  });
+
+  it("drops the age first, then the key label, never cutting a part", () => {
+    expect(texts(65)).toEqual(['key "Laptop"', "5 models"]);
+    expect(texts(45)).toEqual(["5 models"]);
+    expect(texts(30)).toEqual([]);
+  });
+
+  it("drops the later part on a tie and skips empty parts", () => {
+    expect(
+      fitStatusParts(
+        0,
+        [
+          { text: "aa", drop: 1 },
+          { text: "", drop: 9 },
+          { text: "bb", drop: 1 },
+        ],
+        6,
+      ).map((part) => part.text),
+    ).toEqual(["aa"]);
+  });
+});
+
+describe("hints", () => {
+  it("orders keys as key action, retry, copy link, links, connections, all providers", () => {
+    expect(
+      inActionOrder(
+        ["b", "enter", "c", "y", "l", "r", "k"].map((key) => ({ key })),
+      ).map((item) => item.key),
+    ).toEqual(["k", "r", "y", "l", "c", "b", "enter"]);
+  });
+
+  it("shows the wait in parentheses and only then says to wait", () => {
+    expect(retryTitle(59)).toBe("retry (59 s)");
+    expect(retryTitle(undefined)).toBe("retry");
+    expect(retrySentence(59)).toBe("Retry with r once the wait ends.");
+    expect(retrySentence(undefined)).toBe("Retry with r.");
+  });
+});
+
+describe("links layout", () => {
+  const links = actualyzeLinks("https://app.actualyze.ai");
+
+  it("puts URLs beside their labels when every one fits", () => {
+    expect(linkLayout(links, 110)).toBe("beside");
+  });
+
+  it("puts every URL under its label when any one would not fit", () => {
+    // Troubleshooting's URL is the longest; the others would fit at 72.
+    const longest = Math.max(...links.map((link) => link.url.length));
+    expect(linkLayout(links, 21 + longest - 1)).toBe("below");
+    expect(linkLayout(links, 21 + longest)).toBe("beside");
   });
 });
 
