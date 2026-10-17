@@ -93,8 +93,47 @@ const WAIT_TIMEOUT_MS = 15_000;
 const CATALOG_SETTLE_MS = 30_000;
 
 /**
- * Scenarios for what the TUI offers today. Later work on `/modelscout` and
- * `/actualyze` adds its own entries here.
+ * Rows of the `/actualyze` dialog on screen: from the `● ACTUALYZE` header
+ * to the footer that ends in `close esc`, and the blank rows just above the
+ * footer.
+ */
+function dialogRows(text) {
+  const lines = text.split("\n");
+  const top = lines.findIndex((line) => line.includes("● ACTUALYZE"));
+  const bottom = lines.findIndex(
+    (line, index) => index > top && /close esc\s*$/.test(line.trimEnd()),
+  );
+  if (top < 0 || bottom < 0) throw new Error("no /actualyze dialog on screen");
+  let blank = 0;
+  for (let index = bottom - 1; index > top && !lines[index].trim(); index -= 1)
+    blank += 1;
+  return { span: bottom - top + 1, blank };
+}
+
+/** A card-only state takes the rows it needs: at most two blank rows before the footer. */
+const COMPACT_CARD = {
+  label: "the card is not padded with empty rows",
+  run: async (ctx) => {
+    const { blank } = dialogRows(await ctx.session.text());
+    if (blank > 2) throw new Error(`${blank} blank rows above the footer`);
+  },
+};
+
+/** The list views keep the full dialog height, `min(30, rows - 4)` content rows. */
+const FULL_LIST = {
+  label: "the list view takes the full dialog height",
+  run: async (ctx) => {
+    const { span } = dialogRows(await ctx.session.text());
+    // Header through footer: the content rows less the bottom padding row.
+    const want = Math.min(30, ctx.size.rows - 4) - 1;
+    if (span !== want)
+      throw new Error(`dialog spans ${span} rows, not ${want}`);
+  },
+};
+
+/**
+ * Every scenario the runner knows, for `/modelscout`, `/actualyze`, and
+ * startup. `--scenario` selects a subset by name.
  */
 const SCENARIOS = [
   {
@@ -178,6 +217,7 @@ const SCENARIOS = [
       { expectNot: "custom endpoint" },
       { expectColor: { color: "brand", text: "ACTUALYZE" } },
       { expect: "Connect an Actualyze API key" },
+      COMPACT_CARD,
       { expect: /connect key k/ },
       { screenshot: "no-key" },
       { press: "l" },
@@ -220,6 +260,7 @@ const SCENARIOS = [
       { command: "/actualyze" },
       { wait: "ACTUALYZE" },
       { wait: "Not connected" },
+      COMPACT_CARD,
       { press: "k" },
       { wait: "Actualyze API key" },
       { expect: "The key is visible while you type" },
@@ -228,6 +269,7 @@ const SCENARIOS = [
       { wait: "ACTUALYZE", label: "the dialog shows again after submit" },
       { wait: "Catalog accessible", timeout: 45_000 },
       { wait: "Claude Haiku" },
+      { ...FULL_LIST, label: "the dialog grows from the card to the list" },
       { expect: /another key k/ },
       { screenshot: "ready" },
       { press: "b" },
@@ -269,6 +311,7 @@ const SCENARIOS = [
       { command: "/actualyze" },
       { wait: "ACTUALYZE" },
       { wait: "Key rejected (401)", timeout: 30_000 },
+      COMPACT_CARD,
       { expect: "Actualyze did not accept this key" },
       { expect: /another key k/ },
       { expect: /copy API keys link y/ },
@@ -290,7 +333,8 @@ const SCENARIOS = [
     steps: [
       { command: "/actualyze" },
       { wait: "Access denied (403)", timeout: 30_000 },
-      { expect: "did not allow the model list" },
+      { expect: "refused the model list request" },
+      { expectNot: /read-only/i },
       { screenshot: "forbidden" },
       { press: "esc" },
       { waitGone: "ACTUALYZE" },
@@ -444,15 +488,19 @@ const SCENARIOS = [
       { wait: "custom endpoint" },
       { expect: "http://127.0.0.1:" },
       { wait: "Catalog accessible", timeout: 30_000 },
+      { wait: "Claude Haiku" },
+      FULL_LIST,
       { expectColor: { color: "brand", text: "ACTUALYZE" } },
       { screenshot: "custom-endpoint" },
       { press: "l" },
       { wait: "Links ·" },
+      { ...COMPACT_CARD, label: "the dialog shrinks from the list to links" },
       { expect: /http:\/\/127\.0\.0\.1:\d+\/account\/settings\?tab=security/ },
       { expectNot: "https://app.actualyze.ai" },
       { screenshot: "links" },
       { press: "backspace" },
       { wait: "Claude Haiku" },
+      { ...FULL_LIST, label: "the dialog grows back from links to the list" },
       { press: "esc" },
       { waitGone: "ACTUALYZE" },
     ],

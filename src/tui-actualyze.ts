@@ -372,7 +372,10 @@ export function deriveActualyzeState(inputs: ActualyzeInputs): ActualyzeState {
   if (payload?.builtIn.actualyze === "foreign") return at("not-managed");
   if (pending?.phase === "saved" && awaitingCheck(pending, payload))
     return at("checking");
+  // While the catalog loads, a missing record says nothing yet: a
+  // `settings.apiKey` user has no connection either.
   if (
+    inputs.server !== "loading" &&
     inputs.connected === false &&
     (!record || record.credentialSource === "none")
   )

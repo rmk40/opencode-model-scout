@@ -182,6 +182,21 @@ export function closeActualyze(context: Context): void {
   const session = live.get(context);
   if (!session) return;
   const handle = session.handle;
+  // The prompt replaced the dialog, so the handle no longer closes anything.
+  const prompting = session.prompting;
+  endSession(session);
+  if (prompting) {
+    try {
+      context.ui.dialog.clear();
+    } catch {
+      // A failing clear must not escape the plugin cleanup.
+    }
+  } else handle?.close();
+}
+
+/** End a session whose location changed, closing its dialog if still open. */
+function abandon(session: Session): void {
+  const handle = session.handle;
   endSession(session);
   handle?.close();
 }
@@ -458,7 +473,7 @@ function failureCopy(
     case "forbidden":
       return {
         headline: "Access denied (403)",
-        body: "Actualyze accepted the key but did not allow the model list. A read-only key or a team without model access gets this answer; ask a workspace admin.",
+        body: "Actualyze refused the model list request for this key. Check the key's permissions and model access with your administrator.",
         role: "error",
       };
     case "payment-required":
@@ -893,6 +908,7 @@ function failureCard(
         retryAction(wait, true),
         LINKS_ACTION,
         keyAction(view, false),
+        connectionsAction(false),
         BROWSE_ACTION,
       ];
       break;
@@ -1039,7 +1055,14 @@ function describeRow(
         "Model Scout lists the models this key can reach; no inference request is sent.",
         "muted",
       );
-      return done(replaceCard(writer, [LINKS_ACTION, BROWSE_ACTION]));
+      return done(
+        replaceCard(writer, [
+          LINKS_ACTION,
+          keyAction(view, false),
+          connectionsAction(false),
+          BROWSE_ACTION,
+        ]),
+      );
     }
     case "no-key":
       return done(noKeyCard(view, width), "apiKeys");
@@ -1053,6 +1076,7 @@ function describeRow(
       return done(
         replaceCard(writer, [
           LINKS_ACTION,
+          keyAction(view, false),
           connectionsAction(false),
           BROWSE_ACTION,
         ]),
@@ -1065,7 +1089,14 @@ function describeRow(
         "Model Scout is reading the catalog this key can reach.",
         "muted",
       );
-      return done(replaceCard(writer, [LINKS_ACTION, BROWSE_ACTION]));
+      return done(
+        replaceCard(writer, [
+          LINKS_ACTION,
+          keyAction(view, false),
+          connectionsAction(false),
+          BROWSE_ACTION,
+        ]),
+      );
     }
     case "failure": {
       if (!record?.failure) return done(undefined);
@@ -1399,9 +1430,28 @@ async function enterKey(session: Session): Promise<void> {
   } finally {
     session.prompting = false;
   }
-  if (session.ended) return;
-  if (entered === undefined || !accepts(session)) {
+  if (session.ended) {
+    // A plugin reload while the prompt was open: say the key went nowhere.
+    if (entered?.trim())
+      toast(
+        context,
+        "warning",
+        "The Actualyze key was not saved: Model Scout was reloaded. Enter it again with /actualyze.",
+      );
+    return;
+  }
+  if (entered === undefined) {
     endSession(session);
+    return;
+  }
+  if (!accepts(session)) {
+    endSession(session);
+    if (entered.trim())
+      toast(
+        context,
+        "warning",
+        "The Actualyze key was not saved: the location changed. Enter it again with /actualyze.",
+      );
     return;
   }
   let saving: Promise<SaveOutcome>;
@@ -1422,6 +1472,8 @@ async function enterKey(session: Session): Promise<void> {
   void show(session);
   const outcome = await saving;
   if (!accepts(session)) {
+    // Another location now: this session's card would wait forever.
+    if (!session.ended) abandon(session);
     if (outcome === "unconfirmed")
       toast(
         context,

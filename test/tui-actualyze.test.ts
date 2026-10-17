@@ -374,6 +374,22 @@ describe("pending marker", () => {
 });
 
 describe("state", () => {
+  it("waits for the catalog before saying no key is connected", () => {
+    // A settings.apiKey user has no connection; only the record tells them apart.
+    expect(
+      rowOf({ server: "loading", payload: undefined, connected: false }),
+    ).toBe("resolving");
+    expect(rowOf({ payload: payload(undefined), connected: false })).toBe(
+      "no-key",
+    );
+    expect(
+      rowOf({
+        payload: payload(record({ credentialSource: "settings" })),
+        connected: false,
+      }),
+    ).toBe("ready");
+  });
+
   it("counts any current record as new after the server instance changed", () => {
     const pending = marker("saved", { epochAtSubmit: 5 });
     const reloaded = payload(record({ credentialEpoch: 0, resultEpoch: 0 }), {
@@ -489,7 +505,9 @@ describe("state table", () => {
       ],
       [
         "no-key",
-        connected === false && (!rec || rec.credentialSource === "none"),
+        server !== "loading" &&
+          connected === false &&
+          (!rec || rec.credentialSource === "none"),
       ],
       [
         "resolving",

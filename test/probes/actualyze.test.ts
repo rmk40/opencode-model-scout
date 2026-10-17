@@ -310,6 +310,7 @@ describe("probeActualyze list-first reads", () => {
       "z-ai/glm-4.5": {
         context: 131_072,
         maxTokens: 131_072,
+        modelType: "llm",
         toolCall: true,
         inputModalities: ["text"],
         cost: { input: 1, output: 4, cacheRead: 0.1, cacheWrite: 1.25 },
@@ -424,7 +425,8 @@ describe("probeActualyze field mapping", () => {
       ],
     });
 
-    expect(result.models.negative.modelType).toBeUndefined();
+    // Each entry reports `modalities.output: ["text"]`.
+    expect(result.models.negative.modelType).toBe("llm");
     expect(result.models.negative).toMatchObject({
       vision: false,
       toolCall: false,
@@ -434,34 +436,39 @@ describe("probeActualyze field mapping", () => {
     for (const id of ["unknown", "wrong-type"]) {
       const meta = result.models[id];
       expect(meta.vision).toBeUndefined();
-      expect(meta.modelType).toBeUndefined();
+      expect(meta.modelType).toBe("llm");
       expect(meta.toolCall).toBeUndefined();
       expect(meta.reasoning).toBeUndefined();
       expect(meta.temperature).toBeUndefined();
     }
   });
 
-  it("classifies embedding output as an embedding model, whatever the vision flag says", async () => {
-    const embedding = (id: string, vision: boolean | null, output: string[]) =>
+  it("classifies the type from output modalities, then the vision flag", async () => {
+    const entry = (id: string, vision: boolean | null, output?: string[]) =>
       advertisedEntry(id, {
         capabilities: { vision, tool_use: false },
-        modalities: { input: ["text"], output },
+        modalities: output ? { input: ["text"], output } : { input: ["text"] },
       });
     const result = await probe({
       modelsResponse: [
-        embedding("embed-only", false, ["embedding"]),
-        embedding("embed-and-text", true, ["text", "embedding"]),
-        embedding("text-no-vision", false, ["text"]),
-        embedding("vision", true, ["text"]),
+        entry("embed-only", false, ["embedding"]),
+        entry("embed-and-text", true, ["text", "embedding"]),
+        entry("text-no-vision", false, ["text"]),
+        entry("text-unknown-vision", null, ["text"]),
+        entry("vision", true, ["text"]),
+        entry("no-output-list", false),
       ],
     });
 
     expect(result.models["embed-only"].modelType).toBe("embedding");
     expect(result.models["embed-and-text"].modelType).toBe("embedding");
-    // vision: false leaves the type to the name heuristic.
-    expect(result.models["text-no-vision"].modelType).toBeUndefined();
+    // A reported output list without embedding is a language model.
+    expect(result.models["text-no-vision"].modelType).toBe("llm");
     expect(result.models["text-no-vision"].vision).toBe(false);
+    expect(result.models["text-unknown-vision"].modelType).toBe("llm");
     expect(result.models.vision.modelType).toBe("vlm");
+    // vision: false alone leaves the type to the name heuristic.
+    expect(result.models["no-output-list"].modelType).toBeUndefined();
   });
 
   it("treats either thinking flag as reasoning", async () => {

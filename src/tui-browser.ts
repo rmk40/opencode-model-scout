@@ -1423,7 +1423,16 @@ export function buildBrowserView(
     const cards = listScreen && cardsShown();
     const split = listScreen && layout.wide && !cards;
     const summary = listScreen && !layout.wide && !cards;
-    const bodyHeight = bodyRows();
+    const fullBody = bodyRows();
+    // A replacing card and the key list over it take the rows they need
+    // plus one before the footer; the list views keep the full height.
+    const bodyHeight =
+      replacing() && (listScreen || current === "help")
+        ? Math.min(fullBody, paneLines(layout.width).length + 1)
+        : fullBody;
+    const rootHeight = layout.height - (fullBody - bodyHeight);
+    renderer.set(root, "height", rootHeight);
+    renderer.set(root, "maxHeight", rootHeight);
     const bannerHeight = bannerRows();
     renderer.set(statusLine, "visible", frame !== undefined);
     renderer.set(searchRow, "visible", !replacing());
@@ -2149,12 +2158,16 @@ export function buildBrowserView(
     }
   }
 
-  /** What a replacing card leaves to the browser on the list screen. */
+  /**
+   * What a replacing card leaves to the browser on the list screen: `?`,
+   * the caller keys the card lists, and refresh when the card allows it.
+   */
   function allowedUnderCard(action: BrowserAction): boolean {
     switch (action.type) {
       case "help":
-      case "extra":
         return true;
+      case "extra":
+        return card?.hints?.some((hint) => hint.key === action.key) === true;
       case "refresh":
       case "refresh-all":
         return card?.refresh === true;

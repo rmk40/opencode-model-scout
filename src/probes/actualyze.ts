@@ -148,9 +148,10 @@ function readCost(cost: unknown): ProbeModelCost | undefined {
 
 /**
  * A model whose `modalities.output` lists `embedding` is an embedding
- * model; otherwise `vision: true` makes it a `vlm`. `vision: false` says
+ * model; otherwise `vision: true` makes it a `vlm`, and a reported output
+ * list without `embedding` makes it an `llm`. `vision: false` alone says
  * nothing about the type, because embedding models take no images either,
- * so the type is left to discovery's name heuristic.
+ * so without an output list the type is left to discovery's name heuristic.
  */
 function readModelType(
   detail: ActualyzeModelObject,
@@ -162,6 +163,7 @@ function readModelType(
       : undefined;
   if (output?.includes("embedding")) return "embedding";
   if (vision === true) return "vlm";
+  if (output) return "llm";
   return undefined;
 }
 
