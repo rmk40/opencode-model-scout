@@ -21,6 +21,7 @@ const SETTINGS_KEY = "actualyze-settings-key";
 const CONNECTED_KEY = "actualyze-connected-key";
 const SHADOWED_SETTINGS_KEY = "actualyze-shadowed-settings-key";
 const STORED_KEY = "actualyze-stored-key";
+const ZERO_CONFIG_KEY = "actualyze-zero-config-key";
 const INTEGRATION_ID = "actualyze";
 
 const MODELS = [
@@ -292,7 +293,8 @@ async function actualyzeIntegrations(
 
 // Credentials persist in the data directory that every host in this file
 // shares, so scenarios that need `actualyze` without a stored key run before
-// the one that stores a key.
+// the ones that store a key, and a scenario that stores a key before another
+// one removes it again.
 describe("an actualyze provider defined by an earlier plugin without an integration", () => {
   let host: OpenCode.Interface | undefined;
   let location: { directory: string };
@@ -336,6 +338,55 @@ describe("an actualyze provider defined by an earlier plugin without an integrat
     ).toEqual([{ id: INTEGRATION_ID, name: "Actualyze", connections: 0 }]);
     const providers = (await host!.provider.list({ location })).data;
     expect(providers.some((entry) => entry.id === "actualyze")).toBe(false);
+  });
+});
+
+describe("Actualyze with no config and a key stored through the host", () => {
+  let host: OpenCode.Interface | undefined;
+  let location: { directory: string };
+
+  beforeAll(async () => {
+    ({ host, location } = await createHost("zero-config", {}));
+  });
+
+  afterAll(async () => {
+    // Later scenarios start without a stored Actualyze key.
+    if (host) {
+      for (const credential of await host.credential.list()) {
+        if (credential.integrationID === INTEGRATION_ID)
+          await host.credential.remove({ credentialID: credential.id });
+      }
+    }
+    await host?.close();
+  });
+
+  it("appears with the production endpoint and its models once a key is connected", async () => {
+    expect(
+      await eventually(async () => {
+        const listed = await actualyzeIntegrations(host!, location);
+        return listed.length > 0 ? listed : undefined;
+      }),
+    ).toEqual([{ id: INTEGRATION_ID, name: "Actualyze", connections: 0 }]);
+    const before = (await host!.provider.list({ location })).data;
+    expect(before.some((entry) => entry.id === "actualyze")).toBe(false);
+
+    await host!.integration.connect.key({
+      integrationID: INTEGRATION_ID,
+      key: ZERO_CONFIG_KEY,
+      location,
+    });
+
+    expect(await findProvider(host!, location)).toMatchObject({
+      name: "Actualyze",
+      integrationID: INTEGRATION_ID,
+      package: "@opencode/ai/providers/openai-compatible",
+      settings: { baseURL: PRODUCTION_BASE_URL, probe: "actualyze" },
+    });
+    expect(await findModel(host!, location)).toMatchObject({
+      limit: { context: 1_000_000, output: 64_000 },
+      capabilities: { tools: true, input: ["text", "image"] },
+    });
+    expect(authorizations).toContain(`Bearer ${ZERO_CONFIG_KEY}`);
   });
 });
 
