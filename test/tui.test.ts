@@ -1,20 +1,16 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 // The reconciler needs a live renderer; the mock records the same
-// createElement/setProp/insert calls the plugin makes against OpenTUI.
-const { reconcilerMock } = vi.hoisted(() => ({
+// createElement/setProp/insert calls the plugin makes against OpenTUI, and
+// the core mock stands in for StyledText, which the plugin assigns to a
+// text node's `content` directly.
+const { reconcilerMock, coreMock } = vi.hoisted(() => ({
   reconcilerMock: () => ({
     createElement: (tag: string) => ({
       tag,
       props: {} as Record<string, unknown>,
       children: [] as unknown[],
-      selectedIndex: 0,
-      setSelectedIndex(index: number) {
-        this.selectedIndex = index;
-      },
-      getSelectedIndex() {
-        return this.selectedIndex;
-      },
+      content: undefined as unknown,
     }),
     setProp: (
       node: { props: Record<string, unknown> },
@@ -29,8 +25,16 @@ const { reconcilerMock } = vi.hoisted(() => ({
       return child;
     },
   }),
+  coreMock: () => ({
+    StyledText: class {
+      constructor(readonly chunks: Array<{ text: string; fg?: unknown }>) {}
+    },
+    parseColor: (color: unknown) => color,
+    TextAttributes: { BOLD: 1 },
+  }),
 }));
 vi.mock("@opentui/solid", reconcilerMock);
+vi.mock("@opentui/core", coreMock);
 
 import type { Plugin } from "@opencode/plugin/tui";
 import {
@@ -39,16 +43,19 @@ import {
   unknownCapability,
   unknownScalar,
   type CatalogPayload,
+  type CatalogProviderRecord,
 } from "../src/catalog-evidence";
 import { COMMAND_NAME, PLUGIN_ID } from "../src/constants";
 import plugin from "../src/tui";
 import type { HostModel, HostProvider } from "../src/tui-models";
+import { openBrowser } from "../src/tui-session";
 
-type MockNode = {
+interface MockNode {
   tag?: string;
   props?: Record<string, unknown>;
-  children?: unknown[];
-};
+  children?: MockNode[];
+  content?: unknown;
+}
 
 interface Command {
   id?: string;
@@ -64,6 +71,7 @@ interface Layer {
 }
 
 const PROJECT = { directory: "/work/project" };
+const GENERATED_AT = "2026-10-11T08:00:00.000Z";
 
 function findNodeById(node: unknown, id: string): MockNode | undefined {
   if (!node || typeof node !== "object") return undefined;
@@ -76,42 +84,74 @@ function findNodeById(node: unknown, id: string): MockNode | undefined {
   return undefined;
 }
 
-function findTextContaining(node: unknown, text: string): MockNode | undefined {
-  if (!node || typeof node !== "object") return undefined;
-  const candidate = node as MockNode;
-  if (
-    candidate.tag === "text" &&
-    typeof candidate.props?.content === "string" &&
-    candidate.props.content.includes(text)
-  )
-    return candidate;
-  for (const child of candidate.children ?? []) {
-    const found = findTextContaining(child, text);
-    if (found) return found;
-  }
-  return undefined;
+/** Text of a node, from its StyledText chunks or its plain content. */
+function textOf(node: MockNode | undefined): string {
+  const content = node?.content;
+  if (content && typeof content === "object" && "chunks" in content)
+    return (content as { chunks: Array<{ text: string }> }).chunks
+      .map((chunk) => chunk.text)
+      .join("");
+  return typeof node?.props?.content === "string" ? node.props.content : "";
+}
+
+function line(root: unknown, id: string): string {
+  return textOf(findNodeById(root, id)).trimEnd();
+}
+
+function visible(node: MockNode | undefined): boolean {
+  return node?.props?.visible !== false;
+}
+
+/** The visible lines of a row list or text pane. */
+function lines(root: unknown, id: string): string[] {
+  const box = findNodeById(root, id);
+  if (!visible(box)) return [];
+  return (box?.children ?? [])
+    .filter(visible)
+    .map((child) => textOf(child).trimEnd());
+}
+
+function listRows(root: unknown): string[] {
+  return lines(root, "modelscout-list");
+}
+
+function pane(root: unknown): string {
+  return lines(root, "modelscout-pane").join("\n");
 }
 
 function color(name: string) {
   return { name };
 }
 
-const tokens = {
-  text: {
-    base: color("text.base"),
-    muted: color("text.muted"),
-    feedback: { error: { base: color("text.feedback.error.base") } },
-    action: { primary: { focused: color("text.action.primary.focused") } },
-  },
-  background: {
-    base: color("background.base"),
-    raised: { high: color("background.raised.high") },
-    action: {
-      primary: { focused: color("background.action.primary.focused") },
+function stateful(prefix: string) {
+  return {
+    focused: color(`${prefix}.focused`),
+    disabled: color(`${prefix}.disabled`),
+    selected: color(`${prefix}.selected`),
+  };
+}
+
+function surface(base = "text.base") {
+  return {
+    text: {
+      base: color(base),
+      muted: color("text.muted"),
+      action: { primary: stateful("text.action.primary") },
+      formfield: stateful("text.formfield"),
+      feedback: {
+        success: { base: color("text.feedback.success.base") },
+        warning: { base: color("text.feedback.warning.base") },
+        error: { base: color("text.feedback.error.base") },
+        info: { base: color("text.feedback.info.base") },
+      },
     },
-  },
-  hue: { accent: { 200: color("hue.accent.200") } },
-};
+    background: {
+      action: { primary: stateful("background.action.primary") },
+      formfield: stateful("background.formfield"),
+    },
+    border: { base: color("border.base") },
+  };
+}
 
 const atlasProvider: HostProvider = {
   id: "atlas",
@@ -120,82 +160,99 @@ const atlasProvider: HostProvider = {
   settings: { baseURL: "https://atlas.test/openai/v1" },
 };
 
-function hostModel(id = "atlas-model", name = "Atlas Model"): HostModel {
+function hostModel(
+  id = "atlas-model",
+  name = "Atlas Model",
+  input: string[] = ["text"],
+): HostModel {
   return {
     id,
     providerID: "atlas",
     name,
     enabled: true,
-    capabilities: { tools: true, input: ["text"], output: ["text"] },
+    capabilities: { tools: true, input, output: ["text"] },
     variants: [],
     cost: [],
     limit: { context: 8192, output: 32_000 },
   };
 }
 
+function providerRecord(
+  overrides: Partial<CatalogProviderRecord> = {},
+): CatalogProviderRecord {
+  return {
+    id: "atlas",
+    endpointOrigin: knownScalar(
+      "https://atlas.test",
+      "pre-existing",
+      "configured",
+    ),
+    configuredProbe: unknownScalar(),
+    resolvedProbe: knownScalar("vllm", "provider-probe", "reported"),
+    lastGoodAt: GENERATED_AT,
+    failure: null,
+    modelListAttempt: "ready",
+    probeAttempt: "complete",
+    skippedModelIds: [],
+    models: [
+      {
+        id: "atlas-model",
+        origin: "discovered",
+        enabled: true,
+        identity: knownScalar("atlas-model", "server-list", "reported"),
+        name: unknownScalar(),
+        modelType: unknownScalar(),
+        context: knownScalar(8192, "provider-probe", "authoritative"),
+        output: knownScalar(32_000, "host-default", "assumed"),
+        family: unknownScalar(),
+        organizationOwner: unknownScalar(),
+        parameterSize: unknownScalar(),
+        quantization: unknownScalar(),
+        sizeBytes: unknownScalar(),
+        probeIdentity: unknownScalar(),
+        capabilities: {
+          toolCall: unknownCapability(),
+          reasoning: unknownCapability(),
+          temperature: unknownCapability(),
+        },
+        inputModalities: {
+          text: unknownCapability(),
+          image: unknownCapability(),
+          pdf: unknownCapability(),
+          audio: unknownCapability(),
+          video: unknownCapability(),
+        },
+        cost: {
+          input: unknownScalar(),
+          output: unknownScalar(),
+          cacheRead: unknownScalar(),
+          cacheWrite: unknownScalar(),
+        },
+      },
+    ],
+    discovering: false,
+    lastAttemptAt: GENERATED_AT,
+    nextRefreshAt: null,
+    credentialSource: "connection",
+    credentialEpoch: 0,
+    resultEpoch: 0,
+    ...overrides,
+  };
+}
+
 function payload(
-  status: CatalogPayload["status"] = "complete",
+  record: Partial<CatalogProviderRecord> = {},
+  generatedAt = GENERATED_AT,
 ): CatalogPayload {
   return {
     schemaVersion: CATALOG_SCHEMA_VERSION,
     packageVersion: "2.0.0",
-    status,
-    ...(status === "complete"
-      ? { completedAt: "2026-10-11T08:00:00.000Z" }
-      : { startedAt: "2026-10-11T08:00:00.000Z" }),
-    providers: [
-      {
-        id: "atlas",
-        endpointOrigin: knownScalar(
-          "https://atlas.test",
-          "pre-existing",
-          "configured",
-        ),
-        configuredProbe: unknownScalar(),
-        resolvedProbe: knownScalar("actualyze", "provider-probe", "reported"),
-        lastGoodAt: "2026-10-11T08:00:00.000Z",
-        failure: null,
-        modelListAttempt: "ready",
-        probeAttempt: "complete",
-        skippedModelIds: [],
-        models: [
-          {
-            id: "atlas-model",
-            origin: "discovered",
-            enabled: true,
-            identity: knownScalar("atlas-model", "server-list", "reported"),
-            name: unknownScalar(),
-            modelType: unknownScalar(),
-            context: knownScalar(8192, "provider-probe", "authoritative"),
-            output: knownScalar(32_000, "host-default", "assumed"),
-            family: unknownScalar(),
-            organizationOwner: unknownScalar(),
-            parameterSize: unknownScalar(),
-            quantization: unknownScalar(),
-            sizeBytes: unknownScalar(),
-            probeIdentity: unknownScalar(),
-            capabilities: {
-              toolCall: unknownCapability(),
-              reasoning: unknownCapability(),
-              temperature: unknownCapability(),
-            },
-            inputModalities: {
-              text: unknownCapability(),
-              image: unknownCapability(),
-              pdf: unknownCapability(),
-              audio: unknownCapability(),
-              video: unknownCapability(),
-            },
-            cost: {
-              input: unknownScalar(),
-              output: unknownScalar(),
-              cacheRead: unknownScalar(),
-              cacheWrite: unknownScalar(),
-            },
-          },
-        ],
-      },
-    ],
+    instanceID: "instance",
+    generatedAt,
+    status: "complete",
+    completedAt: GENERATED_AT,
+    builtIn: { actualyze: "managed" },
+    providers: [providerRecord(record)],
   };
 }
 
@@ -233,6 +290,20 @@ function harness(options: HarnessOptions = {}) {
       return keyInput;
     }),
   };
+  const resizeListeners = new Set<() => void>();
+  const renderer = {
+    terminalWidth: options.terminalWidth ?? 120,
+    terminalHeight: options.terminalHeight ?? 36,
+    keyInput,
+    on: vi.fn((event: string, listener: () => void) => {
+      if (event === "resize") resizeListeners.add(listener);
+    }),
+    off: vi.fn((event: string, listener: () => void) => {
+      if (event === "resize") resizeListeners.delete(listener);
+    }),
+    copyToClipboardOSC52: vi.fn((_text: string) => true),
+    isOsc52Supported: vi.fn(() => true),
+  };
 
   let hostModels: HostModel[] = [hostModel()];
   const modelList = vi.fn(
@@ -255,13 +326,15 @@ function harness(options: HarnessOptions = {}) {
       accepted: true,
     }),
   );
-  const rpcHandlers = new Set<(event: unknown) => void>();
+  const rpcHandlers = new Map<string, Set<(event: unknown) => void>>();
   const stopRpc = vi.fn();
-  const on = vi.fn((_name: string, handler: (event: unknown) => void) => {
-    rpcHandlers.add(handler);
+  const on = vi.fn((name: string, handler: (event: unknown) => void) => {
+    const set = rpcHandlers.get(name) ?? new Set();
+    set.add(handler);
+    rpcHandlers.set(name, set);
     return () => {
       stopRpc();
-      rpcHandlers.delete(handler);
+      set.delete(handler);
     };
   });
   const rpc = vi.fn(() => ({ catalog, refresh, events: { on } }));
@@ -274,6 +347,20 @@ function harness(options: HarnessOptions = {}) {
       modelHandlers.delete(handler);
     };
   });
+  const memories = new Map<
+    string,
+    readonly [object, (fn: (draft: object) => void) => void]
+  >();
+  const memory = vi.fn((key: string, input: { initial: object }) => {
+    const existing = memories.get(key);
+    if (existing) return existing;
+    const value = structuredClone(input.initial);
+    const entry = [value, (fn: (draft: object) => void) => fn(value)] as const;
+    memories.set(key, entry);
+    return entry;
+  });
+  let currentModel: { providerID: string; modelID: string } | undefined;
+  let tokens = surface();
 
   const context = {
     location: "location" in options ? options.location : PROJECT,
@@ -286,14 +373,19 @@ function harness(options: HarnessOptions = {}) {
       model: { list: modelList },
       provider: { list: providerList },
     },
-    ui: { dialog, toast },
-    keymap: { layer: (factory: () => Layer) => layers.push(factory) },
-    renderer: {
-      terminalWidth: options.terminalWidth ?? 140,
-      terminalHeight: options.terminalHeight ?? 40,
-      keyInput,
+    ui: {
+      dialog,
+      toast,
+      model: { current: () => currentModel },
     },
+    keymap: {
+      layer: (factory: () => Layer) => layers.push(factory),
+      dispatch: vi.fn(),
+    },
+    storage: { memory },
+    renderer,
     theme: { surface: () => tokens },
+    themeMode: "dark",
   };
 
   const cleanup = plugin.setup(context as unknown as Plugin.Context);
@@ -306,6 +398,12 @@ function harness(options: HarnessOptions = {}) {
     await command().run();
     return open?.render();
   };
+  /** Open the dialog and wait until the host lists and the catalog arrived. */
+  const ready = async (): Promise<unknown> => {
+    const root = await run();
+    await vi.waitFor(() => expect(listRows(root).length).toBeGreaterThan(0));
+    return root;
+  };
   const press = (key: Record<string, unknown>) => {
     const event = {
       ctrl: false,
@@ -314,12 +412,14 @@ function harness(options: HarnessOptions = {}) {
       option: false,
       super: false,
       hyper: false,
-      sequence: "",
+      sequence:
+        typeof key.name === "string" && key.name.length === 1 ? key.name : "",
       preventDefault: vi.fn(),
       stopPropagation: vi.fn(),
       ...key,
     };
-    for (const listener of keyListeners) listener(event);
+    for (const listener of [...keyListeners]) listener(event);
+    return event;
   };
 
   return {
@@ -329,10 +429,13 @@ function harness(options: HarnessOptions = {}) {
     toast,
     keyInput,
     keyListeners,
+    resizeListeners,
+    renderer,
     modelList,
     providerList,
     catalog,
     refresh,
+    memory,
     stopRpc,
     stopData,
     cleanup: () => {
@@ -340,13 +443,27 @@ function harness(options: HarnessOptions = {}) {
     },
     command,
     run,
+    ready,
     press,
     current: () => open,
     setHostModels: (models: HostModel[]) => {
       hostModels = models;
     },
-    emitRpc: (event: unknown) => {
-      for (const handler of rpcHandlers) handler(event);
+    setCurrentModel: (
+      model: { providerID: string; modelID: string } | undefined,
+    ) => {
+      currentModel = model;
+    },
+    setTokens: (next: ReturnType<typeof surface>) => {
+      tokens = next;
+    },
+    resize: (columns: number, rows: number) => {
+      renderer.terminalWidth = columns;
+      renderer.terminalHeight = rows;
+      for (const listener of resizeListeners) listener();
+    },
+    emitRpc: (name: string, event: unknown) => {
+      for (const handler of rpcHandlers.get(name) ?? []) handler(event);
     },
     emitModelUpdated: (event: unknown) => {
       for (const handler of modelHandlers) handler(event);
@@ -354,24 +471,19 @@ function harness(options: HarnessOptions = {}) {
   };
 }
 
-function summary(root: unknown): string {
-  return findNodeById(root, "modelscout-summary")?.props?.content as string;
-}
-
-function openDetail(root: unknown, index: number): string {
-  const results = findNodeById(root, "modelscout-results");
-  (results?.props?.onSelect as (index: number) => void)(index);
-  return findNodeById(root, "modelscout-detail-text")?.props?.content as string;
-}
-
-function optionNames(root: unknown): string[] {
-  const options = findNodeById(root, "modelscout-results")?.props
-    ?.options as Array<{ name: string }>;
-  return options.map((option) => option.name);
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.useRealTimers();
 });
 
 describe("plugin definition and command", () => {
@@ -381,7 +493,6 @@ describe("plugin definition and command", () => {
 
   it("registers one global slash and palette command without any I/O", () => {
     const h = harness();
-    expect(h.layers).toHaveLength(1);
     const layer = h.layers[0]?.();
     expect(layer?.mode).toBe("global");
     expect(layer?.commands).toHaveLength(1);
@@ -397,16 +508,43 @@ describe("plugin definition and command", () => {
 });
 
 describe("opening the dialog", () => {
-  it("reads host rows and evidence for the plugin's location", async () => {
+  it("shows a loading state before the host lists answer, then fills in", async () => {
+    const h = harness();
+    const models = deferred<{ location: unknown; data: HostModel[] }>();
+    h.modelList.mockReturnValueOnce(models.promise as never);
+    const root = await h.run();
+    expect(line(root, "modelscout-header")).toMatch(
+      /^Model Scout .*○ loading$/,
+    );
+    expect(pane(root)).toContain("○ Reading models from OpenCode and scout…");
+
+    models.resolve({ location: PROJECT, data: [hostModel()] });
+    await vi.waitFor(() =>
+      expect(listRows(root).some((row) => row.includes("Atlas Model"))).toBe(
+        true,
+      ),
+    );
+    expect(line(root, "modelscout-header")).toMatch(/1 provider · 1 model$/);
+  });
+
+  it("shows the dialog first and then sets its size and placement", async () => {
     const h = harness();
     await h.run();
+    expect(h.dialog.set).toHaveBeenCalledWith({
+      size: "xlarge",
+      centered: true,
+    });
+    expect(h.dialog.show.mock.invocationCallOrder[0]).toBeLessThan(
+      h.dialog.set.mock.invocationCallOrder[0] ?? 0,
+    );
+  });
+
+  it("reads host rows and evidence for the plugin's location", async () => {
+    const h = harness();
+    await h.ready();
     expect(h.modelList).toHaveBeenCalledWith(
       { location: PROJECT },
       expect.objectContaining({ signal: expect.any(AbortSignal) }),
-    );
-    expect(h.providerList).toHaveBeenCalledWith(
-      { location: PROJECT },
-      expect.anything(),
     );
     expect(h.catalog).toHaveBeenCalledWith(
       {},
@@ -419,109 +557,68 @@ describe("opening the dialog", () => {
 
   it("falls back to the default location when the plugin has none", async () => {
     const h = harness({ location: undefined });
-    await h.run();
+    await h.ready();
     expect(h.catalog).toHaveBeenCalledWith(
       {},
       expect.objectContaining({ location: { directory: "/default/project" } }),
     );
   });
 
-  it("shows the dialog first and sizes it afterwards", async () => {
+  it("selects the prompt's current model on the first open", async () => {
     const h = harness();
-    await h.run();
-    expect(h.dialog.set).toHaveBeenCalledWith({ size: "xlarge" });
-    expect(h.dialog.show.mock.invocationCallOrder[0]).toBeLessThan(
-      h.dialog.set.mock.invocationCallOrder[0] ?? 0,
+    h.setHostModels([
+      hostModel("a-first", "A First"),
+      hostModel("z-current", "Z Current"),
+    ]);
+    h.setCurrentModel({ providerID: "atlas", modelID: "z-current" });
+    const root = await h.ready();
+    expect(listRows(root).find((row) => row.startsWith("▌"))).toMatch(
+      /^▌● Z Current/,
     );
+    expect(pane(root)).toContain("● Current model");
   });
 
-  it("renders server evidence next to host rows", async () => {
+  it("keeps the host rows and says why when scout's server half does not answer", async () => {
     const h = harness();
-    const root = await h.run();
-    const detail = openDetail(root, 1);
-    expect(detail).toContain("Model ID: atlas-model [server]");
-    expect(detail).toContain("Context: 8K [probe]");
-    expect(detail).toContain("Max output: 32K [host default]");
-    expect(summary(root)).toMatch(/^Model Scout · 1\/1 models/);
-  });
-
-  it("names a running discovery in the summary", async () => {
-    const h = harness();
-    h.catalog.mockResolvedValueOnce(payload("running"));
-    expect(summary(await h.run())).toContain("discovery running");
-  });
-
-  it("says discovery is starting until the updated event brings evidence", async () => {
-    const h = harness();
-    h.catalog.mockResolvedValueOnce({
-      schemaVersion: CATALOG_SCHEMA_VERSION,
-      packageVersion: "2.0.0",
-      status: "pending",
-      providers: [],
-    });
-    const root = await h.run();
-    expect(summary(root)).toContain("discovery starting");
-    expect(openDetail(root, 1)).toContain("Model ID: atlas-model [host]");
-
-    h.emitRpc({ location: PROJECT, data: { completedAt: "x" } });
-    await vi.waitFor(() =>
-      expect(summary(root)).not.toContain("discovery starting"),
+    h.catalog.mockRejectedValue({ type: "rpc.unavailable", message: "" });
+    const root = await h.ready();
+    expect(line(root, "modelscout-notice")).toBe(
+      "▲ Discovery details unavailable: scout's server half did not answer. Showing OpenCode's model list.",
     );
-    expect(openDetail(root, 1)).toContain("Model ID: atlas-model [server]");
-  });
-
-  it.each([
-    [
-      "the server half is unavailable",
-      { type: "rpc.unavailable", message: "RPC is unavailable" },
-      "host state only: server plugin unavailable",
-    ],
-    [
-      "the handler fails",
-      { type: "rpc.internal", message: "RPC call failed" },
-      "host state only: server error (rpc.internal)",
-    ],
-    [
-      "the call times out",
-      Object.assign(new Error("timed out"), { name: "TimeoutError" }),
-      "host state only: server timed out",
-    ],
-    [
-      "the transport fails",
-      new TypeError("fetch failed"),
-      "host state only: server unreachable",
-    ],
-  ])("degrades to host rows when %s", async (_label, error, notice) => {
-    const h = harness();
-    h.catalog.mockRejectedValueOnce(error);
-    const root = await h.run();
-    expect(summary(root)).toContain(notice);
-    expect(openDetail(root, 0)).toContain(
-      "evidence unavailable; showing host state only",
+    h.press({ name: "r" });
+    expect(h.refresh).not.toHaveBeenCalled();
+    expect(line(root, "modelscout-notice")).toContain(
+      "Refresh needs scout's server half",
     );
     expect(h.toast.show).not.toHaveBeenCalled();
   });
 
-  it("degrades to host rows when the evidence fails validation", async () => {
+  it("treats evidence that fails validation like a missing server half", async () => {
     const h = harness();
-    h.catalog.mockResolvedValueOnce({ ...payload(), schemaVersion: 3 });
-    const root = await h.run();
-    expect(summary(root)).toContain("host state only: invalid server evidence");
-    expect(openDetail(root, 1)).toContain("Model ID: atlas-model [host]");
+    h.catalog.mockResolvedValue({ ...payload(), schemaVersion: 4 });
+    const root = await h.ready();
+    expect(line(root, "modelscout-notice")).toContain(
+      "Discovery details unavailable: scout's answer failed validation",
+    );
   });
 
-  it("toasts and opens nothing when the host lists fail", async () => {
+  it("keeps the dialog open when the host lists fail, and r reads them again", async () => {
     const h = harness();
     h.modelList.mockRejectedValueOnce(new Error("service down"));
-    await h.command().run();
-    expect(h.dialog.show).not.toHaveBeenCalled();
-    expect(h.toast.show).toHaveBeenCalledWith(
-      expect.objectContaining({
-        variant: "error",
-        title: "Model Scout",
-        message: "service down",
-      }),
+    const root = await h.run();
+    await vi.waitFor(() =>
+      expect(pane(root)).toContain("Could not load models from OpenCode."),
     );
+    expect(pane(root)).toContain("service down");
+    expect(h.toast.show).not.toHaveBeenCalled();
+
+    h.press({ name: "r" });
+    await vi.waitFor(() =>
+      expect(listRows(root).some((row) => row.includes("Atlas Model"))).toBe(
+        true,
+      ),
+    );
+    expect(h.refresh).not.toHaveBeenCalled();
   });
 
   it("toasts when showing the dialog throws", async () => {
@@ -534,68 +631,367 @@ describe("opening the dialog", () => {
       expect.objectContaining({ message: "dialog unavailable" }),
     );
   });
+});
 
-  it("maps the dialog surface tokens onto the browser colors", async () => {
+describe("layout", () => {
+  it("shows the detail pane beside the list from 120 columns and a summary line below", async () => {
     const h = harness();
-    const results = findNodeById(await h.run(), "modelscout-results");
-    expect(results?.props).toMatchObject({
-      backgroundColor: tokens.background.base,
-      focusedBackgroundColor: tokens.background.base,
-      selectedBackgroundColor: tokens.background.action.primary.focused,
-      textColor: tokens.text.base,
-      selectedTextColor: tokens.text.action.primary.focused,
+    const root = await h.ready();
+    expect(findNodeById(root, "modelscout-browser")?.props).toMatchObject({
+      width: 116,
+      height: 30,
     });
+    expect(pane(root)).toContain("atlas/atlas-model");
+    expect(visible(findNodeById(root, "modelscout-summary"))).toBe(false);
+
+    h.resize(80, 24);
+    expect(findNodeById(root, "modelscout-browser")?.props).toMatchObject({
+      width: 78,
+      height: 20,
+    });
+    expect(visible(findNodeById(root, "modelscout-pane"))).toBe(false);
+    expect(line(root, "modelscout-summary")).toMatch(/^Atlas Model/);
+    expect(listRows(root).every((row) => row.length <= 72)).toBe(true);
+  });
+
+  it("turns the narrow detail screen into the focused pane when the terminal widens", async () => {
+    const h = harness({ terminalWidth: 80, terminalHeight: 24 });
+    const root = await h.ready();
+    h.press({ name: "down" });
+    h.press({ name: "return" });
+    expect(visible(findNodeById(root, "modelscout-list"))).toBe(false);
+    expect(pane(root)).toContain("atlas/atlas-model");
+
+    h.resize(120, 36);
+    expect(visible(findNodeById(root, "modelscout-list"))).toBe(true);
+    expect(line(root, "modelscout-footer")).toMatch(/^back backspace/);
+  });
+
+  it("re-reads the theme when it repaints", async () => {
+    const h = harness();
+    const root = await h.ready();
+    h.setTokens(surface("text.base.light"));
+    h.emitRpc("updated", { location: PROJECT, data: {} });
+    await vi.waitFor(() => {
+      const header = findNodeById(root, "modelscout-header")?.content as {
+        chunks: Array<{ fg?: { name: string } }>;
+      };
+      expect(header.chunks[0]?.fg?.name).toBe("text.base.light");
+    });
+  });
+});
+
+describe("keys", () => {
+  it("lets every printable key edit a focused search, and enter returns to the list", async () => {
+    const h = harness();
+    const root = await h.ready();
+    const slash = h.press({ name: "/" });
+    expect(slash.preventDefault).toHaveBeenCalled();
+    expect(findNodeById(root, "modelscout-search")?.props?.focused).toBe(true);
+
+    const typed = h.press({ name: "m" });
+    expect(typed.preventDefault).not.toHaveBeenCalled();
+    expect(h.context.keymap.dispatch).not.toHaveBeenCalled();
+
+    const onInput = findNodeById(root, "modelscout-search")?.props?.onInput as (
+      value: string,
+    ) => void;
+    onInput("nothing-matches");
+    expect(pane(root)).toContain(
+      'No models match "nothing-matches" with these filters.',
+    );
+
+    h.press({ name: "return" });
+    expect(findNodeById(root, "modelscout-search")?.props?.focused).toBe(false);
+    h.press({ name: "x" });
+    expect(listRows(root).some((row) => row.includes("Atlas Model"))).toBe(
+      true,
+    );
+    expect(findNodeById(root, "modelscout-search")?.props?.value).toBe("");
+  });
+
+  it("consumes m before opening the host model picker", async () => {
+    const h = harness();
+    await h.ready();
+    const order: string[] = [];
+    h.context.keymap.dispatch.mockImplementationOnce(() =>
+      order.push("dispatch"),
+    );
+    h.press({ name: "m", preventDefault: () => order.push("consumed") });
+    expect(order).toEqual(["consumed", "dispatch"]);
+    expect(h.context.keymap.dispatch).toHaveBeenCalledWith("model.list");
+  });
+
+  it("does not open the picker for an embedding model", async () => {
+    const h = harness();
+    h.catalog.mockResolvedValue({
+      ...payload(),
+      providers: [
+        providerRecord({
+          models: [
+            {
+              ...providerRecord().models[0],
+              modelType: knownScalar(
+                "embedding",
+                "provider-probe",
+                "authoritative",
+              ),
+            },
+          ],
+        }),
+      ],
+    });
+    const root = await h.run();
+    await vi.waitFor(() =>
+      expect(line(root, "modelscout-filters")).toContain("1 embedding hidden"),
+    );
+    h.press({ name: "f" });
+    h.press({ name: "down" });
+    h.press({ name: "left" });
+    h.press({ name: "backspace" });
+    h.press({ name: "down" });
+    h.press({ name: "m" });
+    expect(h.context.keymap.dispatch).not.toHaveBeenCalled();
+    expect(line(root, "modelscout-notice")).toBe(
+      "Embedding model; not in the chat picker",
+    );
+  });
+
+  it("copies provider/model with y and the raw ID with Y", async () => {
+    const h = harness();
+    const root = await h.ready();
+    h.press({ name: "down" });
+    h.press({ name: "y" });
+    expect(h.renderer.copyToClipboardOSC52).toHaveBeenLastCalledWith(
+      "atlas/atlas-model",
+    );
+    expect(line(root, "modelscout-notice")).toBe(
+      "Copy sent to terminal: atlas/atlas-model",
+    );
+    h.press({ name: "y", sequence: "Y", shift: true });
+    expect(h.renderer.copyToClipboardOSC52).toHaveBeenLastCalledWith(
+      "atlas-model",
+    );
+  });
+
+  it("keeps the text visible when the terminal does not accept OSC 52", async () => {
+    const h = harness();
+    const root = await h.ready();
+    h.renderer.isOsc52Supported.mockReturnValue(false);
+    h.press({ name: "down" });
+    h.press({ name: "y" });
+    expect(h.renderer.copyToClipboardOSC52).not.toHaveBeenCalled();
+    expect(line(root, "modelscout-notice")).toMatch(
+      /does not accept copy requests.*atlas\/atlas-model$/,
+    );
+  });
+
+  it("leaves a without an Actualyze hook unconsumed, and runs the hook when given", async () => {
+    const h = harness();
+    await h.ready();
+    expect(h.press({ name: "a" }).preventDefault).not.toHaveBeenCalled();
+
+    h.current()?.onClose?.();
+    const actualyze = vi.fn();
+    await openBrowser(
+      h.context as unknown as Plugin.Context,
+      { kind: "all" },
+      { actualyze },
+    );
+    h.current()?.render();
+    const event = h.press({ name: "a" });
+    expect(actualyze).toHaveBeenCalledOnce();
+    expect(event.preventDefault).toHaveBeenCalled();
+  });
+
+  it("opens evidence with d and returns with backspace", async () => {
+    const h = harness();
+    const root = await h.ready();
+    h.press({ name: "down" });
+    h.press({ name: "d" });
+    expect(pane(root)).toMatch(/Context +8,192 +probe/);
+    expect(pane(root)).toMatch(/Max output +32,000 +OpenCode default/);
+    h.press({ name: "backspace" });
+    expect(visible(findNodeById(root, "modelscout-list"))).toBe(true);
+  });
+});
+
+describe("navigation memory", () => {
+  it("restores query and selection on the next open in the same location", async () => {
+    const h = harness();
+    h.setHostModels([
+      hostModel("a-first", "A First"),
+      hostModel("b-second", "B Second"),
+    ]);
+    const root = await h.ready();
+    h.press({ name: "end" });
+    h.press({ name: "s" });
+    h.current()?.onClose?.();
+
+    const again = await h.ready();
+    expect(root).not.toBe(again);
+    expect(listRows(again).find((row) => row.startsWith("▌"))).toMatch(
+      /B Second/,
+    );
+    expect(line(again, "modelscout-filters")).toContain("sort context");
+  });
+});
+
+describe("live updates", () => {
+  it.each(["updated", "status"])(
+    "reloads in place on the RPC %s event for the same location",
+    async (name) => {
+      const h = harness();
+      const root = await h.ready();
+      h.setHostModels([hostModel(), hostModel("atlas-new", "Atlas New")]);
+      h.emitRpc(name, { location: PROJECT, data: {} });
+      await vi.waitFor(() =>
+        expect(listRows(root).some((row) => row.includes("Atlas New"))).toBe(
+          true,
+        ),
+      );
+    },
+  );
+
+  it("reloads on model.updated and ignores other or missing locations", async () => {
+    const h = harness();
+    await h.ready();
+    h.emitRpc("updated", { location: { directory: "/elsewhere" }, data: {} });
+    h.emitModelUpdated({ type: "model.updated" });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(h.modelList).toHaveBeenCalledOnce();
+    h.emitModelUpdated({ type: "model.updated", location: PROJECT });
+    await vi.waitFor(() => expect(h.modelList).toHaveBeenCalledTimes(2));
+  });
+
+  it("coalesces a burst of events into one follow-up reload", async () => {
+    const h = harness();
+    await h.ready();
+    for (let index = 0; index < 4; index++)
+      h.emitRpc("status", { location: PROJECT, data: {} });
+    await vi.waitFor(() => expect(h.modelList).toHaveBeenCalledTimes(3));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(h.modelList).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the last rows and says so when a reload fails", async () => {
+    const h = harness();
+    const root = await h.ready();
+    h.modelList.mockRejectedValueOnce(new Error("offline"));
+    h.emitRpc("updated", { location: PROJECT, data: {} });
+    await vi.waitFor(() =>
+      expect(line(root, "modelscout-notice")).toBe(
+        "▲ Update failed; showing the last result",
+      ),
+    );
+    expect(listRows(root).some((row) => row.includes("Atlas Model"))).toBe(
+      true,
+    );
+  });
+});
+
+describe("refresh keys", () => {
+  it("refreshes the selected provider with r and every provider with R", async () => {
+    const h = harness();
+    const root = await h.ready();
+    h.press({ name: "r" });
+    await vi.waitFor(() =>
+      expect(line(root, "modelscout-notice")).toBe("○ Refreshing Atlas…"),
+    );
+    expect(h.refresh).toHaveBeenLastCalledWith(
+      { providerID: "atlas" },
+      expect.objectContaining({ location: PROJECT }),
+    );
+    h.press({ name: "r", sequence: "R", shift: true });
+    await vi.waitFor(() =>
+      expect(h.refresh).toHaveBeenLastCalledWith({}, expect.anything()),
+    );
+  });
+
+  it("counts down a throttled refresh from nextRefreshAt and generatedAt", async () => {
+    const h = harness();
+    const root = await h.ready();
+    h.refresh.mockResolvedValueOnce({ accepted: false, reason: "throttled" });
+    // The server clock runs an hour behind the client; only the offset counts.
+    h.catalog.mockResolvedValue(
+      payload(
+        { nextRefreshAt: "2026-10-11T08:00:40.000Z" },
+        "2026-10-11T08:00:00.000Z",
+      ),
+    );
+    h.press({ name: "r" });
+    await vi.waitFor(() =>
+      expect(line(root, "modelscout-notice")).toBe(
+        "Refresh skipped: Atlas was checked recently. Try again in 40 s.",
+      ),
+    );
   });
 
   it.each([
-    [160, 40, 112, 25],
-    [80, 24, 74, 12],
-  ])(
-    "sizes a %i×%i terminal to a content-sized root",
-    async (columns, rows, width, height) => {
-      const h = harness({ terminalWidth: columns, terminalHeight: rows });
-      expect(
-        findNodeById(await h.run(), "modelscout-browser")?.props,
-      ).toMatchObject({ width, height, maxHeight: height });
-    },
-  );
+    [
+      { accepted: false, reason: "no-targets" },
+      "Refresh skipped: Atlas is not a discovery target",
+    ],
+  ])("explains a declined refresh", async (answer, notice) => {
+    const h = harness();
+    const root = await h.ready();
+    h.refresh.mockResolvedValueOnce(answer);
+    h.press({ name: "r" });
+    await vi.waitFor(() =>
+      expect(line(root, "modelscout-notice")).toBe(notice),
+    );
+  });
+
+  it("explains a refresh that failed", async () => {
+    const h = harness();
+    const root = await h.ready();
+    h.refresh.mockRejectedValueOnce({ type: "rpc.internal", message: "" });
+    h.press({ name: "r" });
+    await vi.waitFor(() =>
+      expect(line(root, "modelscout-notice")).toBe(
+        "▲ Refresh failed: scout's server half failed (rpc.internal)",
+      ),
+    );
+  });
 });
 
 describe("dialog lifecycle", () => {
-  it("disposes the key listener and subscriptions once when the host closes it", async () => {
+  it("removes its listeners, subscriptions, and timer once when the host closes it", async () => {
+    const clear = vi.spyOn(globalThis, "clearInterval");
     const h = harness();
-    await h.run();
+    await h.ready();
     expect(h.keyListeners.size).toBe(1);
+    expect(h.resizeListeners.size).toBe(1);
 
     h.current()?.onClose?.();
     h.current()?.onClose?.();
 
     expect(h.keyListeners.size).toBe(0);
-    expect(h.keyInput.off).toHaveBeenCalledTimes(1);
-    expect(h.stopRpc).toHaveBeenCalledOnce();
+    expect(h.resizeListeners.size).toBe(0);
+    expect(h.stopRpc).toHaveBeenCalledTimes(2);
     expect(h.stopData).toHaveBeenCalledOnce();
+    expect(clear).toHaveBeenCalledOnce();
     expect(h.dialog.clear).not.toHaveBeenCalled();
   });
 
   it("keeps one key listener when the host renders the dialog again", async () => {
     const h = harness();
-    await h.run();
+    await h.ready();
     h.current()?.render();
     expect(h.keyListeners.size).toBe(1);
   });
 
   it("closes its own open dialog on plugin cleanup", async () => {
     const h = harness();
-    await h.run();
+    await h.ready();
     h.cleanup();
     expect(h.dialog.clear).toHaveBeenCalledOnce();
     expect(h.keyListeners.size).toBe(0);
-    expect(h.stopRpc).toHaveBeenCalledOnce();
   });
 
   it("leaves a dialog that replaced its own alone on cleanup", async () => {
     const h = harness();
-    await h.run();
+    await h.ready();
     h.context.ui.dialog.show(() => undefined);
     h.cleanup();
     expect(h.dialog.clear).not.toHaveBeenCalled();
@@ -607,6 +1003,7 @@ describe("dialog lifecycle", () => {
     h.cleanup();
     await running;
     expect(h.dialog.show).not.toHaveBeenCalled();
+    expect(h.stopRpc).toHaveBeenCalled();
   });
 
   it("falls back to flat content when the browser cannot be built", async () => {
@@ -619,9 +1016,24 @@ describe("dialog lifecycle", () => {
     expect(h.toast.show).toHaveBeenCalledWith(
       expect.objectContaining({ message: "key input unavailable" }),
     );
-    const body = findTextContaining(root, "(interactive browser unavailable)");
-    expect(body?.props?.content).toContain("Atlas — 1 model");
-    expect(body?.props?.fg).toBe(tokens.text.feedback.error.base);
+    const body = (node: unknown): MockNode | undefined => {
+      const candidate = node as MockNode;
+      if (
+        candidate.tag === "text" &&
+        typeof candidate.props?.content === "string" &&
+        candidate.props.content.includes("(interactive browser unavailable)")
+      )
+        return candidate;
+      for (const child of candidate.children ?? []) {
+        const found = body(child);
+        if (found) return found;
+      }
+      return undefined;
+    };
+    await vi.waitFor(() =>
+      expect(body(root)?.props?.content).toContain("Atlas — 1 model"),
+    );
+    expect(body(root)?.props?.fg).toEqual(color("text.feedback.error.base"));
   });
 
   it("keeps forged provider and model strings on their fallback lines", async () => {
@@ -629,26 +1041,35 @@ describe("dialog lifecycle", () => {
     h.setHostModels([
       hostModel("atlas-model\r\n  forged-standalone-row", "Atlas\u2028Forged"),
     ]);
-    h.catalog.mockRejectedValueOnce({ type: "rpc.unavailable", message: "" });
+    h.catalog.mockRejectedValue({ type: "rpc.unavailable", message: "" });
     await h.command().run();
     h.keyInput.on.mockImplementationOnce(() => {
       throw new Error("forced fallback\nForged Error — standalone line");
     });
-    const content = findTextContaining(
-      h.current()?.render(),
-      "(interactive browser unavailable)",
-    )?.props?.content as string;
+    const root = h.current()?.render() as MockNode;
+    const find = (node: MockNode): string | undefined => {
+      const content = node.props?.content;
+      if (
+        typeof content === "string" &&
+        content.includes("(interactive browser unavailable)")
+      )
+        return content;
+      for (const child of node.children ?? []) {
+        const found = find(child);
+        if (found) return found;
+      }
+      return undefined;
+    };
+    await vi.waitFor(() =>
+      expect(find(root)).toContain("forged-standalone-row"),
+    );
+    const content = find(root) ?? "";
     expect(content.replaceAll("\n", "")).not.toMatch(
       /[\p{Cc}\p{Zl}\p{Zp}\u202A-\u202E\u2066-\u2069]/u,
     );
-    const lines = content.split("\n");
-    expect(lines).not.toContain("  forged-standalone-row");
-    expect(lines).toContain("  atlas-model   forged-standalone-row");
-    expect(
-      lines.some((line) =>
-        line.includes("forced fallback Forged Error — standalone line"),
-      ),
-    ).toBe(true);
+    const contentLines = content.split("\n");
+    expect(contentLines).not.toContain("  forged-standalone-row");
+    expect(contentLines).toContain("  atlas-model   forged-standalone-row");
   });
 
   it("toasts when OpenTUI cannot be loaded", async () => {
@@ -673,153 +1094,5 @@ describe("dialog lifecycle", () => {
       vi.resetModules();
       vi.doMock("@opentui/solid", reconcilerMock);
     }
-  });
-});
-
-describe("live updates", () => {
-  it("reloads in place on an updated event for the same location", async () => {
-    const h = harness();
-    const root = await h.run();
-    h.setHostModels([hostModel(), hostModel("atlas-new", "Atlas New")]);
-
-    h.emitRpc({ location: PROJECT, data: { completedAt: "x" } });
-
-    await vi.waitFor(() =>
-      expect(optionNames(root).some((name) => name.includes("Atlas New"))).toBe(
-        true,
-      ),
-    );
-    expect(h.catalog).toHaveBeenLastCalledWith(
-      {},
-      expect.objectContaining({ location: PROJECT }),
-    );
-  });
-
-  it("reloads on model.updated for the same location", async () => {
-    const h = harness();
-    const root = await h.run();
-    h.setHostModels([hostModel(), hostModel("atlas-new", "Atlas New")]);
-    h.emitModelUpdated({ type: "model.updated", location: PROJECT });
-    await vi.waitFor(() =>
-      expect(optionNames(root).some((name) => name.includes("Atlas New"))).toBe(
-        true,
-      ),
-    );
-  });
-
-  it("ignores events for other or missing locations", async () => {
-    const h = harness();
-    await h.run();
-    h.emitRpc({ location: { directory: "/elsewhere" }, data: {} });
-    h.emitModelUpdated({ type: "model.updated" });
-    h.emitModelUpdated({
-      type: "model.updated",
-      location: { directory: "/elsewhere" },
-    });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(h.modelList).toHaveBeenCalledOnce();
-  });
-
-  it("coalesces a burst of events into one follow-up reload", async () => {
-    const h = harness();
-    await h.run();
-    for (let index = 0; index < 4; index++)
-      h.emitRpc({ location: PROJECT, data: {} });
-    await vi.waitFor(() => expect(h.modelList).toHaveBeenCalledTimes(3));
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(h.modelList).toHaveBeenCalledTimes(3);
-  });
-
-  it("keeps the last rows and says so when a reload fails", async () => {
-    const h = harness();
-    const root = await h.run();
-    h.modelList.mockRejectedValueOnce(new Error("offline"));
-    h.emitRpc({ location: PROJECT, data: {} });
-    await vi.waitFor(() =>
-      expect(summary(root)).toContain("update failed; showing the last result"),
-    );
-    expect(optionNames(root)).toHaveLength(2);
-  });
-
-  it("reloads once after opening when an update arrived during the first reads", async () => {
-    const h = harness();
-    h.modelList.mockImplementationOnce(async (input) => {
-      // The catalog changes while the first read is in flight.
-      h.setHostModels([hostModel(), hostModel("atlas-new", "Atlas New")]);
-      h.emitRpc({ location: PROJECT, data: { completedAt: "x" } });
-      h.emitModelUpdated({ type: "model.updated", location: PROJECT });
-      return { location: input.location, data: [hostModel()] };
-    });
-    const root = await h.run();
-    await vi.waitFor(() =>
-      expect(optionNames(root).some((name) => name.includes("Atlas New"))).toBe(
-        true,
-      ),
-    );
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(h.modelList).toHaveBeenCalledTimes(2);
-  });
-
-  it("stops listening when the dialog never opens", async () => {
-    const h = harness();
-    h.modelList.mockRejectedValueOnce(new Error("service down"));
-    await h.command().run();
-    expect(h.stopRpc).toHaveBeenCalledOnce();
-    expect(h.stopData).toHaveBeenCalledOnce();
-  });
-
-  it("stops reacting to events after the dialog closes", async () => {
-    const h = harness();
-    await h.run();
-    h.current()?.onClose?.();
-    h.emitRpc({ location: PROJECT, data: {} });
-    await new Promise((resolve) => setTimeout(resolve, 5));
-    expect(h.modelList).toHaveBeenCalledOnce();
-  });
-});
-
-describe("refresh key", () => {
-  it("requests a refresh for the captured location and reloads when accepted", async () => {
-    const h = harness();
-    const root = await h.run();
-    h.press({ name: "r", sequence: "R", shift: true });
-    await vi.waitFor(() => expect(h.modelList).toHaveBeenCalledTimes(2));
-    expect(h.refresh).toHaveBeenCalledWith(
-      {},
-      expect.objectContaining({
-        location: PROJECT,
-        signal: expect.any(AbortSignal),
-      }),
-    );
-    await vi.waitFor(() =>
-      expect(summary(root)).toMatch(/^Model Scout · 1\/1 models/),
-    );
-  });
-
-  it.each([
-    ["throttled", "refresh skipped: the last one was under a minute ago"],
-    ["no-targets", "refresh skipped: no providers to discover"],
-  ])("explains a refresh the server declined as %s", async (reason, notice) => {
-    const h = harness();
-    const root = await h.run();
-    h.refresh.mockResolvedValueOnce({ accepted: false, reason });
-    h.press({ name: "r", sequence: "R", shift: true });
-    await vi.waitFor(() => expect(summary(root)).toContain(notice));
-    expect(h.modelList).toHaveBeenCalledOnce();
-  });
-
-  it("explains a refresh that failed", async () => {
-    const h = harness();
-    const root = await h.run();
-    h.refresh.mockRejectedValueOnce({
-      type: "rpc.unavailable",
-      message: "RPC is unavailable",
-    });
-    h.press({ name: "r", sequence: "R", shift: true });
-    await vi.waitFor(() =>
-      expect(summary(root)).toContain(
-        "refresh failed: server plugin unavailable",
-      ),
-    );
   });
 });

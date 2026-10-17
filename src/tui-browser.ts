@@ -1,1673 +1,2021 @@
+import type { KeyEvent, KeyHandler } from "@opentui/core";
 import type {
-  ColorInput,
-  KeyEvent,
-  KeyHandler,
-  SelectOption,
-} from "@opentui/core";
-import stringWidth from "string-width";
-import type {
-  CapabilityEvidence,
-  CostEvidence,
-  MetadataSource,
+  CatalogPayload,
+  CatalogProviderRecord,
   ScalarEvidence,
 } from "./catalog-evidence";
-import { compactCount, formatBytes } from "./format";
+import { formatContextCell, PRICE_CELL_WIDTH } from "./format";
 import {
-  coreMetadataCoverage,
-  type CoreMetadataCoverage,
-  type CoreMetadataName,
+  capabilityCell,
+  helpLines,
+  modelDetailLines,
+  modelEvidenceLines,
+  modelSummaryLine,
+  needsAttention,
+  paragraph,
+  priceCell,
+  providerDetailLines,
+  providerEvidenceLines,
+  providerStatus,
+  type HelpEntry,
+  type Line,
+} from "./tui-detail";
+import {
+  routeKey,
+  type BrowserAction,
+  type BrowserFocus,
+  type BrowserScreen,
+} from "./tui-keys";
+import {
+  createRowList,
+  padText,
+  rowSpans,
+  sanitizeInline,
+  textWidth,
+  type ListMove,
+  type ListRow,
+  type RowList,
+  type Segment,
+} from "./tui-list";
+import {
+  modelCertainty,
   type ModelRow,
   type ProviderGroup,
 } from "./tui-models";
-import { TuiRenderer, type TuiNode } from "./tui-renderer";
+import type { TuiNode, TuiRenderer } from "./tui-renderer";
+import type { ForegroundRole, RolePalette } from "./tui-theme";
 
-export type BrowserScreen = "list" | "detail";
-export type FocusTarget = "search" | "list" | "detail";
-export type ModelTypeFacet = "all" | "llm" | "vlm" | "embedding" | "unknown";
-export type CapabilityNameFacet =
-  | "any"
-  | "image"
-  | "tools"
-  | "reasoning"
-  | "temperature";
-export type CapabilityStateFacet =
-  | "any"
-  | "supported"
-  | "unsupported"
-  | "unknown";
-export type MetadataFacet = "any" | "complete-core" | "missing-core";
-export type OriginFacet = "all" | "discovered" | "pre-existing" | "unknown";
-export type BrowserFacetKey =
-  | "provider"
-  | "type"
-  | "capability"
-  | "capabilityState"
-  | "metadata"
-  | "origin";
+// ── Navigation state ────────────────────────────────────────────────────
 
-export interface BrowserFacets {
+/** Every provider, or one provider listed without a group header. */
+export type BrowserScope =
+  | { readonly kind: "all" }
+  | { readonly kind: "provider"; readonly providerID: string };
+
+export const ALL_PROVIDERS: BrowserScope = { kind: "all" };
+
+export type TypeFilter = "chat" | "embedding" | "all";
+
+export interface BrowserFilters {
+  /** `all`, or one provider ID. */
   provider: string;
-  type: ModelTypeFacet;
-  capability: CapabilityNameFacet;
-  capabilityState: CapabilityStateFacet;
-  metadata: MetadataFacet;
-  origin: OriginFacet;
+  type: TypeFilter;
+  tools: boolean;
+  images: boolean;
+  reasoning: boolean;
+  priced: boolean;
+  /** Let assumed and inferred capabilities satisfy the needs filters. */
+  uncertain: boolean;
 }
 
-type FocusNode = TuiNode<"input"> | TuiNode<"select"> | TuiNode<"scrollbox">;
+export type BrowserSort = "name" | "context" | "input" | "output";
 
-export interface BrowserState {
+export interface SelectedItem {
+  providerID: string;
+  /** Absent when a provider header is selected. */
+  modelID?: string;
+}
+
+/** What the browser keeps across opens, per location and command. */
+export interface NavState {
   query: string;
-  selected?: string;
-  screen: BrowserScreen;
-  focus: FocusTarget;
-  facets: BrowserFacets;
+  filters: BrowserFilters;
+  sort: BrowserSort;
+  /** Provider IDs whose groups are collapsed. */
+  collapsed: string[];
+  selected?: SelectedItem;
 }
 
-export type BrowserItemKind = "provider" | "model";
-
-export interface BrowserItem {
-  key: string;
-  kind: BrowserItemKind;
-  /** Logical name retained for search, state, and tests. */
-  name: string;
-  /** The complete, width-bounded terminal row shown by the select. */
-  displayRow: string;
-  detail: string;
-}
-
-export interface BrowserProjection {
-  query: string;
-  items: readonly BrowserItem[];
-  emptyMessage: string;
-  filterSummary: string;
-  originFilterAvailable: boolean;
-  summary: BrowserSummary;
-}
-
-export interface BrowserSummary {
-  visibleModels: number;
-  totalModels: number;
-  providerCount: number;
-  missingCoreCount: number;
-}
-
-export type BrowserEvent =
-  | { type: "search"; query: string }
-  | { type: "highlight"; key: string }
-  | { type: "show"; screen: BrowserScreen }
-  | { type: "focus"; target: FocusTarget }
-  | { type: "facets"; facets: BrowserFacets };
-
-export const INITIAL_BROWSER_FACETS: BrowserFacets = {
+export const DEFAULT_FILTERS: BrowserFilters = {
   provider: "all",
-  type: "all",
-  capability: "any",
-  capabilityState: "any",
-  metadata: "any",
-  origin: "all",
+  type: "chat",
+  tools: false,
+  images: false,
+  reasoning: false,
+  priced: false,
+  uncertain: false,
 };
 
-export const INITIAL_BROWSER_STATE: BrowserState = {
+export const DEFAULT_NAV: NavState = {
   query: "",
-  selected: undefined,
-  screen: "list",
-  focus: "search",
-  facets: INITIAL_BROWSER_FACETS,
+  filters: DEFAULT_FILTERS,
+  sort: "name",
+  collapsed: [],
 };
 
-function modelSearchFields(group: ProviderGroup, model: ModelRow): string[] {
-  return [
-    model.id,
-    model.name,
-    group.provider,
-    group.id,
-    model.type,
-    model.family,
-    model.parameterSize,
-    model.quantization,
-    model.enabled ? undefined : "disabled",
-    ...model.flags,
-  ].filter((field): field is string => Boolean(field));
+const SORTS: readonly BrowserSort[] = ["name", "context", "input", "output"];
+const SORT_NAMES: Readonly<Record<BrowserSort, string>> = {
+  name: "name",
+  context: "context",
+  input: "input price",
+  output: "output price",
+};
+
+export function nextSort(sort: BrowserSort): BrowserSort {
+  return SORTS[(SORTS.indexOf(sort) + 1) % SORTS.length] ?? "name";
 }
 
-function normalizedSearchText(fields: readonly string[]): string {
-  return fields.join("\n").toLocaleLowerCase();
+function filtersAtDefault(filters: BrowserFilters): boolean {
+  return (Object.keys(DEFAULT_FILTERS) as (keyof BrowserFilters)[]).every(
+    (key) => filters[key] === DEFAULT_FILTERS[key],
+  );
 }
+
+/** Whether `x` would change anything. */
+export function hasNarrowing(nav: NavState): boolean {
+  return nav.query.trim().length > 0 || !filtersAtDefault(nav.filters);
+}
+
+// ── Data ────────────────────────────────────────────────────────────────
+
+export type BrowserDataStatus = "loading" | "ready" | "failed";
+
+/** Everything the browser shows, as one immutable snapshot. */
+export interface BrowserData {
+  readonly status: BrowserDataStatus;
+  readonly groups: readonly ProviderGroup[];
+  /** The validated RPC catalog, or undefined when scout's server half did not answer. */
+  readonly catalog?: CatalogPayload;
+  /** `Date.now()` when `catalog` arrived, for countdowns against `generatedAt`. */
+  readonly catalogReceivedAt?: number;
+  /** Why the catalog is missing, when it is. */
+  readonly serverNotice?: string;
+  /** `providerID/modelID` of every model OpenCode lists. */
+  readonly hostListed: ReadonlySet<string>;
+  /** The host list error, with status `failed`. */
+  readonly error?: string;
+}
+
+export const LOADING_DATA: BrowserData = {
+  status: "loading",
+  groups: [],
+  hostListed: new Set(),
+};
+
+export function qualifiedID(providerID: string, modelID: string): string {
+  return `${providerID}/${modelID}`;
+}
+
+export function findRecord(
+  data: BrowserData,
+  providerID: string,
+): CatalogProviderRecord | undefined {
+  return data.catalog?.providers.find((record) => record.id === providerID);
+}
+
+/**
+ * Seconds until `record` may refresh, measured on the server clock: the
+ * time from the payload's `generatedAt` to `nextRefreshAt`, less the time
+ * since the payload arrived.
+ */
+export function refreshWaitSeconds(
+  record: CatalogProviderRecord | undefined,
+  data: BrowserData,
+  now: number,
+): number | undefined {
+  if (!record?.nextRefreshAt || !data.catalog) return undefined;
+  const remaining =
+    Date.parse(record.nextRefreshAt) -
+    Date.parse(data.catalog.generatedAt) -
+    (now - (data.catalogReceivedAt ?? now));
+  if (!Number.isFinite(remaining) || remaining <= 0) return undefined;
+  return Math.ceil(remaining / 1000);
+}
+
+// ── Filtering and sorting ───────────────────────────────────────────────
 
 function queryTerms(query: string): string[] {
   return query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
 }
 
-function matchesQuery(searchText: string, terms: readonly string[]): boolean {
-  return terms.every((term) => searchText.includes(term));
-}
-
-function providerKey(group: ProviderGroup): string {
-  return `provider:${encodeURIComponent(group.id)}`;
-}
-
-function modelKey(group: ProviderGroup, model: ModelRow): string {
-  return `${providerKey(group)}:model:${encodeURIComponent(model.id)}`;
-}
-
-const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
-  granularity: "grapheme",
-});
-
-function sanitizeInlineValue(value: string): string {
-  return value.replace(
-    /[\p{Cc}\p{Zl}\p{Zp}\u202A-\u202E\u2066-\u2069]+/gu,
-    " ",
-  );
-}
-
-function sliceByTerminalColumns(value: string, maxColumns: number): string {
-  let columns = 0;
-  let result = "";
-  for (const { segment } of GRAPHEME_SEGMENTER.segment(value)) {
-    const nextColumns = stringWidth(segment);
-    if (columns + nextColumns > maxColumns) break;
-    result += segment;
-    columns += nextColumns;
-  }
-  return result;
-}
-
-function bounded(value: string, max: number): string {
-  const width = Math.max(0, Math.floor(max));
-  if (width === 0) return "";
-  const safeValue = sanitizeInlineValue(value);
-  if (stringWidth(safeValue) <= width) return safeValue;
-  if (width === 1) return "…";
-  const prefix = sliceByTerminalColumns(safeValue, width - 1)
-    .trimEnd()
-    .replace(/[·,:;|/-]+$/u, "")
-    .trimEnd();
-  return `${sliceByTerminalColumns(prefix, width - 1)}…`;
-}
-
-/** Bound a value to a column and pad it to that exact terminal width. */
-function paddedColumn(value: string, width: number): string {
-  const cell = bounded(value, width);
-  return cell + " ".repeat(Math.max(0, width - stringWidth(cell)));
-}
-
-function plural(value: number, noun: string): string {
-  return `${value} ${noun}${value === 1 ? "" : "s"}`;
-}
-
-const EVIDENCE_LABELS: Record<MetadataSource, string> = {
-  "provider-probe": "probe",
-  "pre-existing": "config",
-  "server-list": "server",
-  "models.dev": "models.dev",
-  heuristic: "heuristic",
-  "policy-default": "default",
-  "host-default": "host default",
-  "unmatched-host": "host",
-};
-
-function sourceLabel(
-  evidence: ScalarEvidence<string | number> | CapabilityEvidence | undefined,
-): string | undefined {
-  if (!evidence || evidence.state === "unknown") return undefined;
-  return EVIDENCE_LABELS[evidence.source];
-}
-
-function evidencedValue(
-  value: string,
-  evidence: ScalarEvidence<string | number> | undefined,
-): string {
-  const source = sourceLabel(evidence);
-  const safeValue = sanitizeInlineValue(value);
-  return source ? `${safeValue} [${source}]` : safeValue;
-}
-
-function capabilityValue(evidence: CapabilityEvidence): string {
-  const source = sourceLabel(evidence);
-  const state = sanitizeInlineValue(evidence.state);
-  return source ? `${state} [${source}]` : state;
-}
-
-const MODEL_ROW_INDENT = "  ";
-const MODEL_TYPE_COLUMNS = 9; // "embedding"
-const MODEL_CONTEXT_COLUMNS = 8; // "ctx 131K"
-const MODEL_COLUMN_GAP = "  ";
-const MODEL_NAME_MIN_COLUMNS = 8;
-/**
- * Deliberate readable ceiling for the name column. On wide terminals the
- * spare width is left unused after the last column instead of stretching the
- * name column, which would push type/context/core far from the names.
- */
-const MODEL_NAME_MAX_COLUMNS = 40;
-
-/**
- * Indented columnar model row under its provider header. The provider name is
- * intentionally omitted: the header row above already carries it.
- */
-function modelDisplayRow(
-  model: ModelRow,
-  coverage: CoreMetadataCoverage,
-  width: number,
-): string {
-  const tail = [
-    `core ${coverage.known}/${coverage.total}`,
-    ...(model.enabled ? [] : ["disabled"]),
-  ];
-  const fixedColumns =
-    MODEL_ROW_INDENT.length +
-    MODEL_COLUMN_GAP.length * (2 + tail.length) +
-    MODEL_TYPE_COLUMNS +
-    MODEL_CONTEXT_COLUMNS +
-    stringWidth(tail.join(""));
-  const nameColumns = Math.min(
-    MODEL_NAME_MAX_COLUMNS,
-    Math.max(MODEL_NAME_MIN_COLUMNS, width - fixedColumns),
-  );
-  const row = [
-    MODEL_ROW_INDENT + paddedColumn(model.name, nameColumns),
-    paddedColumn(model.type ?? "unknown", MODEL_TYPE_COLUMNS),
-    paddedColumn(
-      model.context === undefined
-        ? "ctx —"
-        : `ctx ${compactCount(model.context)}`,
-      MODEL_CONTEXT_COLUMNS,
-    ),
-    ...tail,
-  ].join(MODEL_COLUMN_GAP);
-  return bounded(row, width).trimEnd();
-}
-
-function modelDetail(group: ProviderGroup, model: ModelRow): string {
-  const coverage = coreMetadataCoverage(model);
-  const summary = [
-    model.type ? sanitizeInlineValue(model.type) : "unknown type",
-    model.context === undefined
-      ? undefined
-      : `ctx ${compactCount(model.context)}`,
-    model.output === undefined
-      ? undefined
-      : `out ${compactCount(model.output)}`,
-    `core ${coverage.known}/${coverage.total}`,
-    model.origin ? sanitizeInlineValue(model.origin) : undefined,
-    model.enabled ? undefined : "disabled",
-  ].filter((part): part is string => Boolean(part));
-  const lines = [
-    sanitizeInlineValue(model.name),
-    `Provider: ${sanitizeInlineValue(group.provider)} · Model ID: ${evidencedValue(model.id, model.provenance?.identity)}`,
-    summary.join(" · "),
-    "",
-    "Capabilities",
-  ];
-
-  const unknownState: CapabilityEvidence = { state: "unknown" };
-  if (model.type === "embedding") {
-    lines.push("Chat capabilities: not applicable");
-  } else if (model.capabilities) {
-    lines.push(
-      `Tools: ${capabilityValue(model.capabilities.toolCall)} · Reasoning: ${capabilityValue(model.capabilities.reasoning)}`,
-      `Temperature: ${capabilityValue(model.capabilities.temperature)}`,
-    );
-  } else if (model.flags.length > 0) {
-    lines.push(model.flags.map(sanitizeInlineValue).join(" · "));
-  } else {
-    lines.push("Tools: unknown · Reasoning: unknown · Temperature: unknown");
-  }
-  const input = model.inputModalities;
-  lines.push(
-    `Image input: ${capabilityValue(input?.image ?? unknownState)} · PDF input: ${capabilityValue(input?.pdf ?? unknownState)}`,
-    `Audio input: ${capabilityValue(input?.audio ?? unknownState)} · Video input: ${capabilityValue(input?.video ?? unknownState)}`,
-  );
-
-  lines.push("", "Cost (USD per 1M tokens)", ...costLines(model.cost));
-
-  lines.push("", "Metadata");
-  if (!model.enabled) lines.push("Enabled: no (hidden from the model picker)");
-  if (model.type)
-    lines.push(`Type: ${evidencedValue(model.type, model.provenance?.type)}`);
-  if (model.context !== undefined)
-    lines.push(
-      `Context: ${evidencedValue(compactCount(model.context), model.provenance?.context)}`,
-    );
-  if (model.output !== undefined)
-    lines.push(
-      `Max output: ${evidencedValue(compactCount(model.output), model.provenance?.output)}`,
-    );
-  if (model.sizeBytes !== undefined)
-    lines.push(
-      `Size: ${evidencedValue(formatBytes(model.sizeBytes), model.provenance?.sizeBytes)}`,
-    );
-  const descriptors = [
-    model.family
-      ? `Family ${evidencedValue(model.family, model.provenance?.family)}`
-      : undefined,
-    model.parameterSize
-      ? `Parameters ${evidencedValue(model.parameterSize, model.provenance?.parameterSize)}`
-      : undefined,
-    model.quantization
-      ? `Quantization ${evidencedValue(model.quantization, model.provenance?.quantization)}`
-      : undefined,
-  ].filter((part): part is string => Boolean(part));
-  if (descriptors.length > 0) lines.push(descriptors.join(" · "));
-  if (model.probeIdentity)
-    lines.push(
-      `Probe identity: ${evidencedValue(model.probeIdentity, model.provenance?.probeIdentity)}`,
-    );
-  lines.push(
-    `Missing core: ${coverage.missing.length > 0 ? coverage.missing.join(", ") : "none"}`,
-  );
-  if (group.endpoint)
-    lines.push(`Endpoint: ${sanitizeInlineValue(group.endpoint)}`);
-
-  const warnings = new Set([
-    ...(group.warnings ?? []),
-    ...(model.warnings ?? []),
-  ]);
-  if (warnings.size > 0) {
-    lines.push("", "Warnings");
-    for (const warning of warnings)
-      lines.push(`• ${sanitizeInlineValue(warning)}`);
-  }
-  lines.push(
-    "",
-    "Sources: probe · config · server · models.dev · heuristic · default · host default · host",
-  );
-  return lines.join("\n");
-}
-
-function priceValue(evidence: ScalarEvidence<number>): string {
-  if (evidence.state === "unknown") return "unknown";
-  return evidencedValue(
-    `$${Number(evidence.value.toFixed(6)).toString()}`,
-    evidence,
-  );
-}
-
-function costLines(cost: CostEvidence | undefined): string[] {
-  if (
-    !cost ||
-    Object.values(cost).every(
-      (price: ScalarEvidence<number>) => price.state === "unknown",
-    )
-  )
-    return ["Prices: unknown"];
+function searchText(group: ProviderGroup, model: ModelRow): string {
   return [
-    `Input: ${priceValue(cost.input)} · Output: ${priceValue(cost.output)}`,
-    `Cache read: ${priceValue(cost.cacheRead)} · Cache write: ${priceValue(cost.cacheWrite)}`,
-  ];
+    model.name,
+    model.id,
+    group.provider,
+    group.id,
+    model.family,
+    model.quantization,
+  ]
+    .filter((field): field is string => Boolean(field))
+    .join("\n")
+    .toLocaleLowerCase();
 }
 
-function capabilityEvidence(
-  model: ModelRow,
-  facet: CapabilityNameFacet,
-): CapabilityEvidence[] {
-  if (model.type === "embedding") return [];
-  const unknownState: CapabilityEvidence = { state: "unknown" };
-  const image = model.inputModalities?.image ?? unknownState;
-  const toolCall = model.capabilities?.toolCall ?? unknownState;
-  const reasoning = model.capabilities?.reasoning ?? unknownState;
-  const temperature = model.capabilities?.temperature ?? unknownState;
-  switch (facet) {
-    case "image":
-      return [image];
-    case "tools":
-      return [toolCall];
-    case "reasoning":
-      return [reasoning];
-    case "temperature":
-      return [temperature];
-    case "any":
-      return [image, toolCall, reasoning, temperature];
-  }
-}
-
-function modelMatchesFacets(
+/** Case-insensitive AND of whitespace-separated terms over the model's and provider's names and IDs, family, and quantization. */
+export function matchesQuery(
   group: ProviderGroup,
   model: ModelRow,
-  facets: BrowserFacets,
-  coverage: CoreMetadataCoverage = coreMetadataCoverage(model),
+  query: string,
 ): boolean {
-  if (facets.provider !== "all" && facets.provider !== group.id) return false;
-  const type = model.type ?? "unknown";
-  if (facets.type !== "all" && facets.type !== type) return false;
-  if (facets.capabilityState !== "any") {
-    const evidence = capabilityEvidence(model, facets.capability);
-    if (!evidence.some((item) => item.state === facets.capabilityState))
-      return false;
-  }
-  if (facets.metadata === "complete-core" && !coverage.complete) return false;
-  if (facets.metadata === "missing-core" && coverage.complete) return false;
-  const origin = model.origin ?? "unknown";
-  return facets.origin === "all" || facets.origin === origin;
+  const terms = queryTerms(query);
+  if (terms.length === 0) return true;
+  const text = searchText(group, model);
+  return terms.every((term) => text.includes(term));
 }
 
-type EvidenceState = CapabilityEvidence["state"];
-
-export interface ProviderSummary {
-  modelCount: number;
-  origins: Record<"discovered" | "pre-existing" | "unknown", number>;
-  completeCore: number;
-  missingCore: number;
-  commonMissing: Array<{ field: CoreMetadataName; count: number }>;
-  capabilities: Record<
-    CapabilityNameFacet,
-    Record<EvidenceState, number> & { applicable: number }
-  >;
+function satisfies(
+  model: ModelRow,
+  name: "tools" | "image" | "reasoning",
+  uncertain: boolean,
+): boolean {
+  const certainty = modelCertainty(model).capabilities[name];
+  return (
+    certainty === "confirmed" ||
+    (uncertain && (certainty === "assumed" || certainty === "inferred"))
+  );
 }
 
-const CAPABILITY_NAMES = [
-  "image",
-  "tools",
-  "reasoning",
-  "temperature",
-] as const;
+function knownPrice(
+  evidence: ScalarEvidence<number> | undefined,
+): number | undefined {
+  return evidence?.state === "known" ? evidence.value : undefined;
+}
 
-/** Pure provider aggregation used by header rows and diagnostics views. */
-export function summarizeProvider(group: ProviderGroup): ProviderSummary {
-  const origins = { discovered: 0, "pre-existing": 0, unknown: 0 };
-  const missing = new Map<CoreMetadataName, number>();
-  const capabilities = Object.fromEntries(
-    ["any", ...CAPABILITY_NAMES].map((name) => [
-      name,
-      { applicable: 0, supported: 0, unsupported: 0, unknown: 0 },
-    ]),
-  ) as ProviderSummary["capabilities"];
-  let completeCore = 0;
-  for (const model of group.models) {
-    origins[model.origin ?? "unknown"] += 1;
-    const coverage = coreMetadataCoverage(model);
-    if (coverage.complete) completeCore += 1;
-    for (const field of coverage.missing)
-      missing.set(field, (missing.get(field) ?? 0) + 1);
-    if (model.type === "embedding") continue;
-    for (const name of CAPABILITY_NAMES) {
-      const evidence = capabilityEvidence(model, name)[0] ?? {
-        state: "unknown" as const,
-      };
-      capabilities[name].applicable += 1;
-      capabilities[name][evidence.state] += 1;
-      capabilities.any.applicable += 1;
-      capabilities.any[evidence.state] += 1;
+function priced(model: ModelRow): boolean {
+  return (
+    knownPrice(model.cost?.input) !== undefined ||
+    knownPrice(model.cost?.output) !== undefined
+  );
+}
+
+/** Every filter except the type filter. */
+function matchesNeeds(model: ModelRow, filters: BrowserFilters): boolean {
+  if (filters.tools && !satisfies(model, "tools", filters.uncertain))
+    return false;
+  if (filters.images && !satisfies(model, "image", filters.uncertain))
+    return false;
+  if (filters.reasoning && !satisfies(model, "reasoning", filters.uncertain))
+    return false;
+  return !filters.priced || priced(model);
+}
+
+function matchesType(model: ModelRow, type: TypeFilter): boolean {
+  const embedding = model.type === "embedding";
+  return type === "all" || (type === "embedding" ? embedding : !embedding);
+}
+
+function sortValue(model: ModelRow, sort: BrowserSort): number | undefined {
+  switch (sort) {
+    case "name":
+      return undefined;
+    case "context": {
+      const certainty = modelCertainty(model).context;
+      return certainty === "confirmed" || certainty === "inferred"
+        ? model.context
+        : undefined;
     }
+    case "input":
+      return knownPrice(model.cost?.input);
+    case "output":
+      return knownPrice(model.cost?.output);
   }
-  return {
-    modelCount: group.models.length,
-    origins,
-    completeCore,
-    missingCore: group.models.length - completeCore,
-    commonMissing: [...missing]
-      .map(([field, count]) => ({ field, count }))
-      .sort((a, b) => b.count - a.count || a.field.localeCompare(b.field)),
-    capabilities,
-  };
+}
+
+/** Order models by `sort`; unknown values sort last, ties by name then ID. */
+export function sortModels(
+  models: readonly ModelRow[],
+  sort: BrowserSort,
+): ModelRow[] {
+  const byName = (a: ModelRow, b: ModelRow): number =>
+    a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
+  return [...models].sort((a, b) => {
+    if (sort === "name") return byName(a, b);
+    const left = sortValue(a, sort);
+    const right = sortValue(b, sort);
+    if (left === undefined && right === undefined) return byName(a, b);
+    if (left === undefined) return 1;
+    if (right === undefined) return -1;
+    const order = sort === "context" ? right - left : left - right;
+    return order || byName(a, b);
+  });
+}
+
+// ── Projection ──────────────────────────────────────────────────────────
+
+export type BrowserRowKind = "provider" | "model" | "note";
+
+export interface BrowserRow extends ListRow {
+  readonly kind: BrowserRowKind;
+  readonly group: ProviderGroup;
+  readonly model?: ModelRow;
+}
+
+export interface BrowserProjection {
+  readonly rows: readonly BrowserRow[];
+  readonly providerCount: number;
+  readonly totalModels: number;
+  readonly visibleModels: number;
+  readonly attention: number;
+  readonly discovering: number;
+  readonly embeddingsHidden: number;
+}
+
+export interface ProjectionOptions {
+  readonly scope: BrowserScope;
+  /** Columns of each list row. */
+  readonly width: number;
+  readonly current?: { readonly providerID: string; readonly modelID: string };
+}
+
+export function providerKey(providerID: string): string {
+  return `p\u0000${providerID}`;
+}
+
+export function modelKey(providerID: string, modelID: string): string {
+  return `m\u0000${providerID}\u0000${modelID}`;
+}
+
+export function selectionKey(
+  selected: SelectedItem | undefined,
+): string | undefined {
+  if (!selected) return undefined;
+  return selected.modelID === undefined
+    ? providerKey(selected.providerID)
+    : modelKey(selected.providerID, selected.modelID);
+}
+
+const GUTTER = 3;
+const CONTEXT_COLUMNS = 6;
+const CAPABILITY_COLUMNS = 5;
+const GAP = "  ";
+const FIXED_MODEL_COLUMNS =
+  GUTTER +
+  CONTEXT_COLUMNS +
+  GAP.length +
+  CAPABILITY_COLUMNS +
+  GAP.length +
+  PRICE_CELL_WIDTH;
+
+function segmentsWidth(segments: readonly Segment[]): number {
+  return segments.reduce(
+    (sum, segment) => sum + textWidth(sanitizeInline(segment.text)),
+    0,
+  );
 }
 
 /**
- * Permanent textual header affordance: unselected provider rows must still
- * read as headers next to indented model rows, independent of the Select's
- * own selected-row gutter.
+ * A model row: gutter (column 1 for the selection bar, column 2 for the
+ * current-model `●`), name, context, `T I R`, and the price cell.
  */
-const PROVIDER_HEADER_PREFIX = "▸ ";
-
-interface ProviderHeaderCounts {
-  visibleModels: number;
-  totalModels: number;
-  /** Complete-core count among the surviving (visible) child models. */
-  completeVisible: number;
-}
-
-/**
- * Header row built from the surviving child models of the active projection.
- * When search or facets hide children, the count cell shows `visible/total`
- * and core coverage describes the visible children only; full-catalog
- * diagnostics stay on the provider detail screen.
- */
-function providerDisplayRow(
-  group: ProviderGroup,
-  counts: ProviderHeaderCounts,
+export function modelRowSegments(
+  model: ModelRow,
   width: number,
-): string {
-  const countCell =
-    counts.visibleModels === counts.totalModels
-      ? plural(counts.totalModels, "model")
-      : `${counts.visibleModels}/${counts.totalModels} models`;
-  return bounded(
-    PROVIDER_HEADER_PREFIX +
-      [
-        group.provider,
-        countCell,
-        `core ${counts.completeVisible}/${counts.visibleModels}`,
-        `discovery ${discoveryStatus(group)}`,
-      ].join(" · "),
-    width,
-  );
-}
-
-/** Latest attempt outcome: its failure kind, else the model list result. */
-function discoveryStatus(group: ProviderGroup): string {
-  if (group.failure) return `failed (${group.failure.kind})`;
-  return group.modelListAttempt ?? "unknown";
-}
-
-function providerDetail(
-  group: ProviderGroup,
-  summary: ProviderSummary = summarizeProvider(group),
-): string {
-  const typeCounts = new Map<string, number>();
-  const families = new Set<string>();
-  for (const model of group.models) {
-    const type = model.type ? sanitizeInlineValue(model.type) : "unknown";
-    typeCounts.set(type, (typeCounts.get(type) ?? 0) + 1);
-    if (model.family) families.add(sanitizeInlineValue(model.family));
-  }
-
-  const lines = [
-    sanitizeInlineValue(group.provider),
-    `Provider ID: ${sanitizeInlineValue(group.id)}`,
-    `${plural(summary.modelCount, "model")} · core ${summary.completeCore}/${summary.modelCount} · discovery ${sanitizeInlineValue(discoveryStatus(group))}`,
-    "",
-    "Discovery",
-    `Model list: ${group.modelListAttempt ? sanitizeInlineValue(group.modelListAttempt) : "unknown"} · Probe: ${group.probeAttempt ? sanitizeInlineValue(group.probeAttempt) : "unknown"}`,
+  current: boolean,
+): Segment[] {
+  const nameColumns = Math.max(4, width - FIXED_MODEL_COLUMNS);
+  const certainty = modelCertainty(model);
+  const assumedContext = certainty.context === "assumed";
+  const context =
+    model.context === undefined || certainty.context === "not-reported"
+      ? ""
+      : formatContextCell(model.context, assumedContext);
+  const embedding = model.type === "embedding";
+  const caps = certainty.capabilities;
+  return [
+    { text: " ", role: "base" },
+    { text: current ? "●" : " ", role: "current" },
+    { text: " ", role: "base" },
+    {
+      text: padText(model.name, nameColumns),
+      role: embedding || !model.enabled ? "muted" : "base",
+    },
+    {
+      text: padText(context, CONTEXT_COLUMNS, "right"),
+      role: assumedContext ? "faint" : "muted",
+    },
+    { text: GAP, role: "base" },
+    capabilityCell(embedding ? "not-reported" : caps.tools, "t"),
+    { text: " ", role: "base" },
+    capabilityCell(embedding ? "not-reported" : caps.image, "i"),
+    { text: " ", role: "base" },
+    capabilityCell(embedding ? "not-reported" : caps.reasoning, "r"),
+    { text: GAP, role: "base" },
+    {
+      text: padText(priceCell(model), PRICE_CELL_WIDTH, "right"),
+      role: "muted",
+    },
   ];
-  if (group.hasEvidence)
-    lines.push(
-      `Last good inventory: ${group.lastGoodAt ? sanitizeInlineValue(group.lastGoodAt) : "none yet"}`,
-    );
-  if (group.failure)
-    lines.push(
-      `Latest attempt failed: ${sanitizeInlineValue(group.failure.kind)} at ${sanitizeInlineValue(group.failure.at)}`,
-    );
-  if (group.configuredProbe || group.resolvedProbe)
-    lines.push(
-      `Probe selection: ${group.configuredProbe ? sanitizeInlineValue(group.configuredProbe) : "auto"} → ${group.resolvedProbe ? sanitizeInlineValue(group.resolvedProbe) : "unresolved"}`,
-    );
-  if (group.endpoint)
-    lines.push(`Endpoint: ${sanitizeInlineValue(group.endpoint)}`);
-  lines.push(
-    `Origin: discovered ${summary.origins.discovered} · configured ${summary.origins["pre-existing"]} · unknown ${summary.origins.unknown}`,
-    "",
-    "Coverage",
+}
+
+/** A provider header: `▾`/`▸`, the name, and count and status at the right edge. */
+export function providerRowSegments(
+  group: ProviderGroup,
+  record: CatalogProviderRecord | undefined,
+  counts: { visible: number; total: number },
+  collapsed: boolean,
+  width: number,
+): Segment[] {
+  const count =
+    counts.visible === counts.total
+      ? `${counts.total} ${counts.total === 1 ? "model" : "models"}`
+      : `${counts.visible}/${counts.total} models`;
+  const status = providerStatus(record);
+  const right: Segment[] = [
+    { text: count, role: "muted" },
+    ...(status
+      ? [
+          { text: GAP, role: "base" as const },
+          { text: status.text, role: status.role },
+        ]
+      : []),
+  ];
+  const nameColumns = Math.max(4, width - GUTTER - 1 - segmentsWidth(right));
+  return [
+    { text: " ", role: "base" },
+    { text: collapsed ? "▸" : "▾", role: "muted" },
+    { text: " ", role: "base" },
+    { text: padText(group.provider, nameColumns), role: "group" },
+    { text: " ", role: "base" },
+    ...right,
+  ];
+}
+
+function noteText(
+  group: ProviderGroup,
+  record: CatalogProviderRecord | undefined,
+  hidden: number,
+): string {
+  if (hidden > 0)
+    return `${hidden} embedding ${hidden === 1 ? "model" : "models"} hidden; f shows them`;
+  if (record?.discovering) return "Checking the model list…";
+  if (record?.failure && !record.lastGoodAt)
+    return "No models yet; the model list failed";
+  if (record?.lastGoodAt) return "No models returned; r refreshes";
+  return group.hasEvidence ? "No models yet" : "No models listed";
+}
+
+/** Rows for the list screen: provider headers, their models, and notes for empty providers. */
+export function projectBrowser(
+  data: BrowserData,
+  nav: NavState,
+  options: ProjectionOptions,
+): BrowserProjection {
+  const { scope, width, current } = options;
+  const single = scope.kind === "provider";
+  const groups = data.groups.filter((group) =>
+    single
+      ? group.id === scope.providerID
+      : nav.filters.provider === "all" || group.id === nav.filters.provider,
   );
-  if (typeCounts.size > 0)
-    lines.push(
-      `Types: ${[...typeCounts].map(([type, count]) => `${type} ${count}`).join(" · ")}`,
-    );
-  if (summary.commonMissing.length > 0)
-    lines.push(
-      `Missing core: ${summary.commonMissing
-        .slice(0, 4)
-        .map(({ field, count }) => `${field} ${count}`)
-        .join(" · ")}`,
-    );
-  else lines.push("Missing core: none");
-  lines.push("", "Capabilities");
-  for (const name of CAPABILITY_NAMES) {
-    const counts = summary.capabilities[name];
-    lines.push(
-      `${name[0]?.toUpperCase()}${name.slice(1)}: ${counts.supported} supported · ${counts.unsupported} unsupported · ${counts.unknown} unknown`,
-    );
-  }
-  if (families.size > 0)
-    lines.push("", `Families: ${[...families].join(", ")}`);
-  const warnings = new Set(group.warnings ?? []);
-  if (warnings.size > 0) {
-    lines.push("", "Warnings");
-    for (const warning of warnings)
-      lines.push(`• ${sanitizeInlineValue(warning)}`);
-  }
-  lines.push(
-    "",
-    `Evidence: ${group.hasEvidence ? "server discovery catalog plus host state" : "host state only"}`,
-  );
-  return lines.join("\n");
-}
-
-const TYPE_CYCLE: readonly ModelTypeFacet[] = [
-  "all",
-  "llm",
-  "vlm",
-  "embedding",
-  "unknown",
-];
-const CAPABILITY_CYCLE: readonly CapabilityNameFacet[] = [
-  "any",
-  "image",
-  "tools",
-  "reasoning",
-  "temperature",
-];
-const CAPABILITY_STATE_CYCLE: readonly CapabilityStateFacet[] = [
-  "any",
-  "supported",
-  "unsupported",
-  "unknown",
-];
-const METADATA_CYCLE: readonly MetadataFacet[] = [
-  "any",
-  "complete-core",
-  "missing-core",
-];
-const ORIGIN_CYCLE: readonly OriginFacet[] = [
-  "all",
-  "discovered",
-  "pre-existing",
-  "unknown",
-];
-
-interface IndexedModel {
-  group: ProviderGroup;
-  model: ModelRow;
-  coverage: CoreMetadataCoverage;
-  searchText: string;
-  item: BrowserItem;
-}
-
-interface IndexedProvider {
-  group: ProviderGroup;
-  summary: ProviderSummary;
-  /** Provider-own fields only; child-model matches surface through children. */
-  selfSearchText: string;
-  /** Projection-time header row reflecting the surviving child models. */
-  headerItem: (counts: ProviderHeaderCounts) => BrowserItem;
-  models: readonly IndexedModel[];
-}
-
-interface BrowserIndex {
-  providers: readonly IndexedProvider[];
-  totalModels: number;
-  originFilterAvailable: boolean;
-  textWidth: number;
-}
-
-/**
- * Columns the OpenTUI Select consumes around each option row: the selection
- * gutter, internal padding, and the scroll indicator. Option rows budgeted to
- * the full textWidth lose their trailing column (the `core k/n` cell) behind
- * that chrome, so display rows must reserve these columns.
- */
-const SELECT_CHROME_COLUMNS = 4;
-
-function buildBrowserIndex(
-  groups: readonly ProviderGroup[],
-  textWidth = 76,
-  rowWidth = Math.max(1, textWidth - SELECT_CHROME_COLUMNS),
-): BrowserIndex {
-  const providers: IndexedProvider[] = [];
+  const narrowing =
+    queryTerms(nav.query).length > 0 ||
+    !filtersAtDefault({ ...nav.filters, provider: "all" });
+  const rows: BrowserRow[] = [];
   let totalModels = 0;
+  let visibleModels = 0;
+  let attention = 0;
+  let discovering = 0;
+  let embeddingsHidden = 0;
+
   for (const group of groups) {
-    const models: IndexedModel[] = [];
-    for (const model of group.models) {
-      const coverage = coreMetadataCoverage(model);
-      const item: BrowserItem = {
-        key: modelKey(group, model),
+    const record = findRecord(data, group.id);
+    if (needsAttention(record)) attention += 1;
+    if (record?.discovering) discovering += 1;
+    // Counts leave out models the type filter hides; the filter row counts hidden embeddings.
+    const typed = group.models.filter((model) =>
+      matchesType(model, nav.filters.type),
+    ).length;
+    totalModels += typed;
+    const searched = group.models.filter(
+      (model) =>
+        matchesQuery(group, model, nav.query) &&
+        matchesNeeds(model, nav.filters),
+    );
+    const matching = searched.filter((model) =>
+      matchesType(model, nav.filters.type),
+    );
+    const hidden =
+      nav.filters.type === "chat" ? searched.length - matching.length : 0;
+    embeddingsHidden += hidden;
+    visibleModels += matching.length;
+    const explicit = !single && nav.filters.provider === group.id;
+    if (matching.length === 0 && narrowing && !explicit) continue;
+
+    const collapsed =
+      !single &&
+      queryTerms(nav.query).length === 0 &&
+      nav.collapsed.includes(group.id);
+    if (!single)
+      rows.push({
+        key: providerKey(group.id),
+        kind: "provider",
+        group,
+        segments: providerRowSegments(
+          group,
+          record,
+          { visible: matching.length, total: typed },
+          collapsed,
+          width,
+        ),
+      });
+    if (collapsed) continue;
+    for (const model of sortModels(matching, nav.sort)) {
+      const isCurrent =
+        current?.providerID === group.id && current.modelID === model.id;
+      rows.push({
+        key: modelKey(group.id, model.id),
         kind: "model",
-        name: model.name,
-        displayRow: modelDisplayRow(model, coverage, rowWidth),
-        get detail() {
-          return modelDetail(group, model);
-        },
-      };
-      models.push({
         group,
         model,
-        coverage,
-        searchText: normalizedSearchText(modelSearchFields(group, model)),
-        item,
+        segments: modelRowSegments(model, width, isCurrent),
       });
-      totalModels += 1;
     }
-    const summary = summarizeProvider(group);
-    let detail: string | undefined;
-    const headerItem = (counts: ProviderHeaderCounts): BrowserItem => ({
-      key: providerKey(group),
-      kind: "provider",
-      name: group.provider,
-      displayRow: providerDisplayRow(group, counts, rowWidth),
-      get detail() {
-        detail ??= providerDetail(group, summary);
-        return detail;
-      },
-    });
-    providers.push({
-      group,
-      summary,
-      selfSearchText: normalizedSearchText(
-        [group.provider, group.id, group.endpoint].filter(
-          (field): field is string => Boolean(field),
-        ),
-      ),
-      headerItem,
-      models,
-    });
+    if (matching.length === 0 && !single)
+      rows.push({
+        key: `n\u0000${group.id}`,
+        kind: "note",
+        group,
+        selectable: false,
+        segments: [
+          { text: `   ${noteText(group, record, hidden)}`, role: "faint" },
+        ],
+      });
   }
   return {
-    providers,
+    rows,
+    providerCount: groups.length,
     totalModels,
-    originFilterAvailable: groups.some((group) => group.hasEvidence),
-    textWidth,
+    visibleModels,
+    attention,
+    discovering,
+    embeddingsHidden,
   };
 }
 
-function nextValue<T extends string>(values: readonly T[], current: T): T {
-  const index = values.indexOf(current);
-  return values[(index + 1) % values.length] ?? values[0];
+/**
+ * The row the first open selects: the prompt's current model when listed,
+ * else the first chat model, else the first selectable row.
+ */
+export function initialSelection(
+  rows: readonly BrowserRow[],
+  current:
+    | { readonly providerID: string; readonly modelID: string }
+    | undefined,
+): BrowserRow | undefined {
+  if (current) {
+    const key = modelKey(current.providerID, current.modelID);
+    const found = rows.find((row) => row.key === key);
+    if (found) return found;
+  }
+  return (
+    rows.find(
+      (row) => row.kind === "model" && row.model?.type !== "embedding",
+    ) ?? rows.find((row) => row.selectable !== false)
+  );
 }
 
-/** Cycle one facet without mutating state. */
-export function cycleBrowserFacet(
-  facets: BrowserFacets,
-  key: BrowserFacetKey,
-  groups: readonly ProviderGroup[],
-  originAvailable: boolean,
-): BrowserFacets {
-  switch (key) {
-    case "provider": {
-      const providers = ["all", ...groups.map((group) => group.id)];
-      return { ...facets, provider: nextValue(providers, facets.provider) };
-    }
+// ── Filter screen ───────────────────────────────────────────────────────
+
+export type FilterField =
+  | "provider"
+  | "type"
+  | "tools"
+  | "images"
+  | "reasoning"
+  | "priced"
+  | "uncertain";
+
+const FILTER_LABELS: Readonly<Record<FilterField, string>> = {
+  provider: "Provider",
+  type: "Type",
+  tools: "Needs tools",
+  images: "Needs images",
+  reasoning: "Needs reasoning",
+  priced: "Priced only",
+  uncertain: "Include assumed or inferred",
+};
+
+const TYPE_CYCLE: readonly TypeFilter[] = ["chat", "embedding", "all"];
+const TYPE_WORDS: Readonly<Record<TypeFilter, string>> = {
+  chat: "chat",
+  embedding: "embedding",
+  all: "all types",
+};
+
+export function filterFields(scope: BrowserScope): FilterField[] {
+  const fields: FilterField[] = [
+    "type",
+    "tools",
+    "images",
+    "reasoning",
+    "priced",
+    "uncertain",
+  ];
+  return scope.kind === "all" ? ["provider", ...fields] : fields;
+}
+
+/** Step one filter field forward or back; booleans toggle. */
+export function cycleFilter(
+  filters: BrowserFilters,
+  field: FilterField,
+  direction: 1 | -1,
+  providerIDs: readonly string[],
+): BrowserFilters {
+  const step = <T>(values: readonly T[], current: T): T => {
+    const index = values.indexOf(current);
+    return (
+      values[(index + direction + values.length) % values.length] ??
+      values[0] ??
+      current
+    );
+  };
+  switch (field) {
+    case "provider":
+      return {
+        ...filters,
+        provider: step(["all", ...providerIDs], filters.provider),
+      };
     case "type":
-      return { ...facets, type: nextValue(TYPE_CYCLE, facets.type) };
-    case "capability":
-      return {
-        ...facets,
-        capability: nextValue(CAPABILITY_CYCLE, facets.capability),
-      };
-    case "capabilityState":
-      return {
-        ...facets,
-        capabilityState: nextValue(
-          CAPABILITY_STATE_CYCLE,
-          facets.capabilityState,
-        ),
-      };
-    case "metadata":
-      return {
-        ...facets,
-        metadata: nextValue(METADATA_CYCLE, facets.metadata),
-      };
-    case "origin":
-      return originAvailable
-        ? { ...facets, origin: nextValue(ORIGIN_CYCLE, facets.origin) }
-        : { ...facets, origin: "all" };
+      return { ...filters, type: step(TYPE_CYCLE, filters.type) };
+    default:
+      return { ...filters, [field]: !filters[field] };
   }
 }
 
-function humanFacetParts(
-  facets: BrowserFacets,
-  originAvailable: boolean,
-): string[] {
-  const parts: string[] = [];
-  if (facets.provider !== "all") parts.push(`provider ${facets.provider}`);
-  if (facets.type !== "all") parts.push(`type ${facets.type}`);
-  if (facets.capability !== "any")
-    parts.push(`capability ${facets.capability}`);
-  if (facets.capabilityState !== "any")
-    parts.push(`capability is ${facets.capabilityState}`);
-  if (facets.metadata === "complete-core") parts.push("core metadata complete");
-  if (facets.metadata === "missing-core") parts.push("core metadata missing");
-  if (originAvailable && facets.origin !== "all")
-    parts.push(`origin ${facets.origin}`);
-  return parts;
-}
-
-/** One bounded, non-focusable row describing the active model facets. */
-export function browserFilterSummary(
-  facets: BrowserFacets,
-  originAvailable: boolean,
-  maxWidth = 76,
-): string {
-  const parts = humanFacetParts(facets, originAvailable);
-  return bounded(
-    parts.length === 0 ? "Filters: none" : `Filters: ${parts.join(" · ")}`,
-    maxWidth,
-  );
-}
-
-function facetsAtDefault(facets: BrowserFacets): boolean {
-  return JSON.stringify(facets) === JSON.stringify(INITIAL_BROWSER_FACETS);
-}
-
-/** Model-level facets only; the provider facet is checked separately. */
-function modelFacetsAtDefault(facets: BrowserFacets): boolean {
-  return facetsAtDefault({ ...facets, provider: "all" });
-}
-
-/**
- * Project reconciled groups into one unified, searchable grouped list: a
- * selectable header row per visible provider followed by its matching models.
- */
-export function projectBrowser(
+function filterValue(
+  filters: BrowserFilters,
+  field: FilterField,
   groups: readonly ProviderGroup[],
-  query: string,
-  facets: BrowserFacets = INITIAL_BROWSER_FACETS,
-  index: BrowserIndex = buildBrowserIndex(groups),
-): BrowserProjection {
-  const items: BrowserItem[] = [];
-  const originFilterAvailable = index.originFilterAvailable;
-  const effectiveFacets = originFilterAvailable
-    ? facets
-    : { ...facets, origin: "all" as const };
-  const defaultFacets = facetsAtDefault(effectiveFacets);
-  const terms = queryTerms(query);
-  let visibleModels = 0;
-  let missingCoreCount = 0;
-  let providerCount = 0;
-
-  const defaultModelFacets = modelFacetsAtDefault(effectiveFacets);
-  for (const provider of index.providers) {
-    if (
-      effectiveFacets.provider !== "all" &&
-      effectiveFacets.provider !== provider.group.id
-    )
-      continue;
-    // A provider-own search hit cascades to its children: the query selects
-    // the provider, and active model facets keep narrowing its models even
-    // when each model's own text does not contain the provider query.
-    const selfMatch =
-      terms.length > 0 && matchesQuery(provider.selfSearchText, terms);
-    const children = provider.models.filter(
-      (entry) =>
-        (selfMatch || matchesQuery(entry.searchText, terms)) &&
-        modelMatchesFacets(
-          entry.group,
-          entry.model,
-          effectiveFacets,
-          entry.coverage,
-        ),
-    );
-    // A childless header stays visible only when it is itself the relevant
-    // result — a direct search hit, or reachable without any search — and no
-    // active model facet excludes every child. The provider facet alone never
-    // hides a directly selected zero-model/error provider.
-    const selfVisible = terms.length > 0 ? selfMatch : true;
-    if (children.length === 0 && !(selfVisible && defaultModelFacets)) continue;
-    providerCount += 1;
-    let completeVisible = 0;
-    for (const child of children)
-      if (child.coverage.complete) completeVisible += 1;
-    items.push(
-      provider.headerItem({
-        visibleModels: children.length,
-        totalModels: provider.models.length,
-        completeVisible,
-      }),
-    );
-    for (const child of children) {
-      visibleModels += 1;
-      if (!child.coverage.complete) missingCoreCount += 1;
-      items.push(child.item);
-    }
-  }
-
-  const filterSummary = browserFilterSummary(
-    effectiveFacets,
-    originFilterAvailable,
-    index.textWidth,
-  );
-  const filtered = terms.length > 0 || !defaultFacets;
-  return {
-    query,
-    items,
-    emptyMessage:
-      groups.length === 0
-        ? "No models available yet. To use Actualyze, add its API key with /connect."
-        : filtered
-          ? `No matches. ${filterSummary}`
-          : "No models available.",
-    filterSummary,
-    originFilterAvailable,
-    summary: {
-      visibleModels,
-      totalModels: index.totalModels,
-      providerCount,
-      missingCoreCount,
-    },
-  };
-}
-
-export function reduceBrowserState(
-  state: BrowserState,
-  event: BrowserEvent,
-): BrowserState {
-  switch (event.type) {
-    case "search":
-      return { ...state, query: event.query, screen: "list" };
-    case "highlight":
-      return { ...state, selected: event.key };
-    case "show":
-      return { ...state, screen: event.screen };
-    case "focus":
-      return { ...state, focus: event.target };
-    case "facets":
-      return { ...state, facets: event.facets, screen: "list" };
+): string {
+  switch (field) {
+    case "provider":
+      return filters.provider === "all"
+        ? "All providers"
+        : (groups.find((group) => group.id === filters.provider)?.provider ??
+            filters.provider);
+    case "type":
+      return filters.type === "all"
+        ? "All types"
+        : filters.type === "chat"
+          ? "Chat"
+          : "Embedding";
+    default:
+      return filters[field] ? "Yes" : "No";
   }
 }
 
-/** Resolve a remembered stable key to a valid list selection. */
-export function resolveSelection(
-  projection: BrowserProjection,
-  selectedKey: string | undefined,
-): { index: number; item: BrowserItem | undefined } {
-  if (projection.items.length === 0) return { index: 0, item: undefined };
-  const found = selectedKey
-    ? projection.items.findIndex((item) => item.key === selectedKey)
-    : -1;
-  const index = found >= 0 ? found : 0;
-  return { index, item: projection.items[index] };
+/** The one-line filter summary: `chat · all providers · 1 embedding hidden`. */
+export function filterSummary(
+  nav: NavState,
+  scope: BrowserScope,
+  groups: readonly ProviderGroup[],
+  embeddingsHidden: number,
+  compact: boolean,
+): string {
+  const filters = nav.filters;
+  const parts: string[] = [TYPE_WORDS[filters.type]];
+  if (scope.kind === "all")
+    parts.push(
+      filters.provider === "all"
+        ? compact
+          ? "all"
+          : "all providers"
+        : (groups.find((group) => group.id === filters.provider)?.provider ??
+            filters.provider),
+    );
+  if (filters.tools) parts.push("tools");
+  if (filters.images) parts.push("images");
+  if (filters.reasoning) parts.push("reasoning");
+  if (filters.priced) parts.push("priced");
+  if (filters.uncertain) parts.push("incl. assumed");
+  if (embeddingsHidden > 0)
+    parts.push(
+      `${embeddingsHidden} ${embeddingsHidden === 1 ? "embedding" : "embeddings"} hidden`,
+    );
+  return parts.join(" · ");
 }
 
-export interface BrowserTheme {
-  text: ColorInput;
-  textMuted: ColorInput;
-  primary: ColorInput;
-  accent: ColorInput;
-  /** Host dialog surface; keeps the select visually one panel with the host. */
-  backgroundPanel: ColorInput;
-  backgroundElement: ColorInput;
-  selectedListItemText: ColorInput;
+// ── Footer ──────────────────────────────────────────────────────────────
+
+export interface FooterHint {
+  readonly title: string;
+  readonly key: string;
+  readonly enabled?: boolean;
 }
 
-export interface BrowserViewOptions {
-  groups: readonly ProviderGroup[];
-  theme: BrowserTheme;
-  /** Total content rows available inside the host dialog. */
-  maxHeight?: number;
-  /** Bounded content columns available inside the host dialog. */
-  width?: number;
-  keyInput: Pick<KeyHandler, "on" | "off">;
-  /** Status shown right after the title, before the summary counts. */
-  notice?: string;
-  /** Called on Shift+R outside the search input; enables the hint. */
-  onRefresh?: () => void;
-}
-
-export interface BrowserView {
-  root: TuiNode<"box">;
-  state: () => BrowserState;
-  /**
-   * Replace the rows in place, keeping query, facets, selection, and screen.
-   * Only mutates existing nodes, so it is safe outside the render scope.
-   */
-  update: (groups: readonly ProviderGroup[], notice?: string) => void;
-  setNotice: (notice: string | undefined) => void;
-  dispose: () => void;
-}
-
-const DEFAULT_CONTENT_HEIGHT = 18;
-const DEFAULT_CONTENT_WIDTH = 80;
-const MAX_CONTENT_WIDTH = 120;
-
-export interface FooterContext {
-  screen: BrowserScreen;
-  focus: FocusTarget;
-  width: number;
-  multiProvider: boolean;
-  hasItems: boolean;
-  /** The zero-item list remains a valid recovery focus target (facet-empty). */
-  listRecoverable: boolean;
-  /** Discovery evidence exists, so the `o` facet key does something. */
-  originFilterAvailable: boolean;
-  /** Shift+R requests a server refresh. */
-  refreshAvailable?: boolean;
+function hintSegments(hint: FooterHint): Segment[] {
+  const enabled = hint.enabled !== false;
+  return [
+    { text: hint.title, role: enabled ? "base" : "disabled" },
+    { text: " ", role: "base" },
+    { text: hint.key, role: enabled ? "key" : "disabled" },
+  ];
 }
 
 /**
- * Focus-aware footer. Every advertised key must work in the advertised
- * focus/screen combination:
- * - Search focus advertises only the actions the search input honors,
- *   including the enter/arrow exit to a zero-item but recoverable list.
- * - Facet keys advertise `p` only for multi-provider catalogs and `o` only
- *   when discovery evidence supplies model origins.
- * - List and detail footers degrade full → medium → compact; the medium
- *   variant fits the 70-column text budget of an 80-column terminal while
- *   still exposing the facet shortcuts and reset. The refresh hint appears
- *   only in the full variant.
+ * Hints in the host's footer style. Optional hints drop from the right as
+ * the width shrinks; `keys ?` and `close esc` always remain.
  */
-export function footerContent(context: FooterContext): string {
-  const {
-    screen,
-    focus,
-    width,
-    multiProvider,
-    hasItems,
-    listRecoverable,
-    originFilterAvailable,
-    refreshAvailable = false,
-  } = context;
-  if (focus === "search") {
-    const hint = hasItems
-      ? "enter results · ↑/↓ results · esc close"
-      : listRecoverable
-        ? "enter filters · ↑/↓ filters · esc close"
-        : "esc close";
-    return bounded(hint, width);
-  }
-  const facetKeys = [
-    ...(multiProvider ? ["p"] : []),
-    "t",
-    "c",
-    "s",
-    "m",
-    ...(originFilterAvailable ? ["o"] : []),
-  ].join("/");
-  if (screen === "list" && !hasItems) {
-    // Facet-empty recovery: only facet cycling, reset, search, and close work.
-    const variants = [
-      ...(refreshAvailable
-        ? [`/ search · ${facetKeys} filters · r reset · R refresh · esc close`]
-        : []),
-      `/ search · ${facetKeys} filters · r reset · esc close`,
-      `/ search · ${facetKeys} · r reset · esc close`,
-      "r reset · esc close",
+export function footerSegments(
+  hints: readonly FooterHint[],
+  width: number,
+  keysHint = true,
+): Segment[] {
+  const close = hintSegments({ title: "close", key: "esc" });
+  const keys = keysHint ? hintSegments({ title: "keys", key: "?" }) : [];
+  const budget = width - segmentsWidth(close) - 2;
+  const left: Segment[] = [];
+  for (const hint of hints) {
+    const next = [
+      ...left,
+      ...(left.length > 0 ? [{ text: GAP, role: "base" as const }] : []),
+      ...hintSegments(hint),
     ];
-    const fit = variants.find((variant) => stringWidth(variant) <= width);
-    return bounded(fit ?? variants[variants.length - 1] ?? "", width);
+    const withKeys =
+      keys.length > 0
+        ? [...next, { text: GAP, role: "base" as const }, ...keys]
+        : next;
+    if (segmentsWidth(withKeys) > budget) break;
+    left.splice(0, left.length, ...next);
   }
-  const variants =
-    screen === "list"
-      ? [
-          ...(refreshAvailable
-            ? [
-                `↑/↓ navigate · enter open · / search · ${facetKeys} filters · r reset · R refresh · esc close`,
-              ]
-            : []),
-          `↑/↓ navigate · enter open · / search · ${facetKeys} filters · r reset · esc close`,
-          `↑/↓ · enter open · / search · ${facetKeys} · r reset · esc close`,
-          "↑/↓ move · enter open · / search · esc close",
-        ]
-      : [
-          ...(refreshAvailable
-            ? [
-                `↑/↓ scroll · backspace list · / search · ${facetKeys} filters · r reset · R refresh · esc close`,
-              ]
-            : []),
-          `↑/↓ scroll · backspace list · / search · ${facetKeys} filters · r reset · esc close`,
-          `↑/↓ scroll · backspace · / search · ${facetKeys} · r reset · esc`,
-          "↑/↓ scroll · backspace list · / search · esc close",
-        ];
-  const fit = variants.find((variant) => stringWidth(variant) <= width);
-  return bounded(fit ?? variants[variants.length - 1] ?? "", width);
+  if (keys.length > 0)
+    left.push(
+      ...(left.length > 0 ? [{ text: GAP, role: "base" as const }] : []),
+      ...keys,
+    );
+  return justify(left, close, width);
 }
 
-export interface BrowserLayoutBudget {
-  summaryRows: number;
-  searchRows: number;
-  filterRows: number;
-  footerRows: number;
-  viewportHeight: number;
-  listHeight: number;
-  rootHeight: number;
+/** `left` at the start and `right` at the end of `width` columns; `left` is cut when both do not fit. */
+export function justify(
+  left: readonly Segment[],
+  right: readonly Segment[],
+  width: number,
+): Segment[] {
+  const rightWidth = segmentsWidth(right);
+  const room = Math.max(0, width - rightWidth - (right.length > 0 ? 1 : 0));
+  const fitted: Segment[] = [];
+  let used = 0;
+  for (const segment of left) {
+    const columns = textWidth(sanitizeInline(segment.text));
+    if (used + columns <= room) {
+      fitted.push(segment);
+      used += columns;
+      continue;
+    }
+    if (room - used > 1)
+      fitted.push({
+        text: padText(segment.text, room - used),
+        role: segment.role,
+      });
+    used = room;
+    break;
+  }
+  const fill = Math.max(right.length > 0 ? 1 : 0, width - used - rightWidth);
+  return [...fitted, { text: " ".repeat(fill), role: "base" }, ...right];
 }
 
-function positiveFloor(value: number | undefined, fallback: number): number {
+// ── Layout ──────────────────────────────────────────────────────────────
+
+/** Wide layout: list 58, separator 3, detail 49. */
+export const WIDE_MIN_COLUMNS = 120;
+const WIDE_LIST_COLUMNS = 58;
+const SEPARATOR_COLUMNS = 3;
+const DIALOG_MAX_COLUMNS = 116;
+const SIDE_PADDING = 3;
+const MAX_CONTENT_ROWS = 30;
+/** Header, search, filter, and notice rows, the footer, and the bottom padding. */
+const CHROME_ROWS = 6;
+/** Row slots of every list and pane; the most body rows the dialog can show. */
+const BODY_CAPACITY = MAX_CONTENT_ROWS;
+
+export interface BrowserLayout {
+  readonly wide: boolean;
+  /** Content columns inside the side padding. */
+  readonly width: number;
+  /**
+   * The root's width. OpenTUI sizes a box with its padding included, so
+   * this is `width` plus both side paddings: the dialog's width.
+   */
+  readonly outerWidth: number;
+  /** Content rows, including the bottom padding row; also the root's height. */
+  readonly height: number;
+  readonly bodyHeight: number;
+  readonly listWidth: number;
+  readonly paneWidth: number;
+}
+
+function finitePositive(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0
-    ? Math.max(1, Math.floor(value))
+    ? Math.floor(value)
     : fallback;
 }
 
-/** Compose fixed chrome within, never above, the supplied total height. */
-export function browserLayoutBudget(maxHeight?: number): BrowserLayoutBudget {
-  const rootHeight = positiveFloor(maxHeight, DEFAULT_CONTENT_HEIGHT);
-  const searchRows = rootHeight >= 2 ? 1 : 0;
-  const summaryRows = rootHeight >= 3 ? 1 : 0;
-  const filterRows = rootHeight >= 4 ? 1 : 0;
-  const footerRows = rootHeight >= 5 ? 1 : 0;
-  const fixedRows = searchRows + summaryRows + filterRows + footerRows;
-  const viewportHeight = Math.max(1, rootHeight - fixedRows);
+/**
+ * Dialog width `min(116, cols - 2)` with side padding 3, content height
+ * `min(30, rows - 4)`; the detail pane sits beside the list from 120 columns.
+ */
+export function browserLayout(columns: number, rows: number): BrowserLayout {
+  const cols = finitePositive(columns, 80);
+  const lines = finitePositive(rows, 24);
+  const width = Math.max(
+    20,
+    Math.min(DIALOG_MAX_COLUMNS, cols - 2) - SIDE_PADDING * 2,
+  );
+  const height = Math.max(
+    CHROME_ROWS + 2,
+    Math.min(MAX_CONTENT_ROWS, lines - 4),
+  );
+  const wide = cols >= WIDE_MIN_COLUMNS;
+  const listWidth = wide ? WIDE_LIST_COLUMNS : width;
   return {
-    summaryRows,
-    searchRows,
-    filterRows,
-    footerRows,
-    viewportHeight,
-    listHeight: rootHeight - footerRows,
-    rootHeight,
+    wide,
+    width,
+    outerWidth: width + SIDE_PADDING * 2,
+    height,
+    bodyHeight: Math.min(BODY_CAPACITY, height - CHROME_ROWS),
+    listWidth,
+    paneWidth: wide
+      ? Math.max(1, width - listWidth - SEPARATOR_COLUMNS)
+      : width,
   };
 }
 
-function browserContentWidth(width?: number): number {
-  return Math.min(
-    MAX_CONTENT_WIDTH,
-    positiveFloor(width, DEFAULT_CONTENT_WIDTH),
+// ── Text pane ───────────────────────────────────────────────────────────
+
+interface TextPane {
+  readonly root: TuiNode<"box">;
+  setLines(lines: readonly Line[], keepOffset?: boolean): void;
+  setViewport(width: number, height: number): void;
+  scroll(move: ListMove): void;
+  repaint(): void;
+}
+
+/**
+ * A scrolling stack of one-line text slots. The row list's window follows
+ * its selection, and detail text has no selection, so the pane keeps its
+ * own offset.
+ */
+function createTextPane(
+  renderer: TuiRenderer,
+  id: string,
+  capacity: number,
+  initial: { width: number; height: number },
+  palette: () => RolePalette,
+): TextPane {
+  let width = initial.width;
+  let height = Math.min(capacity, initial.height);
+  let lines: readonly Line[] = [];
+  let offset = 0;
+  const slots: TuiNode<"text">[] = [];
+  for (let index = 0; index < capacity; index += 1)
+    slots.push(
+      renderer.create("text", {
+        id: `${id}-line-${index}`,
+        height: 1,
+        flexShrink: 0,
+        wrapMode: "none",
+        content: "",
+        visible: index < height,
+      }),
+    );
+  const root = renderer.create(
+    "box",
+    {
+      id,
+      flexDirection: "column",
+      flexShrink: 0,
+      width,
+      height,
+      overflow: "hidden",
+    },
+    ...slots,
   );
+  const maxOffset = (): number => Math.max(0, lines.length - height);
+  const paint = (): void => {
+    const colors = palette();
+    for (const [slot, node] of slots.entries()) {
+      if (slot >= height) continue;
+      const line = lines[offset + slot];
+      renderer.setStyledText(
+        node,
+        line
+          ? rowSpans({ key: "", segments: line }, colors, width, {
+              selected: false,
+              focused: false,
+              bar: false,
+            })
+          : [],
+      );
+    }
+  };
+  return {
+    root,
+    setLines(next, keepOffset = false) {
+      lines = next;
+      offset = keepOffset ? Math.min(offset, maxOffset()) : 0;
+      paint();
+    },
+    setViewport(nextWidth, nextHeight) {
+      width = Math.max(1, nextWidth);
+      const previous = height;
+      height = Math.min(capacity, Math.max(1, nextHeight));
+      renderer.set(root, "width", width);
+      renderer.set(root, "height", height);
+      if (previous !== height)
+        for (const [slot, node] of slots.entries())
+          renderer.set(node, "visible", slot < height);
+      offset = Math.min(offset, maxOffset());
+      paint();
+    },
+    scroll(move) {
+      const page = Math.max(1, height - 1);
+      const next =
+        move === "up"
+          ? offset - 1
+          : move === "down"
+            ? offset + 1
+            : move === "pageup"
+              ? offset - page
+              : move === "pagedown"
+                ? offset + page
+                : move === "home"
+                  ? 0
+                  : maxOffset();
+      offset = Math.min(Math.max(0, next), maxOffset());
+      paint();
+    },
+    repaint: paint,
+  };
 }
 
-function asSelectOptions(items: readonly BrowserItem[]): SelectOption[] {
-  return items.map((item) => ({
-    name: item.displayRow,
-    description: "",
-    value: item.key,
-  }));
+// ── View ────────────────────────────────────────────────────────────────
+
+export type NoticeRole = "info" | "ok" | "warn" | "error" | "muted";
+
+export interface BrowserNotice {
+  readonly text: string;
+  readonly role: NoticeRole;
 }
 
-function consumeKey(key: KeyEvent): void {
+/** A key a caller adds to the list and detail views, such as `/actualyze`'s `k`. */
+export interface BrowserExtraAction {
+  /** One lowercase letter that the browser does not use. */
+  readonly key: string;
+  readonly title: string;
+  readonly enabled?: () => boolean;
+  readonly run: () => void;
+}
+
+/** Side effects the view asks its session for. */
+export interface BrowserActions {
+  /** Open OpenCode's model picker; replaces the dialog. */
+  picker(): void;
+  /** Refresh one provider's discovery, or every provider. */
+  refresh(providerID: string | undefined): void;
+  /** Re-read the host lists after they failed. */
+  retry(): void;
+  copy(text: string): void;
+  notify(notice: BrowserNotice): void;
+  /** Open `/actualyze`; the `a` key is inert without it. */
+  actualyze?: () => void;
+}
+
+export interface TerminalSize {
+  readonly terminalWidth: number;
+  readonly terminalHeight: number;
+  on(event: "resize", listener: (...args: unknown[]) => void): unknown;
+  off(event: "resize", listener: (...args: unknown[]) => void): unknown;
+}
+
+export interface BrowserViewOptions {
+  readonly scope: BrowserScope;
+  readonly data: BrowserData;
+  readonly nav: NavState;
+  /** Called with a fresh copy whenever query, filters, sort, collapse, or selection change. */
+  readonly onNav: (nav: NavState) => void;
+  readonly palette: () => RolePalette;
+  readonly keyInput: Pick<KeyHandler, "on" | "off">;
+  readonly terminal: TerminalSize;
+  readonly current: () =>
+    | { readonly providerID: string; readonly modelID: string }
+    | undefined;
+  readonly actions: BrowserActions;
+  readonly title?: string;
+  readonly searchPlaceholder?: string;
+  readonly extraActions?: readonly BrowserExtraAction[];
+}
+
+export interface BrowserView {
+  readonly root: TuiNode<"box">;
+  update(data: BrowserData): void;
+  setNotice(notice: BrowserNotice | undefined): void;
+  /** Repaint time-dependent text: relative ages and countdowns. */
+  tick(): void;
+  screen(): BrowserScreen;
+  focus(): BrowserFocus;
+  dispose(): void;
+}
+
+function cloneNav(nav: NavState): NavState {
+  return {
+    query: nav.query,
+    filters: { ...nav.filters },
+    sort: nav.sort,
+    collapsed: [...nav.collapsed],
+    ...(nav.selected ? { selected: { ...nav.selected } } : {}),
+  };
+}
+
+function consume(key: KeyEvent): void {
   key.preventDefault();
   key.stopPropagation();
 }
 
-function hasCommandModifier(key: KeyEvent): boolean {
-  return Boolean(key.ctrl || key.meta || key.option || key.super || key.hyper);
-}
+/** Actions that close the dialog or show another one: the key is consumed first. */
+const HANDOFF_ACTIONS: ReadonlySet<BrowserAction["type"]> = new Set([
+  "picker",
+  "actualyze",
+  "extra",
+]);
 
-/** Build the unified grouped list/detail browser from reconciled rows. */
+/**
+ * Build the browser inside a dialog render callback. Every node is created
+ * here, once; updates, resizes, and key handling only mutate them.
+ */
 export function buildBrowserView(
   renderer: TuiRenderer,
   options: BrowserViewOptions,
 ): BrowserView {
-  const { theme, keyInput, onRefresh } = options;
-  const layout = browserLayoutBudget(options.maxHeight);
-  const contentWidth = browserContentWidth(options.width);
-  const textWidth = Math.max(1, contentWidth - 8);
-  let groups = options.groups;
-  let notice = options.notice;
-  let browserIndex = buildBrowserIndex(groups, textWidth);
-  let multiProvider = groups.length > 1;
-  let state = INITIAL_BROWSER_STATE;
-  let projection = projectBrowser(
-    groups,
-    state.query,
-    state.facets,
-    browserIndex,
-  );
-  state = reduceBrowserState(state, {
-    type: "focus",
-    target: projection.items.length > 0 ? "list" : "search",
+  const { scope, palette, actions, terminal } = options;
+  const extraActions = options.extraActions ?? [];
+  const extraKeys = new Set(extraActions.map((action) => action.key));
+  const title = options.title ?? "Model Scout";
+  let data = options.data;
+  let nav = cloneNav(options.nav);
+  let layout = browserLayout(terminal.terminalWidth, terminal.terminalHeight);
+  let projection = projectBrowser(data, nav, {
+    scope,
+    width: layout.listWidth,
+    current: options.current(),
   });
+  let screens: BrowserScreen[] = ["list"];
+  let focus: BrowserFocus = "list";
+  let notice: BrowserNotice | undefined;
+  let selectionPending = nav.selected === undefined;
+  let disposed = false;
+  /** Selection whose details the pane shows, to keep its scroll offset on repaint. */
+  let paneKey: string | undefined;
 
-  const recordFocus = (target: FocusTarget): void => {
-    state = reduceBrowserState(state, { type: "focus", target });
-    refreshFooter();
-  };
+  const screen = (): BrowserScreen => screens[screens.length - 1] ?? "list";
 
-  const summaryText = renderer.create("text", {
-    id: "modelscout-summary",
-    fg: theme.text,
-    content: "",
+  const text = (id: string): TuiNode<"text"> =>
+    renderer.create("text", {
+      id,
+      height: 1,
+      flexShrink: 0,
+      wrapMode: "none",
+      content: "",
+    });
+
+  const header = text("modelscout-header");
+  const slash = renderer.create("text", {
+    id: "modelscout-slash",
+    width: 3,
     height: 1,
-    maxHeight: 1,
-    overflow: "hidden",
-  });
-  const filterText = renderer.create("text", {
-    id: "modelscout-filter-summary",
-    fg: theme.textMuted,
-    content: projection.filterSummary,
-    height: 1,
-    maxHeight: 1,
-    overflow: "hidden",
-  });
-  const emptyText = renderer.create("text", {
-    id: "modelscout-empty",
-    fg: theme.textMuted,
-    content: bounded(projection.emptyMessage, textWidth),
-    height: 1,
-    maxHeight: 1,
-    overflow: "hidden",
-    visible: false,
-  });
-  const detailText = renderer.create("text", {
-    id: "modelscout-detail-text",
-    fg: theme.text,
+    flexShrink: 0,
     content: "",
   });
-  const footerText = renderer.create("text", {
-    id: "modelscout-footer-text",
-    fg: theme.textMuted,
-    content: "",
-    height: 1,
-    maxHeight: 1,
-    overflow: "hidden",
-  });
-
-  function refreshFooter(): void {
-    renderer.set(
-      footerText,
-      "content",
-      footerContent({
-        screen: state.screen,
-        focus: state.focus,
-        width: textWidth,
-        multiProvider,
-        hasItems: projection.items.length > 0,
-        listRecoverable: canRecoverFacetEmptyList(),
-        originFilterAvailable: projection.originFilterAvailable,
-        refreshAvailable: onRefresh !== undefined,
-      }),
-    );
-  }
-
-  const selectByIndex = (index: number): void => {
-    const item = projection.items[index];
-    if (!item) return;
-    state = reduceBrowserState(state, { type: "highlight", key: item.key });
-  };
-
-  const list = renderer.create("select", {
-    id: "modelscout-results",
-    options: asSelectOptions(projection.items),
-    selectedIndex: 0,
-    height: layout.viewportHeight,
-    maxHeight: layout.viewportHeight,
-    showDescription: false,
-    showScrollIndicator: true,
-    wrapSelection: false,
-    backgroundColor: theme.backgroundPanel,
-    focusedBackgroundColor: theme.backgroundPanel,
-    selectedBackgroundColor: theme.primary,
-    textColor: theme.text,
-    focusedTextColor: theme.text,
-    selectedTextColor: theme.selectedListItemText,
-    focused: state.focus === "list",
-    "on:focused": () => recordFocus("list"),
-    onChange: (index) => selectByIndex(index),
-    onSelect: (index) => {
-      selectByIndex(index);
-      const item = projection.items[index];
-      if (!item) return;
-      renderer.set(detailText, "content", item.detail);
-      state = reduceBrowserState(state, { type: "show", screen: "detail" });
-      refresh();
-      focus("detail");
-    },
-  });
-
   const search = renderer.create("input", {
     id: "modelscout-search",
-    width: "100%",
-    value: "",
-    placeholder: "Search models and providers",
-    textColor: theme.text,
-    focusedTextColor: theme.text,
-    placeholderColor: theme.textMuted,
-    "on:focused": () => recordFocus("search"),
-    focused: state.focus === "search",
-    onInput: (query) => updateQuery(query),
-    onChange: (query) => updateQuery(query),
+    width: Math.max(1, layout.width - 3),
+    value: nav.query,
+    placeholder:
+      options.searchPlaceholder ?? "Search name, ID, family, provider",
+    focused: false,
+    onInput: (value: string) => setQuery(value),
+    onChange: (value: string) => setQuery(value),
     onSubmit: () => {
-      // The zero-item list stays a valid focus target during facet-empty
-      // recovery so Enter can leave search and reach the facet shortcuts.
-      if (visibleFocusTargets().includes("list")) focus("list");
+      if (focus === "search") setFocus("list");
     },
   });
-
-  const summaryRow = renderer.create(
-    "box",
-    {
-      id: "modelscout-summary-row",
-      height: 1,
-      maxHeight: 1,
-      overflow: "hidden",
-      visible: layout.summaryRows > 0,
-      flexShrink: 0,
-    },
-    summaryText,
-  );
   const searchRow = renderer.create(
     "box",
     {
       id: "modelscout-search-row",
+      flexDirection: "row",
       height: 1,
-      maxHeight: 1,
-      overflow: "hidden",
-      visible: layout.searchRows > 0,
       flexShrink: 0,
     },
+    slash,
     search,
   );
-  const filterRow = renderer.create(
+  const filterLine = text("modelscout-filters");
+  const noticeLine = text("modelscout-notice");
+  const list: RowList = createRowList(renderer, {
+    id: "modelscout-list",
+    capacity: BODY_CAPACITY,
+    width: layout.listWidth,
+    height: layout.bodyHeight,
+    palette,
+    focused: true,
+    onSelect: (row) => onSelect(row as BrowserRow | undefined),
+  });
+  const separator = renderer.create("text", {
+    id: "modelscout-separator",
+    width: SEPARATOR_COLUMNS,
+    height: layout.bodyHeight,
+    flexShrink: 0,
+    wrapMode: "none",
+    content: "",
+  });
+  const pane = createTextPane(
+    renderer,
+    "modelscout-pane",
+    BODY_CAPACITY,
+    { width: layout.paneWidth, height: layout.bodyHeight },
+    palette,
+  );
+  const filterList: RowList = createRowList(renderer, {
+    id: "modelscout-filter-list",
+    capacity: 12,
+    width: layout.width,
+    height: Math.min(12, layout.bodyHeight),
+    palette,
+    focused: true,
+  });
+  const body = renderer.create(
     "box",
     {
-      id: "modelscout-filter-row",
-      height: 1,
-      maxHeight: 1,
-      overflow: "hidden",
-      visible: layout.filterRows > 0,
+      id: "modelscout-body",
+      flexDirection: "row",
       flexShrink: 0,
-    },
-    filterText,
-  );
-  const resultsPane = renderer.create(
-    "box",
-    {
-      id: "modelscout-list-pane",
-      width: "100%",
-      height: layout.viewportHeight,
-      maxHeight: layout.viewportHeight,
-      flexDirection: "column",
+      height: layout.bodyHeight,
       overflow: "hidden",
     },
-    list,
-    emptyText,
+    list.root,
+    separator,
+    pane.root,
+    filterList.root,
   );
-  const listScreen = renderer.create(
-    "box",
-    {
-      id: "modelscout-list-screen",
-      width: "100%",
-      height: layout.listHeight,
-      maxHeight: layout.listHeight,
-      flexDirection: "column",
-      overflow: "hidden",
-      visible: true,
-    },
-    summaryRow,
-    searchRow,
-    filterRow,
-    resultsPane,
-  );
-  const detailPane = renderer.create(
-    "scrollbox",
-    {
-      id: "modelscout-detail-screen",
-      width: "100%",
-      height: layout.listHeight,
-      maxHeight: layout.listHeight,
-      focused: false,
-      visible: false,
-      "on:focused": () => recordFocus("detail"),
-      scrollbarOptions: { visible: false },
-    },
-    detailText,
-  );
-  const footer = renderer.create(
-    "box",
-    {
-      id: "modelscout-footer-row",
-      height: 1,
-      maxHeight: 1,
-      overflow: "hidden",
-      visible: layout.footerRows > 0,
-      flexShrink: 0,
-    },
-    footerText,
-  );
+  const summaryLine = text("modelscout-summary");
+  const footer = text("modelscout-footer");
   const root = renderer.create(
     "box",
     {
       id: "modelscout-browser",
       flexDirection: "column",
-      // The numeric width behaves as content-box while the root also carries
-      // 2-column left/right padding; subtract both pads so the outer width
-      // (content + padding) stays at the requested contentWidth and the
-      // select viewport/scrollbar cannot overhang the dialog on the right.
-      width: Math.max(1, contentWidth - 4),
-      height: layout.rootHeight,
-      maxHeight: layout.rootHeight,
+      width: layout.outerWidth,
+      height: layout.height,
+      maxHeight: layout.height,
       overflow: "hidden",
-      paddingLeft: 2,
-      paddingRight: 2,
+      paddingLeft: SIDE_PADDING,
+      paddingRight: SIDE_PADDING,
+      paddingBottom: 1,
     },
-    listScreen,
-    detailPane,
+    header,
+    searchRow,
+    filterLine,
+    noticeLine,
+    body,
+    summaryLine,
     footer,
   );
 
-  function updateQuery(query: string): void {
-    if (state.query === query) return;
-    state = reduceBrowserState(state, { type: "search", query });
-    refresh();
+  const paintLine = (
+    node: TuiNode<"text">,
+    segments: readonly Segment[],
+    width = layout.width,
+  ): void => {
+    renderer.setStyledText(
+      node,
+      rowSpans({ key: "", segments }, palette(), width, {
+        selected: false,
+        focused: false,
+        bar: false,
+      }),
+    );
+  };
+
+  // ── Selection ─────────────────────────────────────────────────────────
+
+  const selectedRow = (): BrowserRow | undefined =>
+    list.selected()?.row as BrowserRow | undefined;
+
+  function onSelect(row: BrowserRow | undefined): void {
+    if (!row || row.kind === "note") return;
+    const next: SelectedItem = row.model
+      ? { providerID: row.group.id, modelID: row.model.id }
+      : { providerID: row.group.id };
+    if (selectionKey(next) === selectionKey(nav.selected)) return;
+    nav = { ...nav, selected: next };
+    emitNav();
+    paintPane();
+    paintSummary();
+    paintFooter();
   }
 
-  function focusNodes(): Readonly<Record<FocusTarget, FocusNode>> {
-    return { search, list, detail: detailPane };
+  function emitNav(): void {
+    options.onNav(cloneNav(nav));
   }
 
-  function visibleFocusTargets(): FocusTarget[] {
-    if (state.screen === "detail") return ["detail"];
-    const targets: FocusTarget[] = [];
-    if (layout.searchRows > 0) targets.push("search");
-    if (projection.items.length > 0 || canRecoverFacetEmptyList())
-      targets.push("list");
-    return targets.length > 0 ? targets : ["list"];
+  function setRows(): void {
+    // Read before `setRows`, whose fallback selection reaches `onSelect`.
+    const wanted = selectionKey(nav.selected);
+    projection = projectBrowser(data, nav, {
+      scope,
+      width: layout.listWidth,
+      current: options.current(),
+    });
+    list.setRows(projection.rows);
+    if (selectionPending && data.status === "ready") {
+      selectionPending = false;
+      const first = initialSelection(projection.rows, options.current());
+      if (first) list.select(first.key);
+    } else if (wanted) list.select(wanted);
+  }
+
+  // ── Focus and screens ─────────────────────────────────────────────────
+
+  function setFocus(next: BrowserFocus): void {
+    focus = next;
+    renderer.set(search, "focused", next === "search");
+    list.setFocused(next === "list");
+    paintChrome();
+  }
+
+  function pushScreen(next: BrowserScreen): void {
+    if (screen() === next) return;
+    screens = [...screens, next];
+    if (next !== "list") renderer.set(search, "focused", false);
+    applyScreen();
+  }
+
+  function popScreen(): void {
+    if (screens.length > 1) screens = screens.slice(0, -1);
+    applyScreen();
+  }
+
+  /** Rows the body takes on the current screen and layout. */
+  function bodyRows(): number {
+    const summary =
+      screen() === "list" && !layout.wide && projection.rows.length > 0;
+    return layout.bodyHeight - (summary ? 1 : 0);
   }
 
   /**
-   * A facet action can empty the whole intersection — with or without an
-   * active query. The list keeps shortcut focus so the user can continue
-   * cycling facets or press `r`; ordinary typing is untouched because the
-   * shortcut handler never runs while search owns focus. Recovery only
-   * exists when resetting facets would actually reveal a result for the
-   * current query — an unrelated no-match query stays search-owned because
-   * `r` cannot surface anything.
+   * Show the nodes of the current screen at the current layout. The pane
+   * scrolls back to the top unless `keepOffset` is set.
    */
-  function canRecoverFacetEmptyList(): boolean {
-    if (
-      groups.length === 0 ||
-      projection.items.length > 0 ||
-      facetsAtDefault(state.facets)
-    )
-      return false;
-    return (
-      projectBrowser(groups, state.query, INITIAL_BROWSER_FACETS, browserIndex)
-        .items.length > 0
+  function applyScreen(keepOffset = false): void {
+    const current = screen();
+    const listScreen = current === "list";
+    const cards = listScreen && projection.rows.length === 0;
+    const split = listScreen && layout.wide && !cards;
+    const summary = listScreen && !layout.wide && !cards;
+    const bodyHeight = bodyRows();
+    renderer.set(body, "height", bodyHeight);
+    renderer.set(list.root, "visible", listScreen && !cards);
+    renderer.set(separator, "visible", split);
+    renderer.set(
+      pane.root,
+      "visible",
+      current !== "filters" && (!listScreen || split || cards),
     );
+    renderer.set(filterList.root, "visible", current === "filters");
+    renderer.set(summaryLine, "visible", summary);
+    list.setViewport(layout.listWidth, bodyHeight);
+    pane.setViewport(split ? layout.paneWidth : layout.width, bodyHeight);
+    filterList.setViewport(layout.width, Math.min(12, bodyHeight));
+    renderer.set(separator, "height", bodyHeight);
+    if (current === "filters") paintFilters();
+    if (!keepOffset) paneKey = undefined;
+    paintPane();
+    paintChrome();
   }
 
-  function focus(target: FocusTarget): void {
-    const visible = visibleFocusTargets();
-    const next = visible.includes(target) ? target : (visible[0] ?? "list");
-    state = reduceBrowserState(state, { type: "focus", target: next });
-    for (const [name, node] of Object.entries(focusNodes()) as Array<
-      [FocusTarget, FocusNode]
-    >) {
-      renderer.set(node, "focused", name === next);
+  function paintSeparator(): void {
+    renderer.setStyledText(separator, [
+      {
+        text: Array.from({ length: bodyRows() }, () => " │ ").join("\n"),
+        fg: palette().rule,
+      },
+    ]);
+  }
+
+  function relayout(): void {
+    const next = browserLayout(terminal.terminalWidth, terminal.terminalHeight);
+    const changed =
+      next.wide !== layout.wide ||
+      next.width !== layout.width ||
+      next.height !== layout.height;
+    layout = next;
+    if (!changed) return;
+    renderer.set(root, "width", layout.outerWidth);
+    renderer.set(root, "height", layout.height);
+    renderer.set(root, "maxHeight", layout.height);
+    renderer.set(search, "width", Math.max(1, layout.width - 3));
+    // The wide pane and the narrow detail screen show the same details.
+    if (layout.wide && screens.includes("detail")) {
+      screens = screens.filter((item) => item !== "detail");
+      focus = "pane";
+    } else if (!layout.wide && focus === "pane") {
+      focus = "list";
+      screens = ["list", "detail", ...screens.slice(1)];
     }
-    refreshFooter();
+    list.setFocused(focus === "list");
+    setRows();
+    applyScreen(true);
   }
 
-  function refresh(): void {
-    projection = projectBrowser(
-      groups,
-      state.query,
-      state.facets,
-      browserIndex,
-    );
-    const selection = resolveSelection(projection, state.selected);
-    if (selection.item && state.selected !== selection.item.key) {
-      state = reduceBrowserState(state, {
-        type: "highlight",
-        key: selection.item.key,
+  // ── Painting ──────────────────────────────────────────────────────────
+
+  function paneLines(width: number): Line[] {
+    const now = Date.now();
+    const current = screen();
+    if (current === "help") return helpLines(helpTitle(), helpEntries(), width);
+    if (current === "list" && projection.rows.length === 0)
+      return cardLines(width);
+    const row = selectedRow();
+    if (!row) return [];
+    const record = findRecord(data, row.group.id);
+    if (current === "evidence")
+      return row.model
+        ? modelEvidenceLines(row.group, row.model, width)
+        : providerEvidenceLines(row.group, record, width);
+    if (row.model) {
+      const currentModel = options.current();
+      return modelDetailLines(row.group, row.model, {
+        width,
+        current:
+          currentModel?.providerID === row.group.id &&
+          currentModel.modelID === row.model.id,
+        pickerBlocked: pickerBlocked(row),
       });
     }
-    renderer.set(list, "options", asSelectOptions(projection.items));
-    renderer.set(list, "selectedIndex", selection.index);
-    renderer.set(list, "visible", projection.items.length > 0);
-    renderer.set(emptyText, "visible", projection.items.length === 0);
-    renderer.set(
-      emptyText,
-      "content",
-      bounded(projection.emptyMessage, textWidth),
-    );
-    renderer.set(filterText, "content", projection.filterSummary);
-    refreshSummary();
-    if (state.screen === "list") {
-      renderer.set(listScreen, "visible", true);
-      renderer.set(detailPane, "visible", false);
-    } else {
-      renderer.set(listScreen, "visible", false);
-      renderer.set(detailPane, "visible", true);
-      renderer.set(
-        detailText,
-        "content",
-        selection.item?.detail ?? projection.emptyMessage,
-      );
-    }
-    if (!visibleFocusTargets().includes(state.focus)) {
-      focus(
-        state.screen === "detail"
-          ? "detail"
-          : projection.items.length > 0 || canRecoverFacetEmptyList()
-            ? "list"
-            : "search",
-      );
-    }
-    refreshFooter();
+    return providerDetailLines(row.group, record, {
+      width,
+      now,
+      retryInSeconds: refreshWaitSeconds(record, data, now),
+      serverAvailable: data.catalog !== undefined,
+    });
   }
 
-  function refreshSummary(): void {
-    const summary = projection.summary;
-    const providerPart = multiProvider
-      ? ` · ${plural(summary.providerCount, "provider")}`
-      : "";
-    const noticePart = notice ? ` · ${notice}` : "";
-    renderer.set(
-      summaryText,
-      "content",
-      bounded(
-        `Model Scout${noticePart} · ${summary.visibleModels}/${summary.totalModels} models${providerPart} · ${summary.missingCoreCount} missing core`,
-        textWidth,
+  function paintPane(keepOffset = false): void {
+    const current = screen();
+    const split =
+      current === "list" && layout.wide && projection.rows.length > 0;
+    const visible =
+      current !== "filters" &&
+      (current !== "list" || split || projection.rows.length === 0);
+    if (!visible) return;
+    const width = split ? layout.paneWidth : layout.width;
+    const key = `${current}\u0000${list.selected()?.row.key ?? ""}`;
+    pane.setLines(paneLines(width), keepOffset || key === paneKey);
+    paneKey = key;
+  }
+
+  function cardLines(width: number): Line[] {
+    const lines: Line[] = [[]];
+    const indent = (line: Line): Line => [
+      { text: "   ", role: "base" },
+      ...line,
+    ];
+    const add = (body: string, role: ForegroundRole = "base"): void => {
+      for (const line of paragraph(body, width - 3, role))
+        lines.push(indent(line));
+    };
+    if (data.status === "loading") {
+      add("○ Reading models from OpenCode and scout…", "info");
+      return lines;
+    }
+    if (data.status === "failed") {
+      add("▲ Could not load models from OpenCode.", "error");
+      if (data.error) add(data.error, "muted");
+      lines.push([]);
+      add("r retries.", "base");
+      return lines;
+    }
+    const inScope =
+      scope.kind === "all"
+        ? data.groups.length > 0
+        : data.groups.some((group) => group.id === scope.providerID);
+    if (!inScope) {
+      if (scope.kind === "provider") {
+        add("No models from this provider yet.", "muted");
+        return lines;
+      }
+      add("No OpenAI-compatible providers found.", "base");
+      lines.push([]);
+      if (actions.actualyze)
+        lines.push(
+          ...labeledCard(
+            "Actualyze",
+            "press a to connect an API key (opens /actualyze)",
+            width,
+          ),
+        );
+      lines.push(
+        ...labeledCard(
+          "Other servers",
+          "add a provider with settings.baseURL to opencode.json, for example vLLM, LiteLLM, or a local server, under your own provider ID. The README lists the supported servers.",
+          width,
+        ),
+      );
+      return lines;
+    }
+    if (!hasNarrowing(nav) && scope.kind === "provider") {
+      const group = data.groups.find((item) => item.id === scope.providerID);
+      if (group)
+        add(
+          noteText(
+            group,
+            findRecord(data, group.id),
+            projection.embeddingsHidden,
+          ),
+          "muted",
+        );
+      return lines;
+    }
+    const query = nav.query.trim();
+    add(
+      query
+        ? `No models match "${query}" with these filters.`
+        : "No models match these filters.",
+      "muted",
+    );
+    add("x clears search and filters · f changes filters", "muted");
+    return lines;
+  }
+
+  function labeledCard(label: string, value: string, width: number): Line[] {
+    const labelColumns = 17;
+    return paragraph(value, Math.max(8, width - labelColumns), "base").map(
+      (line, index) => [
+        {
+          text: padText(index === 0 ? `   ${label}` : "", labelColumns),
+          role: "muted",
+        },
+        ...line,
+      ],
+    );
+  }
+
+  function paintFilters(): void {
+    const fields = filterFields(scope);
+    const previous = filterList.selected()?.row.key;
+    const matching = projection.visibleModels;
+    const rows: ListRow[] = [
+      {
+        key: "title",
+        selectable: false,
+        segments: [
+          {
+            text: `Filters · ${matching} matching ${matching === 1 ? "model" : "models"} · applied as you change them`,
+            role: "muted",
+          },
+        ],
+      },
+      { key: "gap", selectable: false, segments: [] },
+      ...fields.map((field) => ({
+        key: field,
+        segments: [
+          { text: "   ", role: "base" as const },
+          { text: padText(FILTER_LABELS[field], 30), role: "muted" as const },
+          {
+            text: filterValue(nav.filters, field, data.groups),
+            role: "base" as const,
+          },
+        ],
+      })),
+    ];
+    filterList.setRows(rows);
+    if (previous) filterList.select(previous);
+    else if (fields[0]) filterList.select(fields[0]);
+  }
+
+  function headerSegments(): Segment[] {
+    const left: Segment[] = [{ text: title, role: "base" }];
+    if (data.status === "loading")
+      return justify(left, [{ text: "○ loading", role: "info" }], layout.width);
+    if (data.status === "failed")
+      return justify(
+        left,
+        [{ text: "▲ OpenCode lists unavailable", role: "error" }],
+        layout.width,
+      );
+    const right: Segment[] = [];
+    if (scope.kind === "all")
+      right.push({
+        text: `${projection.providerCount} ${projection.providerCount === 1 ? "provider" : "providers"} · `,
+        role: "muted",
+      });
+    right.push({
+      text: `${projection.totalModels} ${projection.totalModels === 1 ? "model" : "models"}`,
+      role: "muted",
+    });
+    if (projection.attention > 0)
+      right.push(
+        { text: " · ", role: "muted" },
+        { text: `${projection.attention} needs attention`, role: "warn" },
+      );
+    if (projection.discovering > 0)
+      right.push(
+        { text: " · ", role: "muted" },
+        { text: "○ checking", role: "info" },
+      );
+    return justify(left, right, layout.width);
+  }
+
+  function filterSegments(): Segment[] {
+    const compact = !layout.wide;
+    const summary = filterSummary(
+      nav,
+      scope,
+      data.groups,
+      projection.embeddingsHidden,
+      compact,
+    );
+    const narrowing = hasNarrowing(nav);
+    return justify(
+      [{ text: `Filters: ${summary}`, role: "muted" }],
+      [
+        { text: `sort ${SORT_NAMES[nav.sort]} · `, role: "muted" },
+        { text: "clear", role: narrowing ? "base" : "disabled" },
+        { text: " ", role: "base" },
+        { text: "x", role: narrowing ? "key" : "disabled" },
+      ],
+      layout.width,
+    );
+  }
+
+  function noticeSegments(): Segment[] {
+    if (notice) return [{ text: notice.text, role: notice.role }];
+    if (data.status === "ready" && data.serverNotice)
+      return [
+        {
+          text: `▲ ${data.serverNotice}. Showing OpenCode's model list.`,
+          role: "warn",
+        },
+      ];
+    if (
+      data.catalog?.status === "pending" &&
+      data.catalog.providers.length === 0
+    )
+      return [{ text: "○ Discovery is starting", role: "info" }];
+    return [];
+  }
+
+  function paintSummary(): void {
+    if (layout.wide || screen() !== "list") return;
+    const row = selectedRow();
+    paintLine(
+      summaryLine,
+      row?.model
+        ? modelSummaryLine(row.model)
+        : row
+          ? [
+              { text: row.group.provider, role: "base" },
+              {
+                text: row.group.endpoint ? ` · ${row.group.endpoint}` : "",
+                role: "muted",
+              },
+            ]
+          : [],
+    );
+  }
+
+  function paintChrome(): void {
+    paintLine(header, headerSegments());
+    paintLine(
+      slash,
+      [{ text: "/", role: focus === "search" ? "field" : "faint" }],
+      3,
+    );
+    const colors = palette();
+    renderer.set(search, "textColor", colors.base);
+    renderer.set(search, "focusedTextColor", colors.field);
+    renderer.set(search, "focusedBackgroundColor", colors.fieldBg);
+    renderer.set(search, "placeholderColor", colors.muted);
+    paintLine(filterLine, filterSegments());
+    paintLine(noticeLine, noticeSegments());
+    paintSeparator();
+    paintSummary();
+    paintFooter();
+  }
+
+  function paintFooter(): void {
+    paintLine(
+      footer,
+      footerSegments(
+        footerHints(),
+        layout.width,
+        focus !== "search" && screen() !== "help",
       ),
     );
   }
 
-  function update(next: readonly ProviderGroup[], nextNotice?: string): void {
-    groups = next;
-    notice = nextNotice;
-    browserIndex = buildBrowserIndex(groups, textWidth);
-    multiProvider = groups.length > 1;
-    if (
-      state.facets.provider !== "all" &&
-      !groups.some((group) => group.id === state.facets.provider)
-    )
-      state = reduceBrowserState(state, {
-        type: "facets",
-        facets: { ...state.facets, provider: "all" },
-      });
-    if (
-      state.screen === "detail" &&
-      !projectBrowser(
-        groups,
-        state.query,
-        state.facets,
-        browserIndex,
-      ).items.some((item) => item.key === state.selected)
-    )
-      state = reduceBrowserState(state, { type: "show", screen: "list" });
-    refresh();
+  // ── Hints and help ────────────────────────────────────────────────────
+
+  function pickerBlocked(row: BrowserRow): string | undefined {
+    const model = row.model;
+    if (!model) return "Select a model to open the picker";
+    if (model.type === "embedding")
+      return "Embedding model; not in the chat picker";
+    if (!data.hostListed.has(qualifiedID(row.group.id, model.id)))
+      return "Not in OpenCode's model list yet";
+    if (!model.enabled) return "Hidden from OpenCode's model picker";
+    return undefined;
   }
 
-  function returnToListFocus(): void {
-    focus(
-      projection.items.length > 0 || canRecoverFacetEmptyList()
-        ? "list"
-        : "search",
-    );
+  function extraHints(): FooterHint[] {
+    return extraActions.map((action) => ({
+      title: action.title,
+      key: action.key,
+      enabled: action.enabled?.() ?? true,
+    }));
+  }
+
+  function footerHints(): FooterHint[] {
+    const discovery = data.catalog !== undefined;
+    const row = selectedRow();
+    const current = screen();
+    if (focus === "search" && current === "list")
+      return [{ title: "results", key: "enter" }];
+    switch (current) {
+      case "help":
+        return [{ title: "back", key: "backspace" }];
+      case "filters":
+        return [
+          { title: "change", key: "←/→" },
+          { title: "clear", key: "x", enabled: hasNarrowing(nav) },
+          { title: "back", key: "backspace" },
+        ];
+      case "evidence":
+        return [
+          { title: "back", key: "backspace" },
+          { title: "copy", key: "y" },
+        ];
+      case "detail":
+        return detailHints(row, discovery);
+      case "list":
+        break;
+    }
+    if (focus === "pane") return detailHints(row, discovery);
+    if (data.status === "loading") return [];
+    if (data.status === "failed") return [{ title: "retry", key: "r" }];
+    if (projection.rows.length === 0) {
+      const hints: FooterHint[] = [];
+      if (hasNarrowing(nav))
+        hints.push(
+          { title: "clear", key: "x" },
+          { title: "filters", key: "f" },
+        );
+      else if (actions.actualyze)
+        hints.push({ title: "connect Actualyze", key: "a" });
+      return [...hints, ...extraHints()];
+    }
+    if (row?.kind === "provider") {
+      const collapsed = nav.collapsed.includes(row.group.id);
+      return [
+        { title: "details", key: "enter" },
+        collapsed
+          ? { title: "expand", key: "→" }
+          : { title: "collapse", key: "←" },
+        { title: "refresh", key: "r", enabled: discovery },
+        { title: "filters", key: "f" },
+        { title: "evidence", key: "d" },
+        { title: "sort", key: "s" },
+        { title: "search", key: "/" },
+        ...extraHints(),
+      ];
+    }
+    return [
+      { title: "details", key: "enter" },
+      {
+        title: "picker",
+        key: "m",
+        enabled: row !== undefined && pickerBlocked(row) === undefined,
+      },
+      { title: "copy", key: "y" },
+      { title: "refresh", key: "r", enabled: discovery },
+      { title: "filters", key: "f" },
+      { title: "evidence", key: "d" },
+      { title: "sort", key: "s" },
+      { title: "search", key: "/" },
+      ...extraHints(),
+    ];
+  }
+
+  function detailHints(
+    row: BrowserRow | undefined,
+    discovery: boolean,
+  ): FooterHint[] {
+    return [
+      { title: "back", key: "backspace" },
+      ...(row?.model
+        ? [
+            {
+              title: "picker",
+              key: "m",
+              enabled: pickerBlocked(row) === undefined,
+            },
+          ]
+        : []),
+      { title: "copy", key: "y" },
+      { title: "evidence", key: "d" },
+      { title: "refresh", key: "r", enabled: discovery },
+      ...extraHints(),
+    ];
+  }
+
+  function helpTitle(): string {
+    const below = screens[screens.length - 2] ?? "list";
+    const view =
+      below === "filters"
+        ? "filters"
+        : below === "evidence"
+          ? "evidence"
+          : below === "detail"
+            ? "details"
+            : "list";
+    return `Keys · ${title} ${view}`;
+  }
+
+  function helpEntries(): HelpEntry[] {
+    const below = screens[screens.length - 2] ?? "list";
+    const common: HelpEntry[] = [
+      { keys: "?", action: "this list; backspace or ? returns" },
+      { keys: "esc", action: "close" },
+    ];
+    if (below === "filters")
+      return [
+        { keys: "↑ ↓", action: "choose a filter" },
+        {
+          keys: "← → enter space",
+          action: "change it; the list updates as you go",
+        },
+        { keys: "x", action: "clear search and filters" },
+        { keys: "backspace f", action: "back to the list" },
+        ...common,
+      ];
+    if (below === "evidence")
+      return [
+        { keys: "↑ ↓ pgup pgdn", action: "scroll" },
+        { keys: "y / Y", action: "copy provider/model / the raw model ID" },
+        { keys: "backspace", action: "back" },
+        ...common,
+      ];
+    const entries: HelpEntry[] = [
+      {
+        keys: "↑ ↓ pgup pgdn home end",
+        action: below === "detail" ? "scroll" : "move",
+      },
+      {
+        keys: "enter",
+        action: layout.wide
+          ? "details; in the pane, ↑ ↓ scroll"
+          : "details of a model or provider",
+      },
+      ...(scope.kind === "all"
+        ? [{ keys: "← →", action: "collapse or expand a provider" }]
+        : []),
+      {
+        keys: "/",
+        action:
+          "search name, ID, family, provider; enter or ↓ returns to the list",
+      },
+      { keys: "f", action: "filters: provider, type, needs, priced" },
+      { keys: "x", action: "clear search and filters" },
+      { keys: "s", action: "sort: name, context, input price, output price" },
+      { keys: "d", action: "evidence: where each value comes from" },
+      {
+        keys: "m",
+        action: "open OpenCode's model picker (replaces this dialog)",
+      },
+      { keys: "y / Y", action: "copy provider/model / the raw model ID" },
+      { keys: "r", action: "refresh the selected provider's discovery" },
+      ...(scope.kind === "all"
+        ? [{ keys: "R", action: "refresh every provider" }]
+        : []),
+      ...(actions.actualyze ? [{ keys: "a", action: "open /actualyze" }] : []),
+      ...extraActions.map((action) => ({
+        keys: action.key,
+        action: action.title,
+      })),
+      { keys: "backspace", action: "back from details, evidence, or filters" },
+      ...common,
+    ];
+    return entries;
+  }
+
+  // ── Updates ───────────────────────────────────────────────────────────
+
+  function setQuery(value: string): void {
+    if (value === nav.query) return;
+    nav = { ...nav, query: value };
+    emitNav();
+    refreshList();
+  }
+
+  function setNav(next: NavState): void {
+    nav = next;
+    emitNav();
+    refreshList();
+  }
+
+  function refreshList(): void {
+    setRows();
+    applyScreen(true);
+  }
+
+  // ── Keys ──────────────────────────────────────────────────────────────
+
+  function apply(action: BrowserAction): boolean {
+    const row = selectedRow();
+    const current = screen();
+    switch (action.type) {
+      case "move":
+        if (current === "filters") filterList.move(action.move);
+        else if (projection.rows.length > 0) list.move(action.move);
+        return true;
+      case "scroll":
+        pane.scroll(action.move);
+        return true;
+      case "open":
+        if (!row) return false;
+        if (layout.wide) setFocus("pane");
+        else pushScreen("detail");
+        return true;
+      case "back":
+        if (current === "list" && focus === "pane") {
+          setFocus("list");
+          return true;
+        }
+        if (current === "list") return false;
+        popScreen();
+        if (screen() === "list") setFocus(focus === "pane" ? "pane" : "list");
+        return true;
+      case "collapse":
+      case "expand": {
+        if (scope.kind !== "all" || !row) return false;
+        const id = row.group.id;
+        const collapse = action.type === "collapse";
+        if (collapse === nav.collapsed.includes(id)) {
+          if (collapse && row.model) list.select(providerKey(id));
+          return true;
+        }
+        const collapsed = collapse
+          ? [...nav.collapsed, id]
+          : nav.collapsed.filter((item) => item !== id);
+        setNav({ ...nav, collapsed, selected: { providerID: id } });
+        list.select(providerKey(id));
+        return true;
+      }
+      case "focus-search":
+        screens = ["list"];
+        applyScreen();
+        setFocus("search");
+        return true;
+      case "leave-search":
+        setFocus("list");
+        return true;
+      case "filters":
+        pushScreen("filters");
+        return true;
+      case "filter-change": {
+        const field = filterList.selected()?.row.key as FilterField | undefined;
+        if (!field) return true;
+        const ids = data.groups.map((group) => group.id);
+        setNav({
+          ...nav,
+          filters: cycleFilter(nav.filters, field, action.direction, ids),
+        });
+        return true;
+      }
+      case "clear":
+        renderer.set(search, "value", "");
+        setNav({ ...nav, query: "", filters: { ...DEFAULT_FILTERS } });
+        return true;
+      case "sort":
+        setNav({ ...nav, sort: nextSort(nav.sort) });
+        return true;
+      case "evidence":
+        if (!row) return false;
+        pushScreen("evidence");
+        return true;
+      case "picker": {
+        if (!row) return false;
+        const blocked = pickerBlocked(row);
+        if (blocked) {
+          actions.notify({ text: blocked, role: "muted" });
+          return true;
+        }
+        actions.picker();
+        return true;
+      }
+      case "refresh":
+        if (data.status === "failed") {
+          actions.retry();
+          return true;
+        }
+        if (!data.catalog) {
+          actions.notify({
+            text: "Refresh needs scout's server half, which did not answer",
+            role: "warn",
+          });
+          return true;
+        }
+        actions.refresh(
+          scope.kind === "provider" ? scope.providerID : row?.group.id,
+        );
+        return true;
+      case "refresh-all":
+        if (data.status === "failed") {
+          actions.retry();
+          return true;
+        }
+        if (!data.catalog) {
+          actions.notify({
+            text: "Refresh needs scout's server half, which did not answer",
+            role: "warn",
+          });
+          return true;
+        }
+        actions.refresh(
+          scope.kind === "provider" ? scope.providerID : undefined,
+        );
+        return true;
+      case "actualyze":
+        if (!actions.actualyze) return false;
+        actions.actualyze();
+        return true;
+      case "copy":
+        if (!row) return false;
+        actions.copy(
+          row.model
+            ? action.what === "qualified"
+              ? qualifiedID(row.group.id, row.model.id)
+              : row.model.id
+            : row.group.id,
+        );
+        return true;
+      case "help":
+        pushScreen("help");
+        return true;
+      case "extra": {
+        const extra = extraActions.find((item) => item.key === action.key);
+        if (!extra || extra.enabled?.() === false) return false;
+        extra.run();
+        return true;
+      }
+    }
   }
 
   const onKeyPress = (key: KeyEvent): void => {
-    if (hasCommandModifier(key)) return;
-    const name = key.name.toLowerCase();
-    const slash = name === "/" || name === "slash" || key.sequence === "/";
-    if (slash && state.focus !== "search") {
-      if (state.screen === "detail") {
-        state = reduceBrowserState(state, { type: "show", screen: "list" });
-        refresh();
-      }
-      focus("search");
-      consumeKey(key);
+    if (disposed) return;
+    const action = routeKey({ screen: screen(), focus, extraKeys }, key);
+    if (!action) return;
+    if (action.type === "actualyze" && !actions.actualyze) return;
+    if (HANDOFF_ACTIONS.has(action.type)) {
+      consume(key);
+      apply(action);
       return;
     }
-
-    const backspace =
-      name === "backspace" || key.sequence === "\b" || key.sequence === "\x7f";
-    if (backspace && state.screen === "detail") {
-      state = reduceBrowserState(state, { type: "show", screen: "list" });
-      refresh();
-      returnToListFocus();
-      consumeKey(key);
-      return;
-    }
-
-    if (
-      state.screen === "list" &&
-      state.focus === "search" &&
-      (name === "up" || name === "down") &&
-      visibleFocusTargets().includes("list")
-    ) {
-      if (projection.items.length > 0) {
-        const selection = resolveSelection(projection, state.selected);
-        const direction = name === "down" ? 1 : -1;
-        const index = Math.max(
-          0,
-          Math.min(projection.items.length - 1, selection.index + direction),
-        );
-        const item = projection.items[index];
-        if (item)
-          state = reduceBrowserState(state, {
-            type: "highlight",
-            key: item.key,
-          });
-        // Real OpenTUI emits onChange here; state is already synchronized so
-        // the callback is idempotent rather than a second explicit selection.
-        renderer.setSelectedIndex(list, index);
-      }
-      // With zero items the list is still the facet-empty recovery target:
-      // move focus there so the facet shortcuts and `r` become reachable.
-      focus("list");
-      consumeKey(key);
-      return;
-    }
-
-    if (state.focus === "search") return;
-    if (name === "r" && (key.shift || key.sequence === "R")) {
-      if (!onRefresh) return;
-      onRefresh();
-      consumeKey(key);
-      return;
-    }
-    const shortcut: Partial<Record<string, BrowserFacetKey>> = {
-      ...(multiProvider ? { p: "provider" as const } : {}),
-      t: "type",
-      c: "capability",
-      s: "capabilityState",
-      m: "metadata",
-      ...(projection.originFilterAvailable ? { o: "origin" as const } : {}),
-    };
-    if (name === "r") {
-      state = reduceBrowserState(state, {
-        type: "facets",
-        facets: INITIAL_BROWSER_FACETS,
-      });
-      refresh();
-      returnToListFocus();
-      consumeKey(key);
-      return;
-    }
-    const facet = shortcut[name];
-    if (!facet) return;
-    state = reduceBrowserState(state, {
-      type: "facets",
-      facets: cycleBrowserFacet(
-        state.facets,
-        facet,
-        groups,
-        projection.originFilterAvailable,
-      ),
-    });
-    refresh();
-    returnToListFocus();
-    consumeKey(key);
+    if (apply(action)) consume(key);
   };
 
-  refresh();
-  focus(state.focus);
-  keyInput.on("keypress", onKeyPress);
-  let disposed = false;
+  const onResize = (): void => {
+    if (!disposed) relayout();
+  };
+
+  options.keyInput.on("keypress", onKeyPress);
+  terminal.on("resize", onResize);
+
+  setRows();
+  applyScreen();
+  setFocus("list");
+
   return {
     root,
-    state: () => state,
-    update: (next, nextNotice) => {
-      if (!disposed) update(next, nextNotice);
+    update(next) {
+      data = next;
+      setRows();
+      // A detail or evidence screen whose subject disappeared returns to the list.
+      if (
+        (screens.includes("detail") || screens.includes("evidence")) &&
+        !selectedRow()
+      )
+        screens = ["list"];
+      applyScreen(true);
     },
-    setNotice: (next) => {
-      if (disposed) return;
+    setNotice(next) {
       notice = next;
-      refreshSummary();
+      paintLine(noticeLine, noticeSegments());
     },
-    dispose: () => {
+    tick() {
+      paintPane(true);
+      list.repaint();
+      paintChrome();
+    },
+    screen,
+    focus: () => focus,
+    dispose() {
       if (disposed) return;
       disposed = true;
-      keyInput.off("keypress", onKeyPress);
+      options.keyInput.off("keypress", onKeyPress);
+      terminal.off("resize", onResize);
     },
   };
 }
