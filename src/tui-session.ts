@@ -406,6 +406,8 @@ export interface BrowserFrameTools {
   notify(notice: BrowserNotice): void;
   /** Read the frame again after its own state changed. */
   repaint(): void;
+  /** Read OpenCode's lists and scout's catalog again, saying so in the notice line. */
+  reload(): void;
 }
 
 export interface OpenBrowserOptions {
@@ -743,10 +745,16 @@ function startSession(
       });
   };
 
+  const retry = (): void => {
+    transient("○ Reading models from OpenCode again…", "info");
+    scheduleReload();
+  };
+
   const frame = options.frame?.({
     copy,
     notify: (next) => transient(next.text, next.role),
     repaint: () => view?.refreshFrame(),
+    reload: retry,
   });
 
   /**
@@ -810,10 +818,7 @@ function startSession(
         actions: {
           picker: () => context.keymap.dispatch("model.list"),
           refresh: (providerID) => void refresh(providerID),
-          retry: () => {
-            transient("○ Reading models from OpenCode again…", "info");
-            scheduleReload();
-          },
+          retry,
           copy,
           notify: (next) => transient(next.text, next.role),
           ...(options.actualyze ? { actualyze: options.actualyze } : {}),

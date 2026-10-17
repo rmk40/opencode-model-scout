@@ -92,6 +92,15 @@ function pane(root: unknown): string {
     .join("\n");
 }
 
+function line(root: unknown, id: string): string {
+  return textOf(findNodeById(root, id)).trimEnd();
+}
+
+/** Let queued microtasks and pending continuations run. */
+async function settle(): Promise<void> {
+  for (let index = 0; index < 5; index += 1) await Promise.resolve();
+}
+
 function rootHeight(root: unknown): unknown {
   return findNodeById(root, "modelscout-browser")?.props?.height;
 }
@@ -302,6 +311,9 @@ function harness(initial: State = NO_KEY) {
     async (_input: unknown, _options: unknown): Promise<void> => undefined,
   );
   const dispatch = vi.fn();
+  /** Unsubscribes of the session's fact events; four per session. */
+  const stopFacts = vi.fn();
+  const catalog = vi.fn(async (): Promise<unknown> => state.catalog);
   const integration = () => ({
     id: "actualyze",
     name: "Actualyze",
@@ -317,7 +329,10 @@ function harness(initial: State = NO_KEY) {
   const context = {
     location: PROJECT as { directory: string },
     data: {
-      on: vi.fn(() => () => {}),
+      // The browser's own `model.updated` subscription is not a fact event.
+      on: vi.fn((type: string) =>
+        type === "model.updated" ? () => {} : stopFacts,
+      ),
       location: {
         default: () => PROJECT,
         integration: {
@@ -334,7 +349,7 @@ function harness(initial: State = NO_KEY) {
     },
     client: {
       rpc: vi.fn(() => ({
-        catalog: vi.fn(async () => state.catalog),
+        catalog,
         refresh: vi.fn(async () => ({ accepted: true })),
         events: {
           on: vi.fn((name: string, handler: (event: unknown) => void) => {
@@ -396,6 +411,9 @@ function harness(initial: State = NO_KEY) {
     toast,
     connectKey,
     dispatch,
+    stopFacts,
+    catalog,
+    copied: context.renderer.copyToClipboardOSC52,
     openModelScout,
     root: () => root,
     current: () => open,
@@ -469,10 +487,9 @@ describe("plugin unload while the key prompt is open", () => {
     const shows = h.dialog.show.mock.calls.length;
 
     closeActualyze(h.plugin);
+    await settle();
     expect(h.dialog.clear).toHaveBeenCalledOnce();
     expect(h.current()).toBeUndefined();
-    await Promise.resolve();
-    await Promise.resolve();
     expect(h.connectKey).not.toHaveBeenCalled();
     expect(h.dialog.show.mock.calls.length).toBe(shows);
     expect(h.toast.show).not.toHaveBeenCalled();
@@ -505,8 +522,128 @@ describe("plugin unload while the key prompt is open", () => {
     await Promise.resolve();
     h.dialog.clear.mockClear();
     closeActualyze(h.plugin);
+    await settle();
     expect(h.dialog.clear).not.toHaveBeenCalled();
     expect(h.current()?.render()).toBe("other");
+  });
+
+  it("leaves a dialog that replaced the prompt in the same tick as the cleanup alone", async () => {
+    const h = harness();
+    await openedAt(h, /Connect an Actualyze API key/);
+    h.press("k");
+    h.dialog.clear.mockClear();
+    // No await between: the prompt has settled, but its continuation has not run.
+    h.dialog.show(() => "other");
+    closeActualyze(h.plugin);
+    await settle();
+    expect(h.dialog.clear).not.toHaveBeenCalled();
+    expect(h.current()?.render()).toBe("other");
+    expect(h.toast.show).not.toHaveBeenCalled();
+  });
+});
+
+describe("the key prompt's answer", () => {
+  it("ends the session without showing the dialog again when the prompt is cancelled", async () => {
+    const h = harness();
+    await openedAt(h, /Connect an Actualyze API key/);
+    h.press("k");
+    const shows = h.dialog.show.mock.calls.length;
+    h.submitPrompt(undefined);
+    await settle();
+    expect(h.dialog.show.mock.calls.length).toBe(shows);
+    expect(h.stopFacts).toHaveBeenCalledTimes(4);
+    expect(h.connectKey).not.toHaveBeenCalled();
+  });
+
+  it("ends the session when another dialog replaced the prompt, and leaves that dialog open", async () => {
+    const h = harness();
+    await openedAt(h, /Connect an Actualyze API key/);
+    h.press("k");
+    const shows = h.dialog.show.mock.calls.length;
+    h.dialog.show(() => "other");
+    await settle();
+    expect(h.dialog.show.mock.calls.length).toBe(shows + 1);
+    expect(h.current()?.render()).toBe("other");
+    expect(h.stopFacts).toHaveBeenCalledTimes(4);
+  });
+
+  it("shows the dialog again unchanged after an empty answer", async () => {
+    const h = harness();
+    await openedAt(h, /Connect an Actualyze API key/);
+    const before = pane(h.root());
+    h.press("k");
+    const shows = h.dialog.show.mock.calls.length;
+    h.submitPrompt("   ");
+    await vi.waitFor(() =>
+      expect(h.dialog.show.mock.calls.length).toBe(shows + 1),
+    );
+    await vi.waitFor(() => expect(pane(h.root())).toBe(before));
+    expect(h.connectKey).not.toHaveBeenCalled();
+    expect(h.stopFacts).not.toHaveBeenCalled();
+  });
+
+  it("shows the save as unconfirmed when OpenCode does not answer within 15 s", async () => {
+    const h = harness();
+    h.connectKey.mockReturnValueOnce(new Promise<void>(() => {}));
+    await openedAt(h, /Connect an Actualyze API key/);
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      await submitKey(h);
+      await vi.waitFor(() => expect(pane(h.root())).toMatch(/Saving key/));
+      await vi.advanceTimersByTimeAsync(14_000);
+      expect(pane(h.root())).toMatch(/Saving key/);
+      await vi.advanceTimersByTimeAsync(1_500);
+      await vi.waitFor(() =>
+        expect(pane(h.root())).toMatch(
+          /OpenCode did not confirm the key was saved/,
+        ),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("y", () => {
+  it("copies the card's link on a card and the model ID in the list", async () => {
+    const h = harness();
+    await openedAt(h, /Connect an Actualyze API key/);
+    h.press("y");
+    expect(h.copied).toHaveBeenLastCalledWith(
+      "https://app.actualyze.ai/account/settings?tab=security",
+    );
+
+    h.setState(READY);
+    h.emitRpc("updated");
+    await vi.waitFor(() => expect(rootHeight(h.root())).toBe(FULL_HEIGHT));
+    h.press("y");
+    expect(h.copied).toHaveBeenLastCalledWith("actualyze/claude-haiku");
+  });
+});
+
+describe("a base URL that is not http(s)", () => {
+  it("offers no links and never falls back to production", async () => {
+    const h = harness({
+      ...NO_KEY,
+      hostProviders: [
+        { ...actualyzeProvider, settings: { baseURL: "ftp://gw.example/v1" } },
+      ],
+    });
+    await openedAt(h, /Connect an Actualyze API key/);
+    await vi.waitFor(() =>
+      expect(line(h.root(), "modelscout-header")).toMatch(
+        /settings\.baseURL is not a URL/,
+      ),
+    );
+    expect(pane(h.root())).not.toMatch(/https?:\/\//);
+    expect(line(h.root(), "modelscout-footer")).not.toMatch(/copy link/);
+    h.press("y");
+    h.press("l");
+    await vi.waitFor(() => expect(pane(h.root())).toMatch(/No app links/));
+    h.press("y");
+    h.press("return");
+    expect(h.copied).not.toHaveBeenCalled();
+    expect(pane(h.root())).not.toMatch(/app\.actualyze\.ai/);
   });
 });
 
@@ -600,6 +737,17 @@ describe("keys under a card", () => {
 });
 
 describe("cards", () => {
+  it("offers retry r on the server-unavailable card and reads the catalog again with it", async () => {
+    const h = harness();
+    h.catalog.mockRejectedValue({ type: "rpc.unavailable", message: "down" });
+    await openedAt(h, /server half did not answer/);
+    expect(line(h.root(), "modelscout-footer")).toMatch(/retry r/);
+    const reads = h.catalog.mock.calls.length;
+    const event = h.press("r");
+    expect(event.preventDefault).toHaveBeenCalled();
+    await vi.waitFor(() => expect(h.catalog.mock.calls.length).toBe(reads + 1));
+  });
+
   it("explains a 403 without guessing its cause", async () => {
     const h = harness({
       ...READY,

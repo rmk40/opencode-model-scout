@@ -108,6 +108,8 @@ interface Session {
   linkIndex: number;
   /** The link `y` copies from the card on screen, if it offers one. */
   cardLink: ActualyzeLinkID | undefined;
+  /** The card on screen is the server-unavailable card, whose `r` reads the catalog again. */
+  cardReloads: boolean;
   /** The key prompt is open; the dialog it closed keeps the session. */
   prompting: boolean;
   ended: boolean;
@@ -182,16 +184,24 @@ export function closeActualyze(context: Context): void {
   const session = live.get(context);
   if (!session) return;
   const handle = session.handle;
-  // The prompt replaced the dialog, so the handle no longer closes anything.
   const prompting = session.prompting;
   endSession(session);
-  if (prompting) {
+  if (!prompting) {
+    handle?.close();
+    return;
+  }
+  // The prompt replaced the dialog, so the handle no longer closes anything.
+  // A replaced prompt settles at once, but its continuation, which clears
+  // `prompting`, runs as a microtask queued before this one; clearing only
+  // if the flag is still set leaves a dialog that replaced the prompt alone.
+  queueMicrotask(() => {
+    if (!session.prompting) return;
     try {
       context.ui.dialog.clear();
     } catch {
       // A failing clear must not escape the plugin cleanup.
     }
-  } else handle?.close();
+  });
 }
 
 /** End a session whose location changed, closing its dialog if still open. */
@@ -237,6 +247,7 @@ export async function openActualyze(
     links: false,
     linkIndex: 0,
     cardLink: undefined,
+    cardReloads: false,
     prompting: false,
     ended: false,
     handle: undefined,
@@ -488,7 +499,7 @@ function failureCopy(
           retryIn === undefined
             ? "Catalog rate limited (429)"
             : `Catalog rate limited · retry in ${retryIn} s`,
-        body: "This limits the model list only, not inference. Model Scout checks again once the wait ends.",
+        body: "This limits the model list only, not inference. r works once the wait ends; otherwise Model Scout checks again on its next scheduled refresh, or when settings or the key change.",
         role: "warn",
       };
     case "unreachable":
@@ -1024,12 +1035,14 @@ function describeRow(
       const actions = [
         keyAction(view, true),
         connectionsAction(true),
+        // Discovery refresh needs the server half; `r` reads the catalog again.
+        retryAction(refreshWaitSeconds(record, data, now), false),
         LINKS_ACTION,
         BROWSE_ACTION,
       ];
       writer.blank();
       writer.actions(actions);
-      return done(replaceCard(writer, actions, true));
+      return done(replaceCard(writer, actions));
     }
     case "not-managed": {
       const writer = new CardWriter("muted", width);
@@ -1277,6 +1290,13 @@ function routeFrameKey(
   }
   if (plainY && view.card?.placement === "replace" && session.cardLink)
     return () => copyLink(session, session.cardLink);
+  if (
+    key.name === "r" &&
+    !key.shift &&
+    view.card?.placement === "replace" &&
+    session.cardReloads
+  )
+    return () => session.tools?.reload();
   return undefined;
 }
 
@@ -1285,6 +1305,10 @@ function createFrame(session: Session): BrowserFrame {
     const view = viewState(session, data);
     const described = describe(session, view, width, now);
     session.cardLink = described.link;
+    session.cardReloads =
+      !session.links &&
+      view.data.status !== "failed" &&
+      view.state.row === "server-unavailable";
     return described;
   };
   return {
