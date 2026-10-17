@@ -14,12 +14,18 @@ import {
   DEFAULT_FILTERS,
   DEFAULT_NAV,
   filterSummary,
+  filterFields,
   footerSegments,
+  hasNarrowing,
   initialSelection,
+  justify,
+  matchesQuery,
   modelKey,
   modelRowSegments,
+  nextSort,
   projectBrowser,
   providerKey,
+  providerRowSegments,
   refreshWaitSeconds,
   sortModels,
   type BrowserData,
@@ -130,7 +136,7 @@ function keys(projection: ReturnType<typeof projectBrowser>): string[] {
 describe("routeKey", () => {
   const list: RouteContext = { screen: "list", focus: "list" };
 
-  it("leaves every key but enter, up, and down to the focused search input", () => {
+  it("leaves every key but enter and down to the focused search input", () => {
     const search: RouteContext = { screen: "list", focus: "search" };
     expect(routeKey(search, { name: "m", sequence: "m" })).toBeUndefined();
     expect(routeKey(search, { name: "?", sequence: "?" })).toBeUndefined();
@@ -140,8 +146,8 @@ describe("routeKey", () => {
     });
     expect(routeKey(search, { name: "down" })).toEqual({
       type: "leave-search",
-      move: "down",
     });
+    expect(routeKey(search, { name: "up" })).toBeUndefined();
   });
 
   it("runs letter actions from the list", () => {
@@ -587,5 +593,619 @@ describe("readNav", () => {
     expect(
       readNav({ selected: { providerID: "p", modelID: "m" } }).selected,
     ).toEqual({ providerID: "p", modelID: "m" });
+  });
+
+  it("reads back every valid stored field, and a provider-only selection", () => {
+    const stored: NavState = {
+      query: "qwen",
+      filters: {
+        provider: "atlas",
+        type: "embedding",
+        tools: true,
+        images: true,
+        reasoning: true,
+        priced: true,
+        uncertain: true,
+      },
+      sort: "output",
+      collapsed: ["a", "b"],
+      selected: { providerID: "atlas" },
+    };
+    expect(readNav(structuredClone(stored))).toEqual(stored);
+  });
+
+  it("copies stored values out instead of sharing them", () => {
+    const stored = { collapsed: ["a"], filters: { tools: true } };
+    const read = readNav(stored);
+    read.collapsed.push("b");
+    read.filters.tools = false;
+    expect(stored).toEqual({ collapsed: ["a"], filters: { tools: true } });
+  });
+});
+
+const PRICE = (value: number) =>
+  knownScalar(value, "provider-probe", "authoritative");
+
+function priced(
+  id: string,
+  input: number | undefined,
+  output: number | undefined,
+  overrides: Partial<ModelRow> = {},
+): ModelRow {
+  return model(id, {
+    cost: {
+      input: input === undefined ? unknownScalar() : PRICE(input),
+      output: output === undefined ? unknownScalar() : PRICE(output),
+      cacheRead: unknownScalar(),
+      cacheWrite: unknownScalar(),
+    },
+    ...overrides,
+  });
+}
+
+function withInput(
+  id: string,
+  image: CapabilityEvidence,
+  overrides: Partial<ModelRow> = {},
+): ModelRow {
+  return model(id, {
+    inputModalities: {
+      text: unknownCapability(),
+      image,
+      pdf: unknownCapability(),
+      audio: unknownCapability(),
+      video: unknownCapability(),
+    },
+    ...overrides,
+  });
+}
+
+const INFERRED: CapabilityEvidence = {
+  state: "supported",
+  source: "models.dev",
+  strength: "inferred",
+};
+const UNSUPPORTED: CapabilityEvidence = {
+  state: "unsupported",
+  source: "provider-probe",
+  strength: "authoritative",
+};
+
+function text(segments: readonly { text: string }[]): string {
+  return segments.map((segment) => segment.text).join("");
+}
+
+describe("matchesQuery", () => {
+  const atlas = group("atlas-cloud", [], "Atlas");
+  const row = model("qwen3-coder-30b", {
+    name: "Coder Large",
+    family: "qwen3",
+    quantization: "Q4_K_M",
+  });
+
+  it.each([
+    ["the model ID", "coder-30b"],
+    ["the provider ID", "atlas-cloud"],
+    ["the provider name", "ATLAS"],
+    ["the family", "qwen3"],
+    ["the quantization", "q4_k"],
+    ["terms spread over different fields", "large  q4_k_m atlas"],
+  ])("matches %s", (_label, query) => {
+    expect(matchesQuery(atlas, row, query)).toBe(true);
+  });
+
+  it("requires every term to match", () => {
+    expect(matchesQuery(atlas, row, "coder llama")).toBe(false);
+  });
+
+  it("matches everything for a blank query", () => {
+    expect(matchesQuery(atlas, row, "   ")).toBe(true);
+  });
+});
+
+describe("projectBrowser filters", () => {
+  const scope = { scope: ALL, width: 72 };
+
+  it("shows only embeddings with the embedding type and hides no count", () => {
+    const projection = projectBrowser(
+      data([group("p", [model("chat"), model("vec", { type: "embedding" })])]),
+      nav({ filters: { ...DEFAULT_FILTERS, type: "embedding" } }),
+      scope,
+    );
+    expect(keys(projection)).toEqual(["p", "  vec"]);
+    expect(projection.embeddingsHidden).toBe(0);
+    expect(projection.totalModels).toBe(1);
+  });
+
+  it("counts only the hidden embeddings that match the search", () => {
+    const projection = projectBrowser(
+      data([
+        group("p", [
+          model("nomic-embed", { type: "embedding" }),
+          model("bge", { type: "embedding" }),
+          model("nomic-chat"),
+        ]),
+      ]),
+      nav({ query: "nomic" }),
+      scope,
+    );
+    expect(keys(projection)).toEqual(["p", "  nomic-chat"]);
+    expect(projection.embeddingsHidden).toBe(1);
+  });
+
+  it("keeps a needs filter for images, letting inferred support count only with uncertain on", () => {
+    const groups = [
+      group("p", [
+        withInput("seen", CONFIRMED),
+        withInput("guessed", INFERRED),
+        withInput("blind", UNSUPPORTED),
+      ]),
+    ];
+    const strict = nav({ filters: { ...DEFAULT_FILTERS, images: true } });
+    expect(keys(projectBrowser(data(groups), strict, scope))).toEqual([
+      "p",
+      "  seen",
+    ]);
+    const loose = nav({
+      filters: { ...DEFAULT_FILTERS, images: true, uncertain: true },
+    });
+    expect(keys(projectBrowser(data(groups), loose, scope))).toEqual([
+      "p",
+      "  guessed",
+      "  seen",
+    ]);
+  });
+
+  it("keeps a needs filter for reasoning", () => {
+    const thinker = model("thinker", {
+      capabilities: {
+        toolCall: unknownCapability(),
+        reasoning: CONFIRMED,
+        temperature: unknownCapability(),
+      },
+    });
+    const projection = projectBrowser(
+      data([group("p", [thinker, model("plain")])]),
+      nav({ filters: { ...DEFAULT_FILTERS, reasoning: true } }),
+      scope,
+    );
+    expect(keys(projection)).toEqual(["p", "  thinker"]);
+  });
+
+  it("keeps models with either price known under priced only", () => {
+    const projection = projectBrowser(
+      data([
+        group("p", [
+          priced("in-only", 1, undefined),
+          priced("out-only", undefined, 2),
+          model("free"),
+        ]),
+      ]),
+      nav({ filters: { ...DEFAULT_FILTERS, priced: true } }),
+      scope,
+    );
+    expect(keys(projection)).toEqual(["p", "  in-only", "  out-only"]);
+  });
+
+  it("limits the list to the chosen provider and keeps it with a note when nothing matches", () => {
+    const groups = [group("a", [model("one")]), group("b", [model("two")])];
+    const filtered = nav({
+      query: "zzz",
+      filters: { ...DEFAULT_FILTERS, provider: "b" },
+    });
+    const projection = projectBrowser(data(groups), filtered, scope);
+    expect(keys(projection)).toEqual(["b", "note"]);
+    expect(projection.providerCount).toBe(1);
+  });
+
+  it("shows narrowed counts in the provider header", () => {
+    const projection = projectBrowser(
+      data([group("p", [model("alpha"), model("beta")])]),
+      nav({ query: "alpha" }),
+      scope,
+    );
+    expect(text(projection.rows[0]?.segments ?? [])).toMatch(/1\/2 models$/);
+  });
+
+  it("marks the current model in its row", () => {
+    const projection = projectBrowser(
+      data([group("p", [model("alpha"), model("beta")])]),
+      nav(),
+      { ...scope, current: { providerID: "p", modelID: "beta" } },
+    );
+    const marked = projection.rows
+      .filter((row) => row.kind === "model")
+      .map((row) => row.segments[1]?.text);
+    expect(marked).toEqual([" ", "●"]);
+  });
+
+  it("ignores the provider filter and collapse in a single-provider scope", () => {
+    const groups = [group("a", [model("one")]), group("b", [])];
+    const projection = projectBrowser(
+      data(groups),
+      nav({
+        collapsed: ["a"],
+        filters: { ...DEFAULT_FILTERS, provider: "b" },
+      }),
+      { scope: { kind: "provider", providerID: "a" }, width: 72 },
+    );
+    expect(keys(projection)).toEqual(["  one"]);
+  });
+
+  it("adds no note row for an empty single-provider scope", () => {
+    expect(
+      projectBrowser(data([group("a", [])]), nav(), {
+        scope: { kind: "provider", providerID: "a" },
+        width: 72,
+      }).rows,
+    ).toEqual([]);
+  });
+
+  it("counts providers that are discovering", () => {
+    const payload = catalog([record("a", { discovering: true }), record("b")]);
+    expect(
+      projectBrowser(
+        data([group("a", []), group("b", [])], payload),
+        nav(),
+        scope,
+      ).discovering,
+    ).toBe(1);
+  });
+});
+
+describe("projectBrowser notes for empty providers", () => {
+  const note = (
+    providerGroup: ProviderGroup,
+    providerRecord?: CatalogProviderRecord,
+    state: NavState = nav(),
+  ): string | undefined =>
+    projectBrowser(
+      data(
+        [providerGroup],
+        providerRecord ? catalog([providerRecord]) : undefined,
+      ),
+      state,
+      { scope: ALL, width: 72 },
+    )
+      .rows.find((row) => row.kind === "note")
+      ?.segments[0]?.text.trim();
+
+  it.each([
+    [
+      "hidden embeddings",
+      group("p", [model("vec", { type: "embedding" })]),
+      undefined,
+      "1 embedding model hidden; f shows them",
+    ],
+    [
+      "a running discovery",
+      group("p", []),
+      record("p", { discovering: true, lastGoodAt: null }),
+      "Checking the model list…",
+    ],
+    [
+      "a failure before any success",
+      group("p", []),
+      record("p", {
+        lastGoodAt: null,
+        failure: { kind: "unreachable", at: "2026-10-11T08:00:00.000Z" },
+      }),
+      "No models yet; the model list failed",
+    ],
+    [
+      "a successful empty list",
+      group("p", []),
+      record("p"),
+      "No models returned; r refreshes",
+    ],
+    ["evidence without a record", group("p", []), undefined, "No models yet"],
+    [
+      "no evidence at all",
+      { ...group("p", []), hasEvidence: false },
+      undefined,
+      "No models listed",
+    ],
+  ])("explains %s", (_label, providerGroup, providerRecord, expected) => {
+    expect(note(providerGroup, providerRecord)).toBe(expected);
+  });
+
+  it("is not selectable", () => {
+    const row = projectBrowser(data([group("p", [])]), nav(), {
+      scope: ALL,
+      width: 72,
+    }).rows.find((item) => item.kind === "note");
+    expect(row?.selectable).toBe(false);
+  });
+});
+
+describe("sortModels ties and directions", () => {
+  it("breaks equal names by ID under the name sort", () => {
+    const sorted = sortModels(
+      [model("b", { name: "Same" }), model("a", { name: "Same" })],
+      "name",
+    );
+    expect(sorted.map((item) => item.id)).toEqual(["a", "b"]);
+  });
+
+  it("sorts by output price ascending with ties by name and unknowns last", () => {
+    const sorted = sortModels(
+      [
+        priced("zeta", 9, 2),
+        model("unpriced"),
+        priced("alpha", 1, 2),
+        priced("cheap", 5, 0.5),
+      ],
+      "output",
+    );
+    expect(sorted.map((item) => item.id)).toEqual([
+      "cheap",
+      "alpha",
+      "zeta",
+      "unpriced",
+    ]);
+  });
+
+  it("counts an inferred context as known", () => {
+    const sorted = sortModels(
+      [
+        model("reported", { context: 100_000 }),
+        model("inferred", {
+          context: 300_000,
+          provenance: {
+            context: knownScalar(300_000, "models.dev", "inferred"),
+          },
+        }),
+      ],
+      "context",
+    );
+    expect(sorted.map((item) => item.id)).toEqual(["inferred", "reported"]);
+  });
+
+  it("orders the unknowns by name too", () => {
+    const sorted = sortModels(
+      [model("z", { context: undefined }), model("a", { context: undefined })],
+      "context",
+    );
+    expect(sorted.map((item) => item.id)).toEqual(["a", "z"]);
+  });
+
+  it("leaves the input array as it was", () => {
+    const input = [model("b"), model("a")];
+    sortModels(input, "name");
+    expect(input.map((item) => item.id)).toEqual(["b", "a"]);
+  });
+});
+
+describe("nextSort and hasNarrowing", () => {
+  it("cycles name, context, input price, output price, then name", () => {
+    expect(nextSort("name")).toBe("context");
+    expect(nextSort("context")).toBe("input");
+    expect(nextSort("input")).toBe("output");
+    expect(nextSort("output")).toBe("name");
+  });
+
+  it("counts a non-blank query or any non-default filter as narrowing", () => {
+    expect(hasNarrowing(nav())).toBe(false);
+    expect(hasNarrowing(nav({ query: "  " }))).toBe(false);
+    expect(hasNarrowing(nav({ query: "x" }))).toBe(true);
+    expect(
+      hasNarrowing(nav({ filters: { ...DEFAULT_FILTERS, provider: "a" } })),
+    ).toBe(true);
+    expect(
+      hasNarrowing(nav({ filters: { ...DEFAULT_FILTERS, uncertain: true } })),
+    ).toBe(true);
+    // Sort and collapse are not narrowing.
+    expect(hasNarrowing(nav({ sort: "context", collapsed: ["a"] }))).toBe(
+      false,
+    );
+  });
+});
+
+describe("refreshWaitSeconds edge cases", () => {
+  const payload = catalog([
+    record("a", { nextRefreshAt: "2026-10-11T08:00:10.500Z" }),
+  ]);
+
+  it("rounds a partial second up", () => {
+    const snapshot = data([group("a", [])], payload);
+    expect(
+      refreshWaitSeconds(
+        payload.providers[0],
+        snapshot,
+        Date.parse(payload.generatedAt),
+      ),
+    ).toBe(11);
+  });
+
+  it("is unknown without a catalog", () => {
+    expect(
+      refreshWaitSeconds(payload.providers[0], data([]), Date.now()),
+    ).toBeUndefined();
+  });
+
+  it("uses the payload offset alone when the receipt time is missing", () => {
+    const snapshot: BrowserData = { ...data([]), catalog: payload };
+    expect(refreshWaitSeconds(payload.providers[0], snapshot, Date.now())).toBe(
+      11,
+    );
+  });
+});
+
+describe("initialSelection fallbacks", () => {
+  it("selects the provider header when no model is listed, and nothing for no rows", () => {
+    const rows = projectBrowser(data([group("a", [])]), nav(), {
+      scope: ALL,
+      width: 72,
+    }).rows;
+    expect(initialSelection(rows, undefined)?.key).toBe(providerKey("a"));
+    expect(initialSelection([], undefined)).toBeUndefined();
+  });
+});
+
+describe("row segments", () => {
+  it("shows an embedding model without capabilities and with a muted name", () => {
+    const segments = modelRowSegments(
+      model("vec", {
+        type: "embedding",
+        capabilities: {
+          toolCall: CONFIRMED,
+          reasoning: CONFIRMED,
+          temperature: unknownCapability(),
+        },
+      }),
+      72,
+      false,
+    );
+    expect(text(segments)).toMatch(/^ {3}vec +128K {2}· · · +$/);
+    expect(segments[3]?.role).toBe("muted");
+  });
+
+  it("mutes a model hidden from the picker and leaves an unreported context blank", () => {
+    const segments = modelRowSegments(
+      model("off", { enabled: false, context: undefined }),
+      72,
+      false,
+    );
+    expect(segments[3]?.role).toBe("muted");
+    expect(segments[4]?.text.trim()).toBe("");
+  });
+
+  it("ends provider headers at the same right edge as model rows", () => {
+    const failure = {
+      kind: "unauthorized" as const,
+      at: "2026-10-11T08:00:00.000Z",
+      httpStatus: 401,
+    };
+    for (const width of [58, 72]) {
+      const header = text(
+        providerRowSegments(
+          group("p", [], "Team gateway"),
+          record("p", { failure }),
+          { visible: 3, total: 3 },
+          true,
+          width,
+        ),
+      );
+      expect(header).toHaveLength(width);
+      expect(header).toMatch(/^ ▸ Team gateway +3 models {2}▲ key rejected$/);
+      expect(text(modelRowSegments(priced("m", 3, 15), width, false))).toMatch(
+        new RegExp(`^.{${width - 6}}\\$3/\\$15$`),
+      );
+    }
+  });
+
+  it("shows a singular count and no status without a record", () => {
+    expect(
+      text(
+        providerRowSegments(
+          group("p", []),
+          undefined,
+          { visible: 1, total: 1 },
+          false,
+          40,
+        ),
+      ),
+    ).toMatch(/^ ▾ p +1 model$/);
+  });
+});
+
+describe("filter screen helpers", () => {
+  it("offers the provider field only across every provider", () => {
+    expect(filterFields(ALL)[0]).toBe("provider");
+    expect(filterFields({ kind: "provider", providerID: "a" })).not.toContain(
+      "provider",
+    );
+  });
+
+  it("cycles the type forward through chat, embedding, and all", () => {
+    let filters = DEFAULT_FILTERS;
+    const seen: string[] = [];
+    for (let step = 0; step < 3; step += 1) {
+      filters = cycleFilter(filters, "type", 1, []);
+      seen.push(filters.type);
+    }
+    expect(seen).toEqual(["embedding", "all", "chat"]);
+  });
+
+  it("wraps the provider from the last ID back to all, and from an unknown ID to all", () => {
+    const last = { ...DEFAULT_FILTERS, provider: "b" };
+    expect(cycleFilter(last, "provider", 1, ["a", "b"]).provider).toBe("all");
+    const gone = { ...DEFAULT_FILTERS, provider: "removed" };
+    expect(cycleFilter(gone, "provider", 1, ["a", "b"]).provider).toBe("all");
+  });
+
+  it("names the chosen provider, every flag, and the type in the summary", () => {
+    const state = nav({
+      filters: {
+        provider: "atlas",
+        type: "all",
+        tools: true,
+        images: true,
+        reasoning: true,
+        priced: true,
+        uncertain: true,
+      },
+    });
+    expect(
+      filterSummary(state, ALL, [group("atlas", [], "Atlas Cloud")], 0, false),
+    ).toBe(
+      "all types · Atlas Cloud · tools · images · reasoning · priced · incl. assumed",
+    );
+    expect(filterSummary(state, ALL, [], 0, true)).toMatch(
+      /^all types · atlas/,
+    );
+    expect(filterSummary(nav(), ALL, [], 0, true)).toBe("chat · all");
+  });
+});
+
+describe("footer and justify", () => {
+  it("drops keys ? when asked and shows disabled hints in the disabled role", () => {
+    const segments = footerSegments(
+      [{ title: "picker", key: "m", enabled: false }],
+      40,
+      false,
+    );
+    expect(text(segments)).toMatch(/^picker m +close esc$/);
+    expect(segments[0]).toEqual({ text: "picker", role: "disabled" });
+    expect(segments[2]).toEqual({ text: "m", role: "disabled" });
+  });
+
+  it("keeps keys ? and close esc when no hint fits", () => {
+    expect(
+      text(footerSegments([{ title: "a very long hint title", key: "z" }], 20)),
+    ).toMatch(/^keys \? +close esc$/);
+  });
+
+  it("cuts the left side with an ellipsis to keep the right side whole", () => {
+    const line = text(
+      justify(
+        [{ text: "Model Scout with a long title", role: "base" }],
+        [{ text: "3 models", role: "muted" }],
+        20,
+      ),
+    );
+    expect(line).toHaveLength(20);
+    expect(line).toMatch(/^Model Scou…\s+3 models$/);
+  });
+});
+
+describe("browserLayout bounds", () => {
+  it("falls back to 80x24 for a terminal size it cannot read", () => {
+    expect(browserLayout(Number.NaN, 0)).toEqual(browserLayout(80, 24));
+  });
+
+  it("caps the dialog at 116 columns and 30 content rows", () => {
+    expect(browserLayout(300, 100)).toMatchObject({
+      width: 110,
+      outerWidth: 116,
+      height: 30,
+      paneWidth: 49,
+    });
+  });
+
+  it("keeps a minimum height on a very short terminal", () => {
+    const layout = browserLayout(80, 5);
+    expect(layout.height).toBe(8);
+    expect(layout.bodyHeight).toBe(2);
   });
 });

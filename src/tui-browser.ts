@@ -31,6 +31,7 @@ import {
   padText,
   rowSpans,
   sanitizeInline,
+  sliceColumns,
   textWidth,
   type ListMove,
   type ListRow,
@@ -779,6 +780,10 @@ const MAX_CONTENT_ROWS = 30;
 const CHROME_ROWS = 6;
 /** Row slots of every list and pane; the most body rows the dialog can show. */
 const BODY_CAPACITY = MAX_CONTENT_ROWS;
+/** Most rows a frame's banner above the list takes. */
+const BANNER_CAPACITY = 8;
+/** Fewest list rows a banner leaves. */
+const MIN_LIST_ROWS = 4;
 
 export interface BrowserLayout {
   readonly wide: boolean;
@@ -836,7 +841,12 @@ export function browserLayout(columns: number, rows: number): BrowserLayout {
 
 interface TextPane {
   readonly root: TuiNode<"box">;
-  setLines(lines: readonly Line[], keepOffset?: boolean): void;
+  /** `highlight` lists lines painted as selected; the pane scrolls to show the first. */
+  setLines(
+    lines: readonly Line[],
+    keepOffset?: boolean,
+    highlight?: readonly number[],
+  ): void;
   setViewport(width: number, height: number): void;
   scroll(move: ListMove): void;
   repaint(): void;
@@ -857,6 +867,7 @@ function createTextPane(
   let width = initial.width;
   let height = Math.min(capacity, initial.height);
   let lines: readonly Line[] = [];
+  let highlighted: ReadonlySet<number> = new Set();
   let offset = 0;
   const slots: TuiNode<"text">[] = [];
   for (let index = 0; index < capacity; index += 1)
@@ -888,13 +899,14 @@ function createTextPane(
     for (const [slot, node] of slots.entries()) {
       if (slot >= height) continue;
       const line = lines[offset + slot];
+      const selected = highlighted.has(offset + slot);
       renderer.setStyledText(
         node,
         line
           ? rowSpans({ key: "", segments: line }, colors, width, {
-              selected: false,
-              focused: false,
-              bar: false,
+              selected,
+              focused: selected,
+              bar: selected,
             })
           : [],
       );
@@ -902,9 +914,17 @@ function createTextPane(
   };
   return {
     root,
-    setLines(next, keepOffset = false) {
+    setLines(next, keepOffset = false, highlight = []) {
       lines = next;
+      highlighted = new Set(highlight);
       offset = keepOffset ? Math.min(offset, maxOffset()) : 0;
+      const first = highlight[0];
+      if (first !== undefined) {
+        const last = highlight[highlight.length - 1] ?? first;
+        if (first < offset) offset = first;
+        else if (last >= offset + height)
+          offset = Math.min(maxOffset(), last - height + 1);
+      }
       paint();
     },
     setViewport(nextWidth, nextHeight) {
@@ -947,15 +967,83 @@ export type NoticeRole = "info" | "ok" | "warn" | "error" | "muted";
 export interface BrowserNotice {
   readonly text: string;
   readonly role: NoticeRole;
+  /**
+   * Text shown in full under the notice, cut into lines by column rather
+   * than at spaces, so a long ID or URL stays readable and selectable.
+   */
+  readonly detail?: string;
+}
+
+/** `text` cut into lines of at most `width` columns, by grapheme. */
+export function hardWrap(text: string, width: number): string[] {
+  const columns = Math.max(1, Math.floor(width));
+  const lines: string[] = [];
+  let rest = sanitizeInline(text);
+  while (rest.length > 0) {
+    const line = sliceColumns(rest, columns) || rest.slice(0, 1);
+    lines.push(line);
+    rest = rest.slice(line.length);
+  }
+  return lines;
 }
 
 /** A key a caller adds to the list and detail views, such as `/actualyze`'s `k`. */
 export interface BrowserExtraAction {
   /** One lowercase letter that the browser does not use. */
   readonly key: string;
+  /** Read on every paint, so a getter can change it. */
   readonly title: string;
   readonly enabled?: () => boolean;
+  /** List the hint right after `copy y` instead of after the browser's own hints. */
+  readonly prominent?: boolean;
+  /** The key list's description; defaults to the title. */
+  readonly help?: string;
   readonly run: () => void;
+}
+
+/**
+ * Content a frame shows in place of the list (`replace`), which also hides
+ * search and filters, or as a banner above it (`above`).
+ */
+export interface BrowserFrameCard {
+  readonly placement: "replace" | "above";
+  readonly lines: readonly Line[];
+  /** Lines painted as selected, for a card that lists choices. */
+  readonly highlight?: readonly number[];
+  /** Footer hints while the card replaces the list. */
+  readonly hints?: readonly FooterHint[];
+  /** Key list entries while the card replaces the list. */
+  readonly help?: readonly HelpEntry[];
+  /** Whether `r` and `R` refresh while the card replaces the list. */
+  readonly refresh?: boolean;
+}
+
+/** Where the browser is when a frame sees a key. */
+export interface FrameKeyView {
+  readonly screen: BrowserScreen;
+  readonly focus: BrowserFocus;
+  readonly card: BrowserFrameCard | undefined;
+}
+
+/**
+ * A caller's frame around the browser, such as `/actualyze`'s branded
+ * header and connection cards. Its methods run on every paint.
+ */
+export interface BrowserFrame {
+  /** The header row, in place of the title line. */
+  header(data: BrowserData, width: number): Segment[];
+  /** A status row under the header. */
+  status(data: BrowserData, width: number, now: number): Segment[];
+  card(
+    data: BrowserData,
+    width: number,
+    now: number,
+  ): BrowserFrameCard | undefined;
+  /**
+   * Called before the browser routes a key, except while search has focus.
+   * A returned function runs after the key is consumed.
+   */
+  route?(key: KeyEvent, view: FrameKeyView): (() => void) | undefined;
 }
 
 /** Side effects the view asks its session for. */
@@ -995,6 +1083,7 @@ export interface BrowserViewOptions {
   readonly title?: string;
   readonly searchPlaceholder?: string;
   readonly extraActions?: readonly BrowserExtraAction[];
+  readonly frame?: BrowserFrame;
 }
 
 export interface BrowserView {
@@ -1003,6 +1092,8 @@ export interface BrowserView {
   setNotice(notice: BrowserNotice | undefined): void;
   /** Repaint time-dependent text: relative ages and countdowns. */
   tick(): void;
+  /** Read the frame again after its own state changed. */
+  refreshFrame(): void;
   screen(): BrowserScreen;
   focus(): BrowserFocus;
   dispose(): void;
@@ -1057,8 +1148,14 @@ export function buildBrowserView(
   let disposed = false;
   /** Selection whose details the pane shows, to keep its scroll offset on repaint. */
   let paneKey: string | undefined;
+  const frame = options.frame;
+  /** The frame's card, read again whenever data, layout, or the frame change. */
+  let card: BrowserFrameCard | undefined;
 
   const screen = (): BrowserScreen => screens[screens.length - 1] ?? "list";
+  const replacing = (): boolean => card?.placement === "replace";
+  /** The list screen shows cards instead of rows. */
+  const cardsShown = (): boolean => replacing() || projection.rows.length === 0;
 
   const text = (id: string): TuiNode<"text"> =>
     renderer.create("text", {
@@ -1070,6 +1167,7 @@ export function buildBrowserView(
     });
 
   const header = text("modelscout-header");
+  const statusLine = text("modelscout-status");
   const slash = renderer.create("text", {
     id: "modelscout-slash",
     width: 3,
@@ -1103,6 +1201,13 @@ export function buildBrowserView(
   );
   const filterLine = text("modelscout-filters");
   const noticeLine = text("modelscout-notice");
+  const banner = createTextPane(
+    renderer,
+    "modelscout-banner",
+    BANNER_CAPACITY,
+    { width: layout.width, height: 1 },
+    palette,
+  );
   const list: RowList = createRowList(renderer, {
     id: "modelscout-list",
     capacity: BODY_CAPACITY,
@@ -1165,9 +1270,11 @@ export function buildBrowserView(
       paddingBottom: 1,
     },
     header,
+    statusLine,
     searchRow,
     filterLine,
     noticeLine,
+    banner.root,
     body,
     summaryLine,
     footer,
@@ -1190,8 +1297,9 @@ export function buildBrowserView(
 
   // ── Selection ─────────────────────────────────────────────────────────
 
+  /** The selected row, or none while a frame card replaces the list. */
   const selectedRow = (): BrowserRow | undefined =>
-    list.selected()?.row as BrowserRow | undefined;
+    replacing() ? undefined : (list.selected()?.row as BrowserRow | undefined);
 
   function onSelect(row: BrowserRow | undefined): void {
     if (!row || row.kind === "note") return;
@@ -1219,7 +1327,13 @@ export function buildBrowserView(
       current: options.current(),
     });
     list.setRows(projection.rows);
-    if (selectionPending && data.status === "ready") {
+    // The first open waits for a snapshot with model rows before choosing:
+    // a fresh start can list a provider before its discovered models.
+    if (
+      selectionPending &&
+      data.status === "ready" &&
+      projection.rows.some((row) => row.kind === "model")
+    ) {
       selectionPending = false;
       const first = initialSelection(projection.rows, options.current());
       if (first) list.select(first.key);
@@ -1247,11 +1361,55 @@ export function buildBrowserView(
     applyScreen();
   }
 
-  /** Rows the body takes on the current screen and layout. */
+  /**
+   * Lines of the banner above the body: a notice's full detail on any
+   * screen, then the frame's card when it sits above the list.
+   */
+  function bannerLines(): Line[] {
+    const lines: Line[] = notice?.detail
+      ? hardWrap(notice.detail, layout.width).map((part) => [
+          { text: part, role: "base" as const },
+        ])
+      : [];
+    if (screen() === "list" && card?.placement === "above")
+      lines.push(...card.lines);
+    return lines;
+  }
+
+  /** Rows the banner takes above the body on the current screen. */
+  function bannerRows(): number {
+    const room = layout.bodyHeight - (frame ? 1 : 0) - MIN_LIST_ROWS;
+    return Math.max(0, Math.min(bannerLines().length, BANNER_CAPACITY, room));
+  }
+
+  /**
+   * Rows the body takes on the current screen and layout. A frame's status
+   * row and banner take rows from it; a replacing card gets the search and
+   * filter rows.
+   */
   function bodyRows(): number {
-    const summary =
-      screen() === "list" && !layout.wide && projection.rows.length > 0;
-    return layout.bodyHeight - (summary ? 1 : 0);
+    const summary = screen() === "list" && !layout.wide && !cardsShown();
+    const framed = frame ? 1 : 0;
+    const hidden = replacing() ? 2 : 0;
+    return (
+      layout.bodyHeight - (summary ? 1 : 0) - framed + hidden - bannerRows()
+    );
+  }
+
+  /**
+   * Read the frame's card again. A card that replaces the list leaves no
+   * selected row, so screens about one and the search focus give way.
+   */
+  function syncCard(): void {
+    card = frame?.card(data, layout.width, Date.now());
+    if (!replacing()) return;
+    if (screens.some((item) => item !== "list" && item !== "help"))
+      screens = screens.filter((item) => item === "list" || item === "help");
+    if (focus !== "list") {
+      focus = "list";
+      renderer.set(search, "focused", false);
+      list.setFocused(true);
+    }
   }
 
   /**
@@ -1259,12 +1417,20 @@ export function buildBrowserView(
    * scrolls back to the top unless `keepOffset` is set.
    */
   function applyScreen(keepOffset = false): void {
+    syncCard();
     const current = screen();
     const listScreen = current === "list";
-    const cards = listScreen && projection.rows.length === 0;
+    const cards = listScreen && cardsShown();
     const split = listScreen && layout.wide && !cards;
     const summary = listScreen && !layout.wide && !cards;
     const bodyHeight = bodyRows();
+    const bannerHeight = bannerRows();
+    renderer.set(statusLine, "visible", frame !== undefined);
+    renderer.set(searchRow, "visible", !replacing());
+    renderer.set(filterLine, "visible", !replacing());
+    renderer.set(banner.root, "visible", bannerHeight > 0);
+    banner.setViewport(layout.width, Math.max(1, bannerHeight));
+    banner.setLines(bannerHeight > 0 ? bannerLines() : []);
     renderer.set(body, "height", bodyHeight);
     renderer.set(list.root, "visible", listScreen && !cards);
     renderer.set(separator, "visible", split);
@@ -1325,6 +1491,7 @@ export function buildBrowserView(
     const now = Date.now();
     const current = screen();
     if (current === "help") return helpLines(helpTitle(), helpEntries(), width);
+    if (current === "list" && replacing() && card) return [...card.lines];
     if (current === "list" && projection.rows.length === 0)
       return cardLines(width);
     const row = selectedRow();
@@ -1354,15 +1521,18 @@ export function buildBrowserView(
 
   function paintPane(keepOffset = false): void {
     const current = screen();
-    const split =
-      current === "list" && layout.wide && projection.rows.length > 0;
+    const split = current === "list" && layout.wide && !cardsShown();
     const visible =
-      current !== "filters" &&
-      (current !== "list" || split || projection.rows.length === 0);
+      current !== "filters" && (current !== "list" || split || cardsShown());
     if (!visible) return;
     const width = split ? layout.paneWidth : layout.width;
-    const key = `${current}\u0000${list.selected()?.row.key ?? ""}`;
-    pane.setLines(paneLines(width), keepOffset || key === paneKey);
+    // The wide pane beside the list and the narrow detail screen show the
+    // same details, so crossing the breakpoint keeps the scroll position.
+    const view = current === "list" && !cardsShown() ? "detail" : current;
+    const key = `${view}\u0000${replacing() ? "card" : (list.selected()?.row.key ?? "")}`;
+    const highlight =
+      current === "list" && replacing() ? card?.highlight : undefined;
+    pane.setLines(paneLines(width), keepOffset || key === paneKey, highlight);
     paneKey = key;
   }
 
@@ -1577,7 +1747,10 @@ export function buildBrowserView(
   }
 
   function paintChrome(): void {
-    paintLine(header, headerSegments());
+    if (frame) {
+      paintLine(header, frame.header(data, layout.width));
+      paintLine(statusLine, frame.status(data, layout.width, Date.now()));
+    } else paintLine(header, headerSegments());
     paintLine(
       slash,
       [{ text: "/", role: focus === "search" ? "field" : "faint" }],
@@ -1619,12 +1792,14 @@ export function buildBrowserView(
     return undefined;
   }
 
-  function extraHints(): FooterHint[] {
-    return extraActions.map((action) => ({
-      title: action.title,
-      key: action.key,
-      enabled: action.enabled?.() ?? true,
-    }));
+  function extraHints(prominent = false): FooterHint[] {
+    return extraActions
+      .filter((action) => (action.prominent ?? false) === prominent)
+      .map((action) => ({
+        title: action.title,
+        key: action.key,
+        enabled: action.enabled?.() ?? true,
+      }));
   }
 
   function footerHints(): FooterHint[] {
@@ -1653,6 +1828,7 @@ export function buildBrowserView(
         break;
     }
     if (focus === "pane") return detailHints(row, discovery);
+    if (replacing()) return [...(card?.hints ?? [])];
     if (data.status === "loading") return [];
     if (data.status === "failed") return [{ title: "retry", key: "r" }];
     if (projection.rows.length === 0) {
@@ -1664,7 +1840,7 @@ export function buildBrowserView(
         );
       else if (actions.actualyze)
         hints.push({ title: "connect Actualyze", key: "a" });
-      return [...hints, ...extraHints()];
+      return [...hints, ...extraHints(true), ...extraHints()];
     }
     if (row?.kind === "provider") {
       const collapsed = nav.collapsed.includes(row.group.id);
@@ -1674,6 +1850,7 @@ export function buildBrowserView(
           ? { title: "expand", key: "→" }
           : { title: "collapse", key: "←" },
         { title: "refresh", key: "r", enabled: discovery },
+        ...extraHints(true),
         { title: "filters", key: "f" },
         { title: "evidence", key: "d" },
         { title: "sort", key: "s" },
@@ -1689,6 +1866,7 @@ export function buildBrowserView(
         enabled: row !== undefined && pickerBlocked(row) === undefined,
       },
       { title: "copy", key: "y" },
+      ...extraHints(true),
       { title: "refresh", key: "r", enabled: discovery },
       { title: "filters", key: "f" },
       { title: "evidence", key: "d" },
@@ -1714,6 +1892,7 @@ export function buildBrowserView(
           ]
         : []),
       { title: "copy", key: "y" },
+      ...extraHints(true),
       { title: "evidence", key: "d" },
       { title: "refresh", key: "r", enabled: discovery },
       ...extraHints(),
@@ -1739,6 +1918,8 @@ export function buildBrowserView(
       { keys: "?", action: "this list; backspace or ? returns" },
       { keys: "esc", action: "close" },
     ];
+    if (below === "list" && replacing())
+      return [...(card?.help ?? []), ...common];
     if (below === "filters")
       return [
         { keys: "↑ ↓", action: "choose a filter" },
@@ -1768,6 +1949,11 @@ export function buildBrowserView(
           ? "details; in the pane, ↑ ↓ scroll"
           : "details of a model or provider",
       },
+      // A caller's keys come early: the footer drops their hints first.
+      ...extraActions.map((action) => ({
+        keys: action.key,
+        action: action.help ?? action.title,
+      })),
       ...(scope.kind === "all"
         ? [{ keys: "← →", action: "collapse or expand a provider" }]
         : []),
@@ -1790,10 +1976,6 @@ export function buildBrowserView(
         ? [{ keys: "R", action: "refresh every provider" }]
         : []),
       ...(actions.actualyze ? [{ keys: "a", action: "open /actualyze" }] : []),
-      ...extraActions.map((action) => ({
-        keys: action.key,
-        action: action.title,
-      })),
       { keys: "backspace", action: "back from details, evidence, or filters" },
       ...common,
     ];
@@ -1828,7 +2010,10 @@ export function buildBrowserView(
     switch (action.type) {
       case "move":
         if (current === "filters") filterList.move(action.move);
-        else if (projection.rows.length > 0) list.move(action.move);
+        else if (projection.rows.length > 0) {
+          selectionPending = false;
+          list.move(action.move);
+        }
         return true;
       case "scroll":
         pane.scroll(action.move);
@@ -1850,6 +2035,7 @@ export function buildBrowserView(
       case "collapse":
       case "expand": {
         if (scope.kind !== "all" || !row) return false;
+        selectionPending = false;
         const id = row.group.id;
         const collapse = action.type === "collapse";
         if (collapse === nav.collapsed.includes(id)) {
@@ -1963,10 +2149,33 @@ export function buildBrowserView(
     }
   }
 
+  /** What a replacing card leaves to the browser on the list screen. */
+  function allowedUnderCard(action: BrowserAction): boolean {
+    switch (action.type) {
+      case "help":
+      case "extra":
+        return true;
+      case "refresh":
+      case "refresh-all":
+        return card?.refresh === true;
+      default:
+        return false;
+    }
+  }
+
   const onKeyPress = (key: KeyEvent): void => {
     if (disposed) return;
+    if (frame?.route && focus !== "search") {
+      const run = frame.route(key, { screen: screen(), focus, card });
+      if (run) {
+        consume(key);
+        run();
+        return;
+      }
+    }
     const action = routeKey({ screen: screen(), focus, extraKeys }, key);
     if (!action) return;
+    if (screen() === "list" && replacing() && !allowedUnderCard(action)) return;
     if (action.type === "actualyze" && !actions.actualyze) return;
     if (HANDOFF_ACTIONS.has(action.type)) {
       consume(key);
@@ -1980,34 +2189,51 @@ export function buildBrowserView(
     if (!disposed) relayout();
   };
 
-  options.keyInput.on("keypress", onKeyPress);
-  terminal.on("resize", onResize);
-
+  // Listeners attach only after the first paint succeeds: a view that throws
+  // while building never returns its `dispose`, so nothing could remove them.
   setRows();
   applyScreen();
   setFocus("list");
+  options.keyInput.on("keypress", onKeyPress);
+  try {
+    terminal.on("resize", onResize);
+  } catch (error) {
+    options.keyInput.off("keypress", onKeyPress);
+    throw error;
+  }
 
   return {
     root,
     update(next) {
       data = next;
+      const subject = selectedRow()?.key;
       setRows();
-      // A detail or evidence screen whose subject disappeared returns to the list.
+      // A detail or evidence screen whose subject disappeared returns to the
+      // list rather than showing the row `setRows` fell back to.
       if (
         (screens.includes("detail") || screens.includes("evidence")) &&
-        !selectedRow()
+        selectedRow()?.key !== subject
       )
         screens = ["list"];
       applyScreen(true);
     },
     setNotice(next) {
+      const banner = notice?.detail !== undefined || next?.detail !== undefined;
       notice = next;
-      paintLine(noticeLine, noticeSegments());
+      // A notice with detail changes the banner, and so the body's height.
+      if (banner) applyScreen(true);
+      else paintLine(noticeLine, noticeSegments());
     },
     tick() {
-      paintPane(true);
+      if (frame) applyScreen(true);
+      else {
+        paintPane(true);
+        paintChrome();
+      }
       list.repaint();
-      paintChrome();
+    },
+    refreshFrame() {
+      if (!disposed) applyScreen(true);
     },
     screen,
     focus: () => focus,

@@ -359,10 +359,20 @@ function priceLines(model: ModelRow, width: number): Line[] {
     "write",
   );
   if (cache) lines.push(...labeled("Cache per 1M", cache, width));
+  // Each tier's cache prices share its line, so they stay with its threshold.
   for (const tier of model.priceTiers ?? []) {
     const pair = pricePair(tier.input, tier.output, "in", "out");
-    if (pair)
-      lines.push(...labeled(`Above ${compactCount(tier.above)}`, pair, width));
+    const tierCache = pricePair(
+      tier.cacheRead,
+      tier.cacheWrite,
+      "read",
+      "write",
+    );
+    const value = [pair, tierCache && `cache ${tierCache}`]
+      .filter((part): part is string => Boolean(part))
+      .join(" · ");
+    if (value)
+      lines.push(...labeled(`Above ${compactCount(tier.above)}`, value, width));
   }
   return lines;
 }

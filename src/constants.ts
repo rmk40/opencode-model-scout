@@ -36,6 +36,21 @@ export const ACTUALYZE_BASE_URL = "https://app.actualyze.ai/openai/v1";
 export const ACTUALYZE_PACKAGE = "@opencode/ai/providers/openai-compatible";
 export const ACTUALYZE_ENV = "ACTUALYZE_API_KEY";
 
+/** Slash command name of the Actualyze dialog: `/actualyze`. */
+export const ACTUALYZE_COMMAND_NAME = "actualyze";
+
+/**
+ * Actualyze app pages, as paths appended to the provider's origin, so a
+ * custom endpoint links to its own environment.
+ */
+export const ACTUALYZE_LINK_PATHS = {
+  apiKeys: "/account/settings?tab=security",
+  catalog: "/control/catalog?tab=consume",
+  budgets: "/management/budgets",
+  usage: "/observability?tab=inference",
+  troubleshooting: "/observability?tab=troubleshooting",
+} as const;
+
 /**
  * Deprecated probe IDs accepted in `settings.probe` for the 2.x line, mapped
  * to their current ID.

@@ -30,7 +30,7 @@ export type BrowserAction =
   | { readonly type: "collapse" }
   | { readonly type: "expand" }
   | { readonly type: "focus-search" }
-  | { readonly type: "leave-search"; readonly move?: "up" | "down" }
+  | { readonly type: "leave-search" }
   | { readonly type: "filters" }
   | { readonly type: "filter-change"; readonly direction: 1 | -1 }
   | { readonly type: "clear" }
@@ -116,8 +116,8 @@ function charAction(
  * Map a key to the browser action it triggers in the current view, or
  * undefined when the browser leaves the key alone. Keys with ctrl, meta,
  * option, super, or hyper always belong to the host. While search has
- * focus only `enter`, `up`, and `down` are routed; every other key edits
- * the query.
+ * focus only `enter` and `down` are routed, and both return to the list;
+ * every other key goes to the input.
  */
 export function routeKey(
   context: RouteContext,
@@ -130,9 +130,8 @@ export function routeKey(
   switch (context.screen) {
     case "list": {
       if (context.focus === "search") {
-        if (isEnter(key)) return { type: "leave-search" };
-        if (key.name === "down" || key.name === "up")
-          return { type: "leave-search", move: key.name };
+        if (isEnter(key) || key.name === "down")
+          return { type: "leave-search" };
         return undefined;
       }
       if (context.focus === "pane") return routeDetail(context, key, char);

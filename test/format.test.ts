@@ -218,4 +218,27 @@ describe("formatModelName", () => {
     expect(formatModelName("qwen3:30b-a3b")).toBe("Qwen3 30B A3B");
     expect(formatModelName("smollm2:135m")).toBe("Smollm2 135M");
   });
+
+  it.each([
+    ["claude-sonnet-4-5", "Claude Sonnet 4.5"],
+    ["anthropic/claude-opus-4-1", "Claude Opus 4.1"],
+    ["claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet 20241022"],
+    ["llama-3-1-8b", "Llama 3.1 8B"],
+    ["glm-4-5", "Glm 4.5"],
+  ])("reads the paired version numbers in %s as one decimal", (id, name) => {
+    expect(formatModelName(id)).toBe(name);
+  });
+
+  it.each([
+    // A date: the pair follows another number.
+    ["gpt-4o-2024-08-06", "GPT 4O 2024 08 06"],
+    // Three short numbers in a row are not a version pair.
+    ["model-1-2-3", "Model 1 2 3"],
+    // Only one- and two-digit parts pair up.
+    ["model-100-5", "Model 100 5"],
+    // A lone number stays as it is.
+    ["gemma-3-12b", "Gemma 3 12B"],
+  ])("keeps the numbers in %s apart", (id, name) => {
+    expect(formatModelName(id)).toBe(name);
+  });
 });

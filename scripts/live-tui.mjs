@@ -165,6 +165,298 @@ const SCENARIOS = [
       );
     },
   },
+  {
+    name: "actualyze-no-key",
+    description:
+      "zero config: /actualyze shows the connect card on the built-in origin with the brand wordmark, opens the links screen, and probes nothing",
+    actualyze: "default",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "ACTUALYZE" },
+      { wait: "Not connected" },
+      { expect: "app.actualyze.ai" },
+      { expectNot: "custom endpoint" },
+      { expectColor: { color: "brand", text: "ACTUALYZE" } },
+      { expect: "Connect an Actualyze API key" },
+      { expect: /connect key k/ },
+      { screenshot: "no-key" },
+      { press: "l" },
+      { wait: "Links ·" },
+      {
+        expect: "https://app.actualyze.ai/account/settings?tab=security",
+      },
+      { expect: "Budgets may need an admin role" },
+      { press: "down" },
+      { press: "y" },
+      {
+        // At 80 columns the notice ends in "…" after the path.
+        wait: /Copy sent to terminal: https:\/\/app\.actualyze\.ai\/control\/catalog|OSC 52\) is unavailable/,
+        label: "y copies the selected Catalog link",
+      },
+      { screenshot: "links" },
+      { press: "backspace" },
+      { wait: "Connect an Actualyze API key" },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+      { expect: READY },
+    ],
+    catalog: (payload, ctx) => {
+      ctx.check(
+        "catalog has no actualyze record",
+        !payload.providers.some((provider) => provider.id === "actualyze"),
+      );
+      ctx.check(
+        "catalog reports the built-in actualyze as managed",
+        payload.builtIn.actualyze === "managed",
+      );
+    },
+  },
+  {
+    name: "actualyze-connect-key",
+    description:
+      "the k flow: the prompt opens empty, the synthetic key is submitted, and the dialog returns ready with the catalog",
+    actualyze: "mock",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "ACTUALYZE" },
+      { wait: "Not connected" },
+      { press: "k" },
+      { wait: "Actualyze API key" },
+      { expect: "The key is visible while you type" },
+      { expectNot: /aai_pat_/, label: "the key prompt opens empty" },
+      { submitKey: "ok" },
+      { wait: "ACTUALYZE", label: "the dialog shows again after submit" },
+      { wait: "Catalog accessible", timeout: 45_000 },
+      { wait: "Claude Haiku" },
+      { expect: /another key k/ },
+      { screenshot: "ready" },
+      { press: "b" },
+      { wait: "Model Scout", label: "b opens /modelscout" },
+      { press: "a" },
+      { wait: "ACTUALYZE", label: "a returns to /actualyze" },
+      { wait: "Catalog accessible" },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+    // The key went to the standalone TUI's own server; the harness server
+    // read its credentials before, so its catalog says nothing about it.
+  },
+  {
+    name: "actualyze-connect-checking",
+    description:
+      "a key submitted through the TUI shows the saved-and-checking card until the catalog answers for it, here with a timeout",
+    actualyze: "mock",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "Not connected" },
+      { press: "k" },
+      { wait: "Actualyze API key" },
+      { submitKey: "slow" },
+      { wait: "Key saved. Checking the current connection" },
+      { expect: "no inference request" },
+      { screenshot: "checking" },
+      { wait: "did not answer in time", timeout: 45_000 },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+  },
+  {
+    name: "actualyze-revoked",
+    description: "a revoked key: the 401 card with the key and link actions",
+    actualyze: "mock",
+    connect: "revoked",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "ACTUALYZE" },
+      { wait: "Key rejected (401)", timeout: 30_000 },
+      { expect: "Actualyze did not accept this key" },
+      { expect: /another key k/ },
+      { expect: /copy API keys link y/ },
+      { expect: /connections c/ },
+      { expectColor: { color: "brand", text: "ACTUALYZE" } },
+      { screenshot: "revoked" },
+      { press: "l" },
+      { wait: "Links ·" },
+      { screenshot: "links-after-401" },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+  },
+  {
+    name: "actualyze-forbidden",
+    description: "a 403 answer: the access-denied card",
+    actualyze: "mock",
+    connect: "forbidden",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "Access denied (403)", timeout: 30_000 },
+      { expect: "did not allow the model list" },
+      { screenshot: "forbidden" },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+  },
+  {
+    name: "actualyze-budget",
+    description:
+      "a 402 answer: the budget card, with no balance or reset claimed",
+    actualyze: "mock",
+    connect: "budget",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "Budget or entitlement blocked (402)", timeout: 30_000 },
+      { expect: "No balance or reset date" },
+      { expect: /copy Budgets link y/ },
+      { screenshot: "budget" },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+  },
+  {
+    name: "actualyze-throttled",
+    description:
+      "a 429 with Retry-After 90: a catalog rate-limit card whose countdown runs",
+    actualyze: "mock",
+    connect: "throttled",
+    steps: [
+      { command: "/actualyze" },
+      { wait: /Catalog rate limited · retry in \d+ s/, timeout: 30_000 },
+      { expect: "not inference" },
+      { screenshot: "throttled" },
+      {
+        label: "the countdown decreases",
+        run: async (ctx) => {
+          const read = async () =>
+            Number(
+              /retry in (\d+) s/.exec(await ctx.session.text())?.[1] ?? NaN,
+            );
+          const first = await read();
+          await sleep(3_000);
+          const second = await read();
+          if (!(first > second && first - second <= 5))
+            throw new Error(`countdown ${first} → ${second}`);
+        },
+      },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+  },
+  {
+    name: "actualyze-server-error",
+    description: "a 503 answer: the server-error card",
+    actualyze: "mock",
+    connect: "5xx",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "Actualyze server error (503)", timeout: 30_000 },
+      { expect: /retry( in \d+ s)? r/ },
+      { screenshot: "server-error" },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+  },
+  {
+    name: "actualyze-slow",
+    description:
+      "no response headers within the list timeout: the timeout card, not a refused connection",
+    actualyze: "mock",
+    connect: "slow",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "did not answer in time", timeout: 45_000 },
+      { expectNot: "Can't reach" },
+      { screenshot: "slow" },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+  },
+  {
+    name: "actualyze-unreachable",
+    description: "a refused port: the can't-reach card",
+    actualyze: "refused",
+    connect: "ok",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "Can't reach", timeout: 30_000 },
+      { expect: "custom endpoint" },
+      { screenshot: "unreachable" },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+  },
+  {
+    name: "actualyze-empty",
+    description: "an empty catalog: accessible, no models for this key",
+    actualyze: "mock",
+    connect: "empty",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "no models for this key", timeout: 30_000 },
+      { expect: "Catalog accessible" },
+      { screenshot: "empty" },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+  },
+  {
+    name: "actualyze-readonly",
+    description:
+      "a read-only key lists models: the ready view says catalog accessible and never claims inference works",
+    actualyze: "mock",
+    connect: "readonly",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "Catalog accessible", timeout: 30_000 },
+      { wait: "Claude Haiku" },
+      { expectNot: /Connected|inference works/ },
+      { expect: /another key k/ },
+      {
+        label: "the status line lists k, l, c, and b where they fit",
+        run: async (ctx) => {
+          if (ctx.size.cols < 120) return;
+          const text = await ctx.session.text();
+          for (const hint of ["links l", "connections c", "all providers b"])
+            if (!text.includes(hint)) throw new Error(`no "${hint}"`);
+        },
+      },
+      { screenshot: "readonly" },
+      { press: "?" },
+      { wait: "Keys · Actualyze" },
+      { expect: "connect a key through OpenCode's key prompt" },
+      { expect: "OpenCode's connections (pick Actualyze)" },
+      { expect: "every provider (/modelscout)" },
+      { screenshot: "keys" },
+      { press: "backspace" },
+      { wait: "Claude Haiku" },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+  },
+  {
+    name: "actualyze-custom-endpoint",
+    description:
+      "--actualyze-mock: the header shows the custom endpoint badge and the mock origin, and links use that origin",
+    actualyze: "mock",
+    connect: "ok",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "ACTUALYZE" },
+      { wait: "custom endpoint" },
+      { expect: "http://127.0.0.1:" },
+      { wait: "Catalog accessible", timeout: 30_000 },
+      { expectColor: { color: "brand", text: "ACTUALYZE" } },
+      { screenshot: "custom-endpoint" },
+      { press: "l" },
+      { wait: "Links ·" },
+      { expect: /http:\/\/127\.0\.0\.1:\d+\/account\/settings\?tab=security/ },
+      { expectNot: "https://app.actualyze.ai" },
+      { screenshot: "links" },
+      { press: "backspace" },
+      { wait: "Claude Haiku" },
+      { press: "esc" },
+      { waitGone: "ACTUALYZE" },
+    ],
+  },
 ];
 
 // ── Arguments ───────────────────────────────────────────────────────────

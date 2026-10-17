@@ -62,6 +62,7 @@ interface Command {
   title?: string;
   palette?: true;
   slash?: { name: string };
+  bind?: false | string;
   run: () => void | false | Promise<void>;
 }
 
@@ -491,17 +492,25 @@ describe("plugin definition and command", () => {
     expect(plugin.id).toBe(PLUGIN_ID);
   });
 
-  it("registers one global slash and palette command without any I/O", () => {
+  it("registers /modelscout and /actualyze as global slash and palette commands without any I/O", () => {
     const h = harness();
     const layer = h.layers[0]?.();
     expect(layer?.mode).toBe("global");
-    expect(layer?.commands).toHaveLength(1);
+    expect(layer?.commands).toHaveLength(2);
     expect(h.command()).toMatchObject({
       id: `${COMMAND_NAME}.show`,
       title: "Model Scout",
       slash: { name: COMMAND_NAME },
       palette: true,
     });
+    const actualyze = layer?.commands?.[1];
+    expect(actualyze).toMatchObject({
+      id: "actualyze.show",
+      title: "Actualyze",
+      slash: { name: "actualyze" },
+      palette: true,
+    });
+    expect(actualyze?.bind).toBeUndefined();
     expect(h.modelList).not.toHaveBeenCalled();
     expect(h.catalog).not.toHaveBeenCalled();
   });
@@ -667,6 +676,81 @@ describe("layout", () => {
     expect(line(root, "modelscout-footer")).toMatch(/^back backspace/);
   });
 
+  it("keeps a scrolled detail where it was when the terminal crosses 120 columns", async () => {
+    // 16 rows leave a 6-row body, shorter than the model's details.
+    const h = harness({ terminalWidth: 120, terminalHeight: 16 });
+    const root = await h.ready();
+    h.press({ name: "down" });
+    h.press({ name: "return" });
+    for (let step = 0; step < 3; step += 1) h.press({ name: "down" });
+    const first = (): string | undefined => lines(root, "modelscout-pane")[0];
+    expect(first()).toMatch(/^Context/);
+
+    h.resize(80, 16);
+    expect(visible(findNodeById(root, "modelscout-list"))).toBe(false);
+    expect(first()).toMatch(/^Context/);
+
+    h.resize(120, 16);
+    expect(visible(findNodeById(root, "modelscout-list"))).toBe(true);
+    expect(first()).toMatch(/^Context/);
+  });
+
+  it("returns to the list when a reload removes the model a detail screen shows", async () => {
+    const h = harness({ terminalWidth: 80, terminalHeight: 24 });
+    h.setHostModels([
+      hostModel("a-first", "A First"),
+      hostModel("b-second", "B Second"),
+    ]);
+    const root = await h.ready();
+    h.press({ name: "end" });
+    h.press({ name: "d" });
+    expect(pane(root)).toContain("atlas/b-second");
+
+    h.setHostModels([hostModel("a-first", "A First")]);
+    h.emitRpc("updated", { location: PROJECT, data: {} });
+    await vi.waitFor(() =>
+      expect(visible(findNodeById(root, "modelscout-list"))).toBe(true),
+    );
+    expect(pane(root)).not.toContain("atlas/a-first");
+    expect(listRows(root).some((row) => row.includes("B Second"))).toBe(false);
+  });
+
+  it("keeps a detail screen open when a reload keeps its model", async () => {
+    const h = harness({ terminalWidth: 80, terminalHeight: 24 });
+    const root = await h.ready();
+    h.press({ name: "down" });
+    h.press({ name: "d" });
+    h.emitRpc("updated", { location: PROJECT, data: {} });
+    await vi.waitFor(() => expect(h.modelList).toHaveBeenCalledTimes(2));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(visible(findNodeById(root, "modelscout-list"))).toBe(false);
+    expect(pane(root)).toContain("Atlas Model · Evidence");
+  });
+
+  it("leaves no key or resize listener behind when the first paint throws", async () => {
+    const h = harness();
+    await h.command().run();
+    const surfaceOf = h.context.theme.surface;
+    let failed = false;
+    h.context.theme.surface = () => {
+      // The browser's first paint fails; the fallback after it paints.
+      if (!failed) {
+        failed = true;
+        throw new Error("theme unavailable");
+      }
+      return surfaceOf();
+    };
+    h.current()?.render();
+    expect(failed).toBe(true);
+    expect(h.toast.show).toHaveBeenCalledWith(
+      expect.objectContaining({ message: "theme unavailable" }),
+    );
+    expect(h.keyListeners.size).toBe(0);
+    expect(h.resizeListeners.size).toBe(0);
+    expect(h.press({ name: "m" }).preventDefault).not.toHaveBeenCalled();
+    expect(h.context.keymap.dispatch).not.toHaveBeenCalled();
+  });
+
   it("re-reads the theme when it repaints", async () => {
     const h = harness();
     const root = await h.ready();
@@ -774,21 +858,30 @@ describe("keys", () => {
     );
   });
 
-  it("keeps the text visible when the terminal does not accept OSC 52", async () => {
-    const h = harness();
+  it("shows the whole text below the notice when the terminal does not accept OSC 52", async () => {
+    const id = `atlas-${"x".repeat(90)}`;
+    const h = harness({ terminalWidth: 80, terminalHeight: 24 });
+    h.setHostModels([hostModel(id, "Long ID")]);
     const root = await h.ready();
     h.renderer.isOsc52Supported.mockReturnValue(false);
     h.press({ name: "down" });
     h.press({ name: "y" });
     expect(h.renderer.copyToClipboardOSC52).not.toHaveBeenCalled();
-    expect(line(root, "modelscout-notice")).toMatch(
-      /does not accept copy requests.*atlas\/atlas-model$/,
+    expect(line(root, "modelscout-notice")).toBe(
+      "Terminal copy (OSC 52) is unavailable; select the text below:",
     );
+    const banner = lines(root, "modelscout-banner");
+    expect(banner.join("")).toBe(`atlas/${id}`);
+    expect(banner.every((part) => part.length <= 72)).toBe(true);
+    // The list keeps the selection while the banner takes rows from it.
+    expect(listRows(root).some((row) => row.startsWith("▌"))).toBe(true);
   });
 
   it("leaves a without an Actualyze hook unconsumed, and runs the hook when given", async () => {
     const h = harness();
-    await h.ready();
+    await openBrowser(h.context as unknown as Plugin.Context, { kind: "all" });
+    h.current()?.render();
+    await vi.waitFor(() => expect(h.modelList).toHaveBeenCalled());
     expect(h.press({ name: "a" }).preventDefault).not.toHaveBeenCalled();
 
     h.current()?.onClose?.();
@@ -802,6 +895,19 @@ describe("keys", () => {
     const event = h.press({ name: "a" });
     expect(actualyze).toHaveBeenCalledOnce();
     expect(event.preventDefault).toHaveBeenCalled();
+  });
+
+  it("opens /actualyze in place of /modelscout when a is pressed", async () => {
+    const h = harness();
+    await h.ready();
+    const before = h.dialog.show.mock.calls.length;
+    const event = h.press({ name: "a" });
+    expect(event.preventDefault).toHaveBeenCalled();
+    await vi.waitFor(() =>
+      expect(h.dialog.show.mock.calls.length).toBe(before + 1),
+    );
+    const root = h.current()?.render();
+    expect(line(root, "modelscout-header")).toMatch(/^● ACTUALYZE/);
   });
 
   it("opens evidence with d and returns with backspace", async () => {

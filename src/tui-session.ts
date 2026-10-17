@@ -19,6 +19,7 @@ import {
   refreshWaitSeconds,
   type BrowserData,
   type BrowserExtraAction,
+  type BrowserFrame,
   type BrowserNotice,
   type BrowserScope,
   type BrowserSort,
@@ -398,6 +399,15 @@ function buildFallback(
 
 // ── Sessions ────────────────────────────────────────────────────────────
 
+/** What a caller's frame may ask the browser session for. */
+export interface BrowserFrameTools {
+  /** Copy through OSC 52 and say so in the notice line. */
+  copy(text: string): void;
+  notify(notice: BrowserNotice): void;
+  /** Read the frame again after its own state changed. */
+  repaint(): void;
+}
+
 export interface OpenBrowserOptions {
   /** Opens `/actualyze`; without it the `a` key does nothing. */
   readonly actualyze?: () => void;
@@ -405,6 +415,10 @@ export interface OpenBrowserOptions {
   readonly searchPlaceholder?: string;
   /** Keys a caller adds to the list and detail views. */
   readonly extraActions?: readonly BrowserExtraAction[];
+  /** Builds a frame around the browser for this dialog; its time-dependent text repaints every second. */
+  readonly frame?: (tools: BrowserFrameTools) => BrowserFrame;
+  /** Runs once when the dialog closes, whatever closed it. */
+  readonly onClose?: () => void;
 }
 
 export interface BrowserHandle {
@@ -431,6 +445,8 @@ interface ActiveNotice {
   /** The text at `now`; undefined ends the notice. */
   readonly text: (now: number) => string | undefined;
   readonly expiresAt?: number;
+  /** Shown in full under the notice; see `BrowserNotice.detail`. */
+  readonly detail?: string;
 }
 
 function toastError(context: Context, error: unknown): void {
@@ -461,9 +477,9 @@ export async function openBrowser(
     const ref = context.location ?? context.data.location.default();
     const location: LocationQuery = { directory: ref.directory };
     feed = subscribeUpdates(context, location);
-    const [renderer, untrack] = await Promise.all([
+    const [renderer, solid] = await Promise.all([
       loadTuiRenderer(),
-      loadUntrack(),
+      loadSolid(),
     ]);
     if (retired.has(context)) {
       feed.stop();
@@ -471,7 +487,7 @@ export async function openBrowser(
     }
     const handle = startSession(
       context,
-      { renderer, untrack },
+      { renderer, solid },
       location,
       scope,
       options,
@@ -493,30 +509,48 @@ export async function openBrowser(
 
 type Untrack = <T>(fn: () => T) => T;
 
+/** The parts of Solid the session uses. */
+interface SolidRuntime {
+  readonly untrack: Untrack;
+  /** Absent when `solid-js` could not be loaded. */
+  readonly createEffect?: (fn: () => void) => void;
+}
+
 /**
- * Solid's `untrack`, from the copy of `solid-js` the host supplies to
- * plugins. Without it the render runs tracked, which only means a reactive
- * read can run it again.
+ * `untrack` and `createEffect` from the copy of `solid-js` the host
+ * supplies to plugins. Without them the render runs tracked, which only
+ * means a reactive read can run it again, and a theme switch shows on the
+ * next timed repaint instead of at once.
  */
-async function loadUntrack(): Promise<Untrack> {
+async function loadSolid(): Promise<SolidRuntime> {
   try {
-    const solid = (await import("solid-js")) as { untrack?: Untrack };
-    if (typeof solid.untrack === "function") return solid.untrack;
+    const solid = (await import("solid-js")) as {
+      untrack?: Untrack;
+      createEffect?: (fn: () => void) => void;
+    };
+    if (typeof solid.untrack === "function")
+      return {
+        untrack: solid.untrack,
+        ...(typeof solid.createEffect === "function"
+          ? { createEffect: solid.createEffect }
+          : {}),
+      };
   } catch {
     // Fall through to a tracked render.
   }
-  return (fn) => fn();
+  return { untrack: (fn) => fn() };
 }
 
 function startSession(
   context: Context,
-  runtime: { readonly renderer: TuiRenderer; readonly untrack: Untrack },
+  runtime: { readonly renderer: TuiRenderer; readonly solid: SolidRuntime },
   location: LocationQuery,
   scope: BrowserScope,
   options: OpenBrowserOptions,
   updates: UpdateFeed,
 ): BrowserHandle {
-  const { renderer, untrack } = runtime;
+  const { renderer, solid } = runtime;
+  const { untrack } = solid;
   let data: BrowserData = LOADING_DATA;
   let view: BrowserView | undefined;
   let fallback: Fallback | undefined;
@@ -546,7 +580,11 @@ function startSession(
       view?.setNotice(undefined);
       return;
     }
-    const shown: BrowserNotice = { text, role: notice.role };
+    const shown: BrowserNotice = {
+      text,
+      role: notice.role,
+      ...(notice.detail === undefined ? {} : { detail: notice.detail }),
+    };
     view?.setNotice(shown);
   };
 
@@ -565,7 +603,7 @@ function startSession(
     fallback?.update(data);
   };
 
-  let reloading = false;
+  let reloading: Promise<void> | undefined;
   let reloadAgain = false;
   const reloadOnce = async (): Promise<void> => {
     try {
@@ -579,22 +617,28 @@ function startSession(
         setData({ ...LOADING_DATA, status: "failed", error: errorText(error) });
     }
   };
-  /** Coalesce bursts of events into at most one queued reload. */
-  const reload = async (): Promise<void> => {
-    if (closed) return;
+  /**
+   * Coalesce bursts of events into at most one queued reload. A request
+   * during a reload queues one more pass and resolves with the running
+   * loop, so the caller sees data read after its request.
+   */
+  const reload = (): Promise<void> => {
+    if (closed) return Promise.resolve();
     if (reloading) {
       reloadAgain = true;
-      return;
+      return reloading;
     }
-    reloading = true;
-    try {
-      do {
-        reloadAgain = false;
-        await reloadOnce();
-      } while (reloadAgain && !closed);
-    } finally {
-      reloading = false;
-    }
+    reloading = (async () => {
+      try {
+        do {
+          reloadAgain = false;
+          await reloadOnce();
+        } while (reloadAgain && !closed);
+      } finally {
+        reloading = undefined;
+      }
+    })();
+    return reloading;
   };
   const scheduleReload = (): void => void reload();
 
@@ -693,10 +737,17 @@ function startSession(
       showNotice({
         role: "warn",
         text: () =>
-          `This terminal does not accept copy requests (OSC 52). Select the text: ${text}`,
+          "Terminal copy (OSC 52) is unavailable; select the text below:",
+        detail: text,
         expiresAt: Date.now() + 30_000,
       });
   };
+
+  const frame = options.frame?.({
+    copy,
+    notify: (next) => transient(next.text, next.role),
+    repaint: () => view?.refreshFrame(),
+  });
 
   /**
    * Builds the view from the current data and navigation. The host's
@@ -706,6 +757,37 @@ function startSession(
    * built before in case it runs twice.
    */
   const render = (): never => untrack(build);
+
+  /**
+   * Repaint `built` when the theme or its mode changes. `context.theme` and
+   * `context.themeMode` read the host's theme signals, so an effect owned
+   * by the dialog sees a switch without remounting it, and is disposed with
+   * the dialog.
+   */
+  const watchTheme = (built: BrowserView): void => {
+    if (!solid.createEffect) return;
+    let first = true;
+    solid.createEffect(() => {
+      try {
+        void context.theme;
+        void context.themeMode;
+      } catch {
+        return;
+      }
+      if (first) {
+        first = false;
+        return;
+      }
+      if (view === built && !closed)
+        untrack(() => {
+          try {
+            built.tick();
+          } catch {
+            // A failed repaint keeps the previous colors.
+          }
+        });
+    });
+  };
   const build = (): never => {
     view?.dispose();
     view = undefined;
@@ -741,8 +823,10 @@ function startSession(
           ? { searchPlaceholder: options.searchPlaceholder }
           : {}),
         ...(options.extraActions ? { extraActions: options.extraActions } : {}),
+        ...(frame ? { frame } : {}),
       });
       paintNotice();
+      watchTheme(view);
       // The host's render slot is typed as Solid's JSX.Element, which is
       // effectively `any`; the reconciler's renderable is what it renders.
       return renderer.raw(view.root) as never;
@@ -765,6 +849,11 @@ function startSession(
     view?.dispose();
     view = undefined;
     sessions.get(context)?.delete(handle);
+    try {
+      options.onClose?.();
+    } catch (error) {
+      toastError(context, error);
+    }
   };
 
   const handle: BrowserHandle = {
@@ -791,7 +880,7 @@ function startSession(
     if (closed) return;
     const now = Date.now();
     if (notice) paintNotice(now);
-    if (now - lastAgePaint >= AGE_REPAINT_MS) {
+    if (frame || now - lastAgePaint >= AGE_REPAINT_MS) {
       lastAgePaint = now;
       view?.tick();
     }

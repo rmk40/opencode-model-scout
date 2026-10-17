@@ -134,10 +134,7 @@ const ACRONYMS = new Set([
   "mlx",
 ]);
 
-/**
- * Format model ID for display.
- * Turns "qwen/qwen3-30b-a3b" into "Qwen3 30B A3B".
- */
+/** A one- or two-digit token, a candidate half of a version number. */
 const SHORT_NUMBER = /^\d{1,2}$/;
 
 /**
@@ -168,6 +165,10 @@ function joinVersionParts(tokens: readonly string[]): string[] {
   return result;
 }
 
+/**
+ * Format model ID for display.
+ * Turns "qwen/qwen3-30b-a3b" into "Qwen3 30B A3B".
+ */
 export function formatModelName(id: string): string {
   // Extract part after slash (if any)
   const slash = id.indexOf("/");
