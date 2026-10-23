@@ -17,6 +17,7 @@ import {
   LOADING_DATA,
   qualifiedID,
   refreshWaitSeconds,
+  SEARCH_INPUT_ID,
   type BrowserData,
   type BrowserExtraAction,
   type BrowserFrame,
@@ -26,6 +27,7 @@ import {
   type BrowserView,
   type NavState,
   type NoticeRole,
+  type PickerModel,
   type TypeFilter,
 } from "./tui-browser";
 import {
@@ -132,26 +134,206 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** The names OpenCode's model picker shows for a model and its provider. */
+interface PickerNames {
+  readonly provider: string;
+  readonly model: string;
+}
+
+/**
+ * The picker's names for every model OpenCode lists, by `provider/model`:
+ * the host model's name and its provider's name, or the provider ID when
+ * the provider is not listed, as the picker falls back.
+ */
+function pickerNames(host: HostCatalog): Map<string, PickerNames> {
+  const providers = new Map(
+    host.providers.map((provider) => [provider.id, provider.name]),
+  );
+  return new Map(
+    host.models.map((model) => [
+      qualifiedID(model.providerID, model.id),
+      {
+        provider: providers.get(model.providerID) ?? model.providerID,
+        model: model.name,
+      },
+    ]),
+  );
+}
+
+interface Loaded {
+  readonly data: BrowserData;
+  readonly pickerNames: ReadonlyMap<string, PickerNames>;
+}
+
 /** Host lists and evidence, read in parallel; a host failure rejects. */
 async function loadData(
   context: Context,
   location: LocationQuery,
-): Promise<BrowserData> {
+): Promise<Loaded> {
   const [host, evidence] = await Promise.all([
     readHost(context, location),
     readEvidence(context, location),
   ]);
   return {
-    status: "ready",
-    groups: collectModelGroups(host, evidence.payload),
-    ...(evidence.payload
-      ? { catalog: evidence.payload, catalogReceivedAt: Date.now() }
-      : {}),
-    ...(evidence.notice ? { serverNotice: evidence.notice } : {}),
-    hostListed: new Set(
-      host.models.map((model) => qualifiedID(model.providerID, model.id)),
-    ),
+    data: {
+      status: "ready",
+      groups: collectModelGroups(host, evidence.payload),
+      ...(evidence.payload
+        ? { catalog: evidence.payload, catalogReceivedAt: Date.now() }
+        : {}),
+      ...(evidence.notice ? { serverNotice: evidence.notice } : {}),
+      hostListed: new Set(
+        host.models.map((model) => qualifiedID(model.providerID, model.id)),
+      ),
+    },
+    pickerNames: pickerNames(host),
   };
+}
+
+// ── Model picker ────────────────────────────────────────────────────────
+
+/**
+ * OpenCode's picker focuses its search a tick after it mounts; scout looks
+ * for it this often, for at most `PICKER_WAIT_MS`.
+ */
+const PICKER_POLL_MS = 16;
+const PICKER_WAIT_MS = 1_000;
+
+/**
+ * The search that lists `names` first in OpenCode's model picker. The
+ * picker matches every word of its search against each model's name and
+ * category, and the category is the provider's name only while some
+ * integration has a connection. Without one a provider word matches no
+ * model, so the search is the model's name alone.
+ */
+function pickerQuery(context: Context, names: PickerNames): string {
+  return hasConnection(context)
+    ? `${names.provider} ${names.model}`
+    : names.model;
+}
+
+/** Whether any integration has a connection, which is how OpenCode's picker decides it. */
+function hasConnection(context: Context): boolean {
+  try {
+    return (context.data.location.integration.list() ?? []).some(
+      (integration) => integration.connections.length > 0,
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** The fields of a focused OpenTUI renderable that mark the picker's search. */
+interface FocusedField {
+  readonly id?: unknown;
+  readonly traits?: { readonly status?: unknown };
+  value?: unknown;
+}
+
+/** The focused renderable when it is a filter input other than scout's own search. */
+function focusedFilter(context: Context): FocusedField | undefined {
+  const focused: unknown = context.renderer.currentFocusedRenderable;
+  if (typeof focused !== "object" || focused === null) return undefined;
+  const field = focused as FocusedField;
+  if (field.id === SEARCH_INPUT_ID) return undefined;
+  return field.traits?.status === "FILTER" && typeof field.value === "string"
+    ? field
+    : undefined;
+}
+
+/**
+ * The pending pre-fill of each context, as the function that ends it.
+ * Pickers come and go within one context, so a new handoff ends the
+ * earlier attempt rather than letting it fill the newer picker.
+ */
+const pendingFills = new WeakMap<object, () => void>();
+
+/** End `context`'s pending pre-fill, if any; plugin cleanup calls this. */
+function cancelPickerFill(context: Context): void {
+  pendingFills.get(context)?.();
+}
+
+/** The key emitter's methods the pre-fill uses; OpenTUI's is a Node `EventEmitter`. */
+interface KeyEvents {
+  on(event: "keypress", listener: () => void): unknown;
+  off(event: "keypress", listener: () => void): unknown;
+  prependListener?(event: "keypress", listener: () => void): unknown;
+}
+
+/**
+ * Type `query` into OpenCode's model picker once it has focused its
+ * search. The picker's search input carries the `FILTER` status trait, and
+ * assigning `value` emits OpenTUI's `input` event, which sets the picker's
+ * filter as OpenCode's own `setFilter` does. Stops at the first filter
+ * input it finds, filling it only while it is empty, so a search the user
+ * started is kept; gives up after `PICKER_WAIT_MS`, on plugin cleanup, or
+ * when another handoff starts.
+ *
+ * Any keypress before the fill also ends the attempt: keys that arrive in
+ * the same input chunk as the handoff key run before the picker focuses
+ * its search, and one of them can replace the picker with another dialog
+ * whose search carries the same trait. The listener is attached here,
+ * during the handoff key's dispatch; OpenTUI calls the listeners it had
+ * when that dispatch began, so the handoff key itself never reaches it. It
+ * goes first, because the host keymap stops the keys it handles before
+ * later listeners see them.
+ */
+function fillPickerSearch(context: Context, query: string): void {
+  cancelPickerFill(context);
+  const keyInput: KeyEvents = context.renderer.keyInput;
+  const deadline = Date.now() + PICKER_WAIT_MS;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let ended = false;
+  const onKey = (): void => end();
+  const end = (): void => {
+    if (ended) return;
+    ended = true;
+    if (timer !== undefined) clearTimeout(timer);
+    timer = undefined;
+    try {
+      keyInput.off("keypress", onKey);
+    } catch {
+      // A listener the emitter cannot remove only ends the attempt early.
+    }
+    if (pendingFills.get(context) === end) pendingFills.delete(context);
+  };
+  pendingFills.set(context, end);
+  try {
+    if (typeof keyInput.prependListener === "function")
+      keyInput.prependListener("keypress", onKey);
+    else keyInput.on("keypress", onKey);
+  } catch {
+    // Without the listener a key could redirect the fill, so none happens.
+    end();
+    return;
+  }
+  const step = (): void => {
+    timer = undefined;
+    if (ended) return;
+    if (retired.has(context)) {
+      end();
+      return;
+    }
+    try {
+      const field = focusedFilter(context);
+      if (field) {
+        if (field.value === "") field.value = query;
+        end();
+        return;
+      }
+    } catch {
+      end();
+      return;
+    }
+    if (Date.now() >= deadline) {
+      end();
+      return;
+    }
+    timer = setTimeout(step, PICKER_POLL_MS);
+    // A timer must not keep a test or a closing process alive on its own.
+    (timer as { unref?: () => void }).unref?.();
+  };
+  step();
 }
 
 /**
@@ -433,11 +615,13 @@ const sessions = new WeakMap<object, Set<BrowserHandle>>();
 const retired = new WeakSet<object>();
 
 /**
- * Close every browser opened for `context` and refuse later opens; the
- * plugin cleanup calls this so a reload leaves no dialog on screen.
+ * Close every browser opened for `context`, end a pending picker pre-fill,
+ * and refuse later opens; the plugin cleanup calls this so a reload leaves
+ * no dialog on screen and no listener behind.
  */
 export function closeBrowsers(context: Context): void {
   retired.add(context);
+  cancelPickerFill(context);
   for (const handle of sessions.get(context) ?? []) handle.close();
   sessions.delete(context);
 }
@@ -605,12 +789,17 @@ function startSession(
     fallback?.update(data);
   };
 
+  /** The model picker's names for each model, from the latest host lists. */
+  let names: ReadonlyMap<string, PickerNames> = new Map();
+
   let reloading: Promise<void> | undefined;
   let reloadAgain = false;
   const reloadOnce = async (): Promise<void> => {
     try {
       const next = await loadData(context, location);
-      if (!closed) setData(next);
+      if (closed) return;
+      names = next.pickerNames;
+      setData(next.data);
     } catch (error) {
       if (closed) return;
       if (data.status === "ready")
@@ -750,6 +939,22 @@ function startSession(
     scheduleReload();
   };
 
+  /**
+   * OpenCode's model picker replaces the dialog, its search filled in so
+   * `model` is the first result and `enter` there selects it. The plugin
+   * API has no model setter, so the choice is made in the picker.
+   */
+  const picker = (model: PickerModel): void => {
+    try {
+      context.keymap.dispatch("model.list");
+    } catch (error) {
+      toastError(context, error);
+      return;
+    }
+    const found = names.get(qualifiedID(model.providerID, model.modelID));
+    if (found) fillPickerSearch(context, pickerQuery(context, found));
+  };
+
   const frame = options.frame?.({
     copy,
     notify: (next) => transient(next.text, next.role),
@@ -816,7 +1021,7 @@ function startSession(
         terminal: context.renderer,
         current: () => context.ui.model.current(),
         actions: {
-          picker: () => context.keymap.dispatch("model.list"),
+          picker,
           refresh: (providerID) => void refresh(providerID),
           retry,
           copy,

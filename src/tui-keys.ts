@@ -1,14 +1,14 @@
 import { keyMove, type ListMove } from "./tui-list";
 
 /**
- * Where the browser is: the list screen (with the wide detail pane when the
- * terminal has room), a detail screen below 120 columns, Evidence, the
+ * Where the browser is: the list screen (with a preview of the selected row
+ * beside it when the terminal has room), the details screen, Evidence, the
  * filter screen, or the key list.
  */
 export type BrowserScreen = "list" | "detail" | "evidence" | "filters" | "help";
 
-/** What receives keys on the list screen: the search input, the list, or the wide detail pane. */
-export type BrowserFocus = "search" | "list" | "pane";
+/** What receives keys on the list screen: the search input or the list. */
+export type BrowserFocus = "search" | "list";
 
 /** The fields of an OpenTUI `KeyEvent` the router reads. */
 export interface RoutedKey {
@@ -25,6 +25,8 @@ export interface RoutedKey {
 export type BrowserAction =
   | { readonly type: "move"; readonly move: ListMove }
   | { readonly type: "scroll"; readonly move: ListMove }
+  /** `picker` on a model row; `open` on a provider header. */
+  | { readonly type: "select" }
   | { readonly type: "open" }
   | { readonly type: "back" }
   | { readonly type: "collapse" }
@@ -96,6 +98,7 @@ const ACTION_CHARS: Readonly<Record<string, BrowserAction>> = {
 
 /** List-only actions. */
 const LIST_CHARS: Readonly<Record<string, BrowserAction>> = {
+  i: { type: "open" },
   f: { type: "filters" },
   x: { type: "clear" },
   s: { type: "sort" },
@@ -134,9 +137,8 @@ export function routeKey(
           return { type: "leave-search" };
         return undefined;
       }
-      if (context.focus === "pane") return routeDetail(context, key, char);
       if (move) return { type: "move", move };
-      if (isEnter(key)) return { type: "open" };
+      if (isEnter(key)) return { type: "select" };
       if (key.name === "left") return { type: "collapse" };
       if (key.name === "right") return { type: "expand" };
       return (
@@ -145,7 +147,12 @@ export function routeKey(
       );
     }
     case "detail":
-      return routeDetail(context, key, char);
+      // `i` closes what `i` opened.
+      if (move) return { type: "scroll", move };
+      if (isEnter(key)) return { type: "select" };
+      if (isBackspace(key) || key.name === "left" || char === "i")
+        return { type: "back" };
+      return charAction(char, context, ACTION_CHARS);
     case "evidence": {
       if (move) return { type: "scroll", move };
       if (isBackspace(key)) return { type: "back" };
@@ -174,15 +181,4 @@ export function routeKey(
       return undefined;
     }
   }
-}
-
-function routeDetail(
-  context: RouteContext,
-  key: RoutedKey,
-  char: string | undefined,
-): BrowserAction | undefined {
-  const move = keyMove(key.name);
-  if (move) return { type: "scroll", move };
-  if (isBackspace(key)) return { type: "back" };
-  return charAction(char, context, ACTION_CHARS);
 }

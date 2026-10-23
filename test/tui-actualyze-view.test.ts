@@ -740,6 +740,38 @@ describe("keys under a card", () => {
     h.press("c");
     expect(h.dispatch).toHaveBeenCalledWith("provider.connect");
   });
+
+  it("never selects or opens the row hidden under a card", async () => {
+    // OpenCode lists a model, but the card for a foreign provider replaces the list.
+    const h = harness({ ...READY, catalog: payload(undefined, "foreign") });
+    await openedAt(h, /Another plugin or a models\.dev catalog/);
+    for (const name of ["return", "i", "m"])
+      expect(h.press(name).preventDefault).not.toHaveBeenCalled();
+    expect(h.dispatch).not.toHaveBeenCalled();
+    expect(pane(h.root())).toMatch(/Another plugin or a models\.dev catalog/);
+  });
+});
+
+describe("selecting a model", () => {
+  it("hands the model to OpenCode's picker with its search filled in", async () => {
+    const h = harness(READY);
+    await h.open();
+    await vi.waitFor(() => expect(rootHeight(h.root())).toBe(FULL_HEIGHT));
+    const field = {
+      id: "picker-search",
+      traits: { status: "FILTER" },
+      value: "",
+    };
+    h.dispatch.mockImplementation((command: string) => {
+      if (command === "model.list")
+        Object.assign(h.context.renderer, { currentFocusedRenderable: field });
+    });
+    const event = h.press("return");
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(h.dispatch).toHaveBeenCalledWith("model.list");
+    // The integration is connected, so the provider's name leads the search.
+    await vi.waitFor(() => expect(field.value).toBe("Actualyze Claude Haiku"));
+  });
 });
 
 describe("status line", () => {

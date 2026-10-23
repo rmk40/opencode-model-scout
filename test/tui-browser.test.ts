@@ -170,7 +170,10 @@ describe("routeKey", () => {
       type: "focus-search",
     });
     expect(routeKey(list, { name: "left" })).toEqual({ type: "collapse" });
-    expect(routeKey(list, { name: "return" })).toEqual({ type: "open" });
+    expect(routeKey(list, { name: "return" })).toEqual({ type: "select" });
+    expect(routeKey(list, { name: "i", sequence: "i" })).toEqual({
+      type: "open",
+    });
     expect(routeKey(list, { name: "pagedown" })).toEqual({
       type: "move",
       move: "pagedown",
@@ -203,11 +206,8 @@ describe("routeKey", () => {
     ).toBeUndefined();
   });
 
-  it("scrolls and goes back in the detail pane and screens, and keeps list-only keys out", () => {
-    for (const context of [
-      { screen: "list", focus: "pane" },
-      { screen: "detail", focus: "list" },
-    ] as const) {
+  it("scrolls and goes back on the details screen, and keeps list-only keys out", () => {
+    for (const context of [{ screen: "detail", focus: "list" }] as const) {
       expect(routeKey(context, { name: "down" })).toEqual({
         type: "scroll",
         move: "down",
@@ -219,7 +219,7 @@ describe("routeKey", () => {
         type: "picker",
       });
       expect(routeKey(context, { name: "f", sequence: "f" })).toBeUndefined();
-      expect(routeKey(context, { name: "return" })).toBeUndefined();
+      expect(routeKey(context, { name: "return" })).toEqual({ type: "select" });
     }
     expect(
       routeKey({ screen: "list", focus: "list" }, { name: "backspace" }),

@@ -41,6 +41,8 @@ export interface HostModel {
   readonly name: string;
   readonly family?: string;
   readonly enabled: boolean;
+  /** `alpha`, `beta`, `deprecated`, or `active`; OpenCode's picker leaves `deprecated` models out. */
+  readonly status?: string;
   readonly capabilities: {
     readonly tools: boolean;
     readonly input: readonly string[];
@@ -107,6 +109,8 @@ export interface ModelRow {
   priceTiers?: readonly PriceTier[];
   /** The host's explicit `capabilities.temperature`, when it states one. */
   hostTemperature?: boolean;
+  /** The host's release status, when it lists the model. */
+  hostStatus?: string;
   provenance?: Partial<
     Record<ModelScalarField, ScalarEvidence<string | number>>
   >;
@@ -656,6 +660,7 @@ export function toModelRow(
     cost: discovered ? evidence.cost : hostCost(host),
     ...(priceTiers.length > 0 ? { priceTiers } : {}),
     ...(hostTemperature === undefined ? {} : { hostTemperature }),
+    ...(typeof host?.status === "string" ? { hostStatus: host.status } : {}),
     provenance,
     warnings,
   };

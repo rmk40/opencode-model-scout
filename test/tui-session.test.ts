@@ -407,12 +407,17 @@ function harness(options: HarnessOptions = {}) {
   });
   const store = { get: vi.fn(), set: vi.fn(), remove: vi.fn() };
   let currentModel: { providerID: string; modelID: string } | undefined;
+  let integrations: Array<{ id: string; connections: unknown[] }> = [];
+  const integrationList = vi.fn(() => integrations);
 
   const context = {
     location: "location" in options ? options.location : PROJECT,
     data: {
       on: dataOn,
-      location: { default: () => ({ directory: "/default/project" }) },
+      location: {
+        default: () => ({ directory: "/default/project" }),
+        integration: { list: integrationList },
+      },
     },
     client: {
       rpc,
@@ -480,10 +485,14 @@ function harness(options: HarnessOptions = {}) {
     catalog,
     refresh,
     store,
+    integrationList,
     show,
     ready,
     press,
     current: () => open,
+    setIntegrations: (next: Array<{ id: string; connections: unknown[] }>) => {
+      integrations = next;
+    },
     setHostModels: (models: HostModel[]) => {
       hostModels = models;
     },
@@ -720,6 +729,16 @@ describe("the m key", () => {
       "Atlas Model",
       "Hidden from OpenCode's model picker",
     ],
+    [
+      "a deprecated model",
+      (h: Harness) => {
+        h.setHostModels([
+          hostModel("atlas-model", "Atlas Model", { status: "deprecated" }),
+        ]);
+      },
+      "Atlas Model",
+      "Deprecated; not in OpenCode's model picker",
+    ],
   ])(
     "explains instead of opening the picker for %s",
     async (_label, arrange, rowName, reason) => {
@@ -727,7 +746,7 @@ describe("the m key", () => {
       arrange(h);
       const { root } = await h.ready();
       while (!selectedRow(root)?.includes(rowName)) h.press({ name: "down" });
-      expect(footerRole(root, "picker")).toBe("text.action.primary.disabled");
+      expect(footerRole(root, "select")).toBe("text.action.primary.disabled");
       expect(pane(root)).toContain(reason);
       const event = h.press({ name: "m" });
       expect(event.preventDefault).toHaveBeenCalled();
@@ -739,7 +758,7 @@ describe("the m key", () => {
   it("asks for a model on a provider header, and opens the picker for a listed model", async () => {
     const h = harness();
     const { root } = await h.ready();
-    expect(footerRole(root, "picker")).toBe("text.base");
+    expect(footerRole(root, "select")).toBe("text.base");
     h.press({ name: "home" });
     h.press({ name: "m" });
     expect(line(root, "modelscout-notice")).toBe(
@@ -749,6 +768,686 @@ describe("the m key", () => {
     h.press({ name: "m" });
     expect(h.context.keymap.dispatch).toHaveBeenCalledWith("model.list");
   });
+});
+
+/** Move the list selection down until the row named `name` is selected. */
+function selectRowNamed(h: Harness, root: unknown, name: string): void {
+  for (let step = 0; step < 10 && !selectedRow(root)?.includes(name); step += 1)
+    h.press({ name: "down" });
+  expect(selectedRow(root)).toContain(name);
+}
+
+describe("enter", () => {
+  it.each([
+    [
+      "an embedding model",
+      (h: Harness) => {
+        h.catalog.mockResolvedValue(
+          payload([
+            providerRecord({
+              models: [
+                evidenceModel("atlas-model", {
+                  modelType: knownScalar(
+                    "embedding",
+                    "provider-probe",
+                    "authoritative",
+                  ),
+                }),
+              ],
+            }),
+          ]),
+        );
+      },
+      // Embeddings are hidden until the type filter shows them.
+      (h: Harness) => {
+        h.press({ name: "f" });
+        h.press({ name: "down" });
+        h.press({ name: "left" });
+        h.press({ name: "backspace" });
+      },
+      "Atlas Model",
+      "Embedding model; not in the chat picker",
+    ],
+    [
+      "a model OpenCode does not list",
+      (h: Harness) => {
+        h.catalog.mockResolvedValue(
+          payload([providerRecord({ models: [evidenceModel("ghost")] })]),
+        );
+      },
+      undefined,
+      "ghost",
+      "Not in OpenCode's model list yet",
+    ],
+    [
+      "a model hidden from the picker",
+      (h: Harness) => {
+        h.setHostModels([
+          hostModel("atlas-model", "Atlas Model", { enabled: false }),
+        ]);
+      },
+      undefined,
+      "Atlas Model",
+      "Hidden from OpenCode's model picker",
+    ],
+    [
+      "a deprecated model",
+      (h: Harness) => {
+        h.setHostModels([
+          hostModel("atlas-model", "Atlas Model", { status: "deprecated" }),
+        ]);
+      },
+      undefined,
+      "Atlas Model",
+      "Deprecated; not in OpenCode's model picker",
+    ],
+  ])(
+    "explains instead of opening the picker for %s, on the list and in details",
+    async (_label, arrange, reveal, rowName, reason) => {
+      const h = harness();
+      arrange(h);
+      const { root } = await h.ready();
+      reveal?.(h);
+      selectRowNamed(h, root, rowName);
+
+      const onList = h.press({ name: "return" });
+      expect(onList.preventDefault).toHaveBeenCalled();
+      expect(line(root, "modelscout-notice")).toBe(reason);
+
+      h.press({ name: "i" });
+      expect(line(root, "modelscout-footer")).toMatch(
+        /^select enter {2}back backspace/,
+      );
+      expect(footerRole(root, "select")).toBe("text.action.primary.disabled");
+      // A copy replaces the notice, so the next one comes from enter in details.
+      h.press({ name: "y" });
+      expect(line(root, "modelscout-notice")).toMatch(/^Copy sent/);
+      const inDetails = h.press({ name: "return" });
+      expect(inDetails.preventDefault).toHaveBeenCalled();
+      expect(line(root, "modelscout-notice")).toBe(reason);
+      expect(h.context.keymap.dispatch).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["alpha", "beta", "active"])(
+    "opens the picker with enter and m for a model whose status is %s",
+    async (status) => {
+      const h = harness();
+      h.setHostModels([hostModel("atlas-model", "Atlas Model", { status })]);
+      const { root } = await h.ready();
+      expect(selectedRow(root)).toContain("Atlas Model");
+      expect(footerRole(root, "select")).toBe("text.base");
+      h.press({ name: "return" });
+      h.press({ name: "m" });
+      expect(h.context.keymap.dispatch.mock.calls).toEqual([
+        ["model.list"],
+        ["model.list"],
+      ]);
+    },
+  );
+
+  it.each([
+    ["the list", 120, 36, []],
+    ["the wide details screen", 120, 36, ["i"]],
+    ["the narrow details screen", 80, 24, ["i"]],
+  ] as const)(
+    "opens the picker for a listed model from %s, consuming the key",
+    async (_label, columns, rows, before) => {
+      const h = harness({ terminalWidth: columns, terminalHeight: rows });
+      await h.ready();
+      for (const name of before) h.press({ name });
+      const event = h.press({ name: "return" });
+      expect(event.preventDefault).toHaveBeenCalled();
+      expect(h.context.keymap.dispatch).toHaveBeenCalledExactlyOnceWith(
+        "model.list",
+      );
+    },
+  );
+
+  it("opens a provider header's full-width details screen, where enter does nothing", async () => {
+    const h = harness();
+    const { root } = await h.ready();
+    h.press({ name: "home" });
+    h.press({ name: "return" });
+    expect(visible(findNodeById(root, "modelscout-list"))).toBe(false);
+    expect(findNodeById(root, "modelscout-pane")?.props?.width).toBe(110);
+    expect(pane(root)).toMatch(/Server type +vLLM, detected automatically/);
+    expect(line(root, "modelscout-footer")).toMatch(
+      /^back backspace {2}copy y/,
+    );
+    const shown = pane(root);
+    h.press({ name: "return" });
+    expect(h.context.keymap.dispatch).not.toHaveBeenCalled();
+    expect(pane(root)).toBe(shown);
+    // One backspace still returns, so enter opened no second screen.
+    h.press({ name: "backspace" });
+    expect(visible(findNodeById(root, "modelscout-list"))).toBe(true);
+    expect(selectedRow(root)).toMatch(/Atlas +1 model/);
+  });
+});
+
+describe("leaving details", () => {
+  it.each([
+    ["wide", 120, 36],
+    ["narrow", 80, 24],
+  ] as const)(
+    "returns to the list with backspace, left, or i, on the same row and without collapsing (%s)",
+    async (_label, columns, rows) => {
+      const h = harness({ terminalWidth: columns, terminalHeight: rows });
+      h.setHostModels([
+        hostModel("m-a", "Model A"),
+        hostModel("m-b", "Model B"),
+      ]);
+      const { root } = await h.ready();
+      h.press({ name: "down" });
+      expect(selectedRow(root)).toContain("Model B");
+      for (const name of ["backspace", "left", "i"]) {
+        h.press({ name: "i" });
+        expect(visible(findNodeById(root, "modelscout-list"))).toBe(false);
+        h.press({ name });
+        expect(visible(findNodeById(root, "modelscout-list"))).toBe(true);
+        expect(selectedRow(root)).toContain("Model B");
+        expect(listRows(root)).toHaveLength(3);
+      }
+      // The list has the keys again.
+      h.press({ name: "up" });
+      expect(selectedRow(root)).toContain("Model A");
+    },
+  );
+});
+
+describe("footer hints by row and screen", () => {
+  it("offers select and details i on a model row, and details enter on a provider header", async () => {
+    const h = harness();
+    const { root } = await h.ready();
+    expect(line(root, "modelscout-footer")).toMatch(
+      /^select enter {2}details i {2}copy y/,
+    );
+    expect(footerRole(root, "select")).toBe("text.base");
+    h.press({ name: "home" });
+    expect(line(root, "modelscout-footer")).toMatch(
+      /^details enter {2}collapse ←/,
+    );
+  });
+
+  it.each([
+    ["wide detail screen", 120, 36],
+    ["narrow detail screen", 80, 24],
+  ] as const)(
+    "offers select, back, and copy in the %s on a model, and no select on a provider",
+    async (_label, columns, rows) => {
+      const h = harness({ terminalWidth: columns, terminalHeight: rows });
+      const { root } = await h.ready();
+      h.press({ name: "i" });
+      expect(line(root, "modelscout-footer")).toMatch(
+        /^select enter {2}back backspace {2}copy y/,
+      );
+      expect(footerRole(root, "select")).toBe("text.base");
+      h.press({ name: "backspace" });
+      h.press({ name: "home" });
+      h.press({ name: "i" });
+      expect(line(root, "modelscout-footer")).toMatch(
+        /^back backspace {2}copy y/,
+      );
+    },
+  );
+});
+
+// ── The model picker's search ───────────────────────────────────────────
+
+/** A focused input as OpenCode's model picker mounts its search. */
+function pickerSearch(value = "") {
+  return { id: "picker-search", traits: { status: "FILTER" }, value };
+}
+
+/** Report `field` as the renderer's focused renderable, as OpenTUI does. */
+function focusField(h: Harness, field: unknown): void {
+  h.renderer.currentFocusedRenderable = field;
+}
+
+/**
+ * Open the browser on the fake clock; `model.list` replaces the dialog, as
+ * OpenCode's picker does.
+ */
+async function openForPicker(h: Harness): Promise<unknown> {
+  const { root } = await h.show();
+  await settle();
+  expect(listRows(root).length).toBeGreaterThan(0);
+  h.context.keymap.dispatch.mockImplementation((command: string) => {
+    if (command === "model.list") h.dialog.show(() => "picker");
+  });
+  return root;
+}
+
+describe("the picker's search", () => {
+  const connected = [
+    { id: "other", connections: [] },
+    { id: "atlas", connections: [{ id: "c1" }] },
+  ];
+
+  it.each([
+    [
+      "an integration has a connection",
+      (h: Harness) => h.setIntegrations(connected),
+      "Atlas Cloud Atlas Model",
+    ],
+    [
+      "integrations have no connection",
+      (h: Harness) => h.setIntegrations([{ id: "atlas", connections: [] }]),
+      "Atlas Model",
+    ],
+    ["there are no integrations", (_h: Harness) => undefined, "Atlas Model"],
+    [
+      "the integration list cannot be read",
+      (h: Harness) =>
+        h.integrationList.mockImplementation(() => {
+          throw new Error("not synced");
+        }),
+      "Atlas Model",
+    ],
+  ])(
+    "types OpenCode's provider and model names when %s",
+    async (_label, arrange, query) => {
+      useFakeClock(GENERATED_AT);
+      const h = harness();
+      h.setHostProviders([hostProvider("atlas", "Atlas Cloud")]);
+      arrange(h);
+      await openForPicker(h);
+      h.press({ name: "return" });
+      const field = pickerSearch();
+      focusField(h, field);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(field.value).toBe(query);
+    },
+  );
+
+  it("names a provider OpenCode does not list by its ID", async () => {
+    useFakeClock(GENERATED_AT);
+    const h = harness();
+    h.setHostProviders([]);
+    h.setIntegrations(connected);
+    await openForPicker(h);
+    h.press({ name: "return" });
+    const field = pickerSearch();
+    focusField(h, field);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(field.value).toBe("atlas Atlas Model");
+  });
+
+  // Both rows, so neither the first nor the last model with the ID passes by chance.
+  it.each([
+    ["Shared on Atlas", "Atlas Shared on Atlas"],
+    ["Shared on Bravo", "Bravo Shared on Bravo"],
+  ])(
+    "types the names of the selected model %j when two providers share its ID",
+    async (rowName, query) => {
+      useFakeClock(GENERATED_AT);
+      const h = harness();
+      h.setHostProviders([
+        hostProvider("atlas", "Atlas"),
+        hostProvider("bravo", "Bravo"),
+      ]);
+      h.setHostModels([
+        hostModel("shared", "Shared on Atlas"),
+        hostModel("shared", "Shared on Bravo", { providerID: "bravo" }),
+      ]);
+      h.setIntegrations(connected);
+      const root = await openForPicker(h);
+      selectRowNamed(h, root, rowName);
+      h.press({ name: "return" });
+      const field = pickerSearch();
+      focusField(h, field);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(field.value).toBe(query);
+    },
+  );
+
+  it("waits for the picker's search, passing over scout's own search and other inputs", async () => {
+    useFakeClock(GENERATED_AT);
+    const h = harness();
+    await openForPicker(h);
+    h.press({ name: "m" });
+    // Scout's search is skipped by its ID even if it carried the trait.
+    const own = {
+      id: "modelscout-search",
+      traits: { status: "FILTER" },
+      value: "",
+    };
+    const prompt = { id: "prompt", traits: {}, value: "" };
+    const select = { id: "list", traits: { status: "FILTER" }, value: 3 };
+    for (const other of [undefined, own, prompt, select]) {
+      focusField(h, other);
+      await vi.advanceTimersByTimeAsync(50);
+    }
+    expect(own.value).toBe("");
+    expect(prompt.value).toBe("");
+    expect(select.value).toBe(3);
+    const field = pickerSearch();
+    focusField(h, field);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(field.value).toBe("Atlas Model");
+  });
+
+  it("keeps a search the user already started and stops looking", async () => {
+    useFakeClock(GENERATED_AT);
+    const h = harness();
+    await openForPicker(h);
+    h.press({ name: "return" });
+    const started = pickerSearch("gp");
+    focusField(h, started);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(started.value).toBe("gp");
+    const later = pickerSearch();
+    focusField(h, later);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(later.value).toBe("");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("fills the search once, leaving it alone after the user clears it", async () => {
+    useFakeClock(GENERATED_AT);
+    const h = harness();
+    await openForPicker(h);
+    h.press({ name: "return" });
+    const field = pickerSearch();
+    focusField(h, field);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(field.value).toBe("Atlas Model");
+    // The picker replaced the browser, so no key listener of scout's is left.
+    expect(h.keyListeners.size).toBe(0);
+    field.value = "";
+    await vi.advanceTimersByTimeAsync(200);
+    expect(field.value).toBe("");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([
+    [900, "Atlas Model"],
+    [1_100, ""],
+  ])(
+    "looks for about a second: a search that appears after %i ms gets %j",
+    async (after, expected) => {
+      useFakeClock(GENERATED_AT);
+      const h = harness();
+      await openForPicker(h);
+      h.press({ name: "return" });
+      await vi.advanceTimersByTimeAsync(after);
+      const field = pickerSearch();
+      focusField(h, field);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(field.value).toBe(expected);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(h.keyListeners.size).toBe(0);
+    },
+  );
+
+  it("stops looking when the plugin cleans up, removing its timer and key listener at once", async () => {
+    useFakeClock(GENERATED_AT);
+    const h = harness();
+    await openForPicker(h);
+    h.press({ name: "return" });
+    await vi.advanceTimersByTimeAsync(50);
+    expect(h.keyListeners.size).toBe(1);
+    expect(vi.getTimerCount()).toBe(1);
+    closeBrowsers(h.pluginContext);
+    expect(h.keyListeners.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    const field = pickerSearch();
+    focusField(h, field);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(field.value).toBe("");
+  });
+
+  it.each([
+    [
+      "the focused renderable cannot be read",
+      (h: Harness) =>
+        Object.defineProperty(h.renderer, "currentFocusedRenderable", {
+          configurable: true,
+          get() {
+            throw new Error("renderer destroyed");
+          },
+        }),
+    ],
+    [
+      "it fails only on a later look",
+      (h: Harness) => {
+        let looks = 0;
+        Object.defineProperty(h.renderer, "currentFocusedRenderable", {
+          configurable: true,
+          get() {
+            looks += 1;
+            if (looks > 1) throw new Error("renderer destroyed");
+            return undefined;
+          },
+        });
+      },
+    ],
+    [
+      "the search refuses the value",
+      (h: Harness) =>
+        focusField(h, {
+          id: "picker-search",
+          traits: { status: "FILTER" },
+          get value() {
+            return "";
+          },
+          set value(_next: string) {
+            throw new Error("read-only");
+          },
+        }),
+    ],
+  ])("never throws when %s", async (_label, arrange) => {
+    useFakeClock(GENERATED_AT);
+    const h = harness();
+    await openForPicker(h);
+    arrange(h);
+    expect(() => h.press({ name: "return" })).not.toThrow();
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(h.context.keymap.dispatch).toHaveBeenCalledWith("model.list");
+  });
+
+  it("neither throws nor types anywhere when the picker cannot be opened", async () => {
+    useFakeClock(GENERATED_AT);
+    const h = harness();
+    await openForPicker(h);
+    h.context.keymap.dispatch.mockImplementation(() => {
+      throw new Error("unknown command");
+    });
+    const field = pickerSearch();
+    focusField(h, field);
+    expect(() => h.press({ name: "return" })).not.toThrow();
+    await vi.advanceTimersByTimeAsync(100);
+    expect(field.value).toBe("");
+  });
+});
+
+/** A keypress as OpenTUI delivers it, with the flag its key handler reads. */
+interface EmittedKey {
+  readonly name: string;
+  readonly sequence: string;
+  readonly ctrl: boolean;
+  readonly meta: boolean;
+  readonly shift: boolean;
+  readonly option: boolean;
+  readonly super: boolean;
+  readonly hyper: boolean;
+  propagationStopped: boolean;
+  preventDefault(): void;
+  stopPropagation(): void;
+}
+
+type KeyListener = (key: EmittedKey) => void;
+
+/**
+ * A key input that calls listeners as OpenTUI's key handler does: only the
+ * listeners present when a keypress begins, in order, stopping after one
+ * that stops propagation. It offers `prependListener` only when `prepend`
+ * is set.
+ */
+function keyEmitter(prepend: boolean) {
+  let listeners: KeyListener[] = [];
+  const on = vi.fn((event: string, listener: KeyListener) => {
+    if (event === "keypress") listeners = [...listeners, listener];
+  });
+  const off = vi.fn((event: string, listener: KeyListener) => {
+    if (event === "keypress")
+      listeners = listeners.filter((item) => item !== listener);
+  });
+  const prependListener = vi.fn((event: string, listener: KeyListener) => {
+    if (event === "keypress") listeners = [listener, ...listeners];
+  });
+  return {
+    keyInput: prepend ? { on, off, prependListener } : { on, off },
+    on,
+    prependListener,
+    count: () => listeners.length,
+    /** Listen ahead of every other listener, as OpenCode's keymap does. */
+    first: (listener: KeyListener) => {
+      listeners = [listener, ...listeners];
+    },
+    press(name: string, modifiers: { ctrl?: boolean } = {}): EmittedKey {
+      const key: EmittedKey = {
+        name,
+        sequence: name.length === 1 ? name : "",
+        ctrl: modifiers.ctrl ?? false,
+        meta: false,
+        shift: false,
+        option: false,
+        super: false,
+        hyper: false,
+        propagationStopped: false,
+        preventDefault: () => undefined,
+        stopPropagation: () => {
+          key.propagationStopped = true;
+        },
+      };
+      for (const listener of [...listeners]) {
+        listener(key);
+        if (key.propagationStopped) break;
+      }
+      return key;
+    },
+  };
+}
+
+type KeyEmitter = ReturnType<typeof keyEmitter>;
+
+describe("keys during the picker handoff", () => {
+  /** Open the browser with `keys` as its key input; `model.list` replaces it. */
+  async function openWith(h: Harness, keys: KeyEmitter): Promise<unknown> {
+    h.renderer.keyInput = keys.keyInput;
+    return openForPicker(h);
+  }
+
+  const emitters = [
+    ["with prependListener", true],
+    ["with on alone", false],
+  ] as const;
+
+  it.each(emitters)(
+    "fills after the handoff key, which never reaches the new listener, and then stops listening (%s)",
+    async (_label, prepend) => {
+      useFakeClock(GENERATED_AT);
+      const h = harness();
+      const keys = keyEmitter(prepend);
+      await openWith(h, keys);
+      keys.press("return");
+      // The picker replaced the browser; only the pre-fill listens now.
+      expect(keys.count()).toBe(1);
+      const field = pickerSearch();
+      focusField(h, field);
+      await vi.advanceTimersByTimeAsync(50);
+      expect(field.value).toBe("Atlas Model");
+      expect(keys.count()).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
+
+  it.each(emitters)(
+    "ends the attempt on any key that arrives before the fill (%s)",
+    async (_label, prepend) => {
+      useFakeClock(GENERATED_AT);
+      const h = harness();
+      const keys = keyEmitter(prepend);
+      await openWith(h, keys);
+      keys.press("return");
+      keys.press("x");
+      expect(keys.count()).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+      const field = pickerSearch();
+      focusField(h, field);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(field.value).toBe("");
+    },
+  );
+
+  it("hears a key OpenCode's keymap stops, because it listens ahead of the keymap", async () => {
+    useFakeClock(GENERATED_AT);
+    const h = harness();
+    const keys = keyEmitter(true);
+    // The keymap listens ahead of plugins and stops the keys it handles,
+    // such as ctrl+a, which opens another dialog with a filter input.
+    keys.first((key) => {
+      if (key.ctrl) key.stopPropagation();
+    });
+    await openWith(h, keys);
+    keys.press("return");
+    keys.press("a", { ctrl: true });
+    expect(keys.count()).toBe(1);
+    const field = pickerSearch();
+    focusField(h, field);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(field.value).toBe("");
+  });
+
+  it("ends an earlier attempt when another handoff starts, so its query never reaches the newer picker", async () => {
+    useFakeClock(GENERATED_AT);
+    const h = harness();
+    h.setHostModels([hostModel("m-a", "Model A"), hostModel("m-b", "Model B")]);
+    // Without prependListener the browser, which stays open here, goes
+    // first and stops the keys it handles, so the earlier attempt never
+    // hears them and only the second handoff can end it.
+    const keys = keyEmitter(false);
+    h.renderer.keyInput = keys.keyInput;
+    const { root } = await h.show();
+    await settle();
+    expect(selectedRow(root)).toContain("Model A");
+    keys.press("return");
+    await vi.advanceTimersByTimeAsync(5);
+    keys.press("down");
+    expect(selectedRow(root)).toContain("Model B");
+    keys.press("return");
+    // The browser and the newer attempt.
+    expect(keys.count()).toBe(2);
+    const field = pickerSearch();
+    focusField(h, field);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(field.value).toBe("Model B");
+  });
+
+  it.each([
+    ["on", false],
+    ["prependListener", true],
+  ] as const)(
+    "types nothing when %s cannot attach the key listener",
+    async (_method, prepend) => {
+      useFakeClock(GENERATED_AT);
+      const h = harness();
+      const keys = keyEmitter(prepend);
+      await openWith(h, keys);
+      (prepend ? keys.prependListener : keys.on).mockImplementation(() => {
+        throw new Error("emitter closed");
+      });
+      const field = pickerSearch();
+      focusField(h, field);
+      expect(() => keys.press("return")).not.toThrow();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(field.value).toBe("");
+      expect(keys.count()).toBe(0);
+      expect(vi.getTimerCount()).toBe(0);
+    },
+  );
 });
 
 // ── Copy ────────────────────────────────────────────────────────────────
@@ -973,7 +1672,7 @@ describe("selection", () => {
     h.setHostModels([hostModel("m-a", "Model A"), hostModel("m-b", "Model B")]);
     const { root } = await h.ready();
     h.press({ name: "down" });
-    h.press({ name: "return" });
+    h.press({ name: "i" });
     expect(visible(findNodeById(root, "modelscout-list"))).toBe(false);
     h.setHostModels([]);
     h.setHostProviders([]);
@@ -1123,28 +1822,160 @@ describe("updates", () => {
 // ── Keys and screens ────────────────────────────────────────────────────
 
 describe("wide layout keys", () => {
-  it("moves focus into the pane on enter, scrolls it without moving the list, and backspace returns", async () => {
+  it("opens the details over the list on i, scrolls them without moving the list, and backspace returns", async () => {
     const h = harness();
     const { root } = await h.ready();
     const before = selectedRow(root);
-    h.press({ name: "return" });
-    expect(line(root, "modelscout-footer")).toMatch(/^back backspace/);
+    h.press({ name: "i" });
+    expect(visible(findNodeById(root, "modelscout-list"))).toBe(false);
+    expect(line(root, "modelscout-footer")).toMatch(
+      /^select enter {2}back backspace/,
+    );
     h.press({ name: "down" });
-    expect(selectedRow(root)).toBe(before);
     h.press({ name: "backspace" });
-    expect(line(root, "modelscout-footer")).toMatch(/^details enter/);
+    expect(selectedRow(root)).toBe(before);
+    expect(line(root, "modelscout-footer")).toMatch(
+      /^select enter {2}details i/,
+    );
   });
 
-  it("turns a focused pane into the detail screen when the terminal narrows", async () => {
+  it("keeps the details screen when the terminal narrows", async () => {
     const h = harness();
     const { root } = await h.ready();
-    h.press({ name: "return" });
+    h.press({ name: "i" });
     h.resize(80, 24);
     expect(visible(findNodeById(root, "modelscout-list"))).toBe(false);
     expect(pane(root)).toContain("atlas/atlas-model");
     h.press({ name: "backspace" });
     expect(visible(findNodeById(root, "modelscout-list"))).toBe(true);
     expect(line(root, "modelscout-summary")).toMatch(/^Atlas Model/);
+  });
+});
+
+describe("the preview beside the list", () => {
+  /** 16 rows leave a body shorter than a model's or a provider's details. */
+  const short = { terminalWidth: 120, terminalHeight: 16 };
+  const shownPane = (root: unknown): string[] => lines(root, "modelscout-pane");
+
+  it("follows the selection under every move key, from its top, and never takes the keys", async () => {
+    const h = harness(short);
+    h.setHostModels([
+      hostModel("m-a", "Model A"),
+      hostModel("m-b", "Model B"),
+      hostModel("m-c", "Model C"),
+    ]);
+    const { root } = await h.ready();
+    for (const [name, row, subject] of [
+      ["down", "Model B", "atlas/m-b"],
+      ["end", "Model C", "atlas/m-c"],
+      ["up", "Model B", "atlas/m-b"],
+      ["home", "Atlas", "https://atlas.test"],
+      ["pagedown", "Model C", "atlas/m-c"],
+      ["pageup", "Atlas", "https://atlas.test"],
+    ] as const) {
+      h.press({ name });
+      expect(selectedRow(root), name).toContain(row);
+      expect(visible(findNodeById(root, "modelscout-list"))).toBe(true);
+      const preview = shownPane(root);
+      expect(preview.join("\n"), name).toContain(subject);
+      expect(preview[0], name).not.toMatch(/^↑/);
+      expect(preview.at(-1), name).toMatch(/^↓ \d+ more · i$/);
+    }
+  });
+
+  it("names i in the more line of the side preview only", async () => {
+    const h = harness(short);
+    const { root } = await h.ready();
+    const last = (): string | undefined => shownPane(root).at(-1);
+    expect(last()).toMatch(/^↓ \d+ more · i$/);
+    for (const [open, close] of [
+      ["i", "backspace"],
+      ["d", "backspace"],
+      ["?", "?"],
+    ]) {
+      h.press({ name: open, sequence: open });
+      expect(last(), open).toMatch(/^↓ (\d+ )?more$/);
+      h.press({ name: close, sequence: close === "?" ? "?" : "" });
+      expect(last(), open).toMatch(/^↓ \d+ more · i$/);
+    }
+  });
+
+  it("keeps the more line plain on a card in place of the list", async () => {
+    const h = harness(short);
+    h.setHostProviders([]);
+    h.setHostModels([]);
+    h.catalog.mockResolvedValue(payload([]));
+    const { root } = await h.show();
+    await vi.waitFor(() =>
+      expect(shownPane(root).join("\n")).toContain(
+        "No OpenAI-compatible providers found.",
+      ),
+    );
+    expect(shownPane(root).at(-1)).toMatch(/^↓ \d+ more$/);
+  });
+
+  it("shows the preview from its top after the details screen was scrolled", async () => {
+    const h = harness(short);
+    const { root } = await h.ready();
+    h.press({ name: "i" });
+    for (let step = 0; step < 3; step += 1) h.press({ name: "down" });
+    expect(shownPane(root)[0]).toBe("↑ 3 more");
+    h.press({ name: "backspace" });
+    expect(shownPane(root)[0]).not.toMatch(/^↑/);
+    expect(shownPane(root).at(-1)).toMatch(/^↓ \d+ more · i$/);
+  });
+
+  it("gives the details screen the whole content width at every size, and keeps it open across a resize", async () => {
+    const h = harness();
+    const { root } = await h.ready();
+    const width = (): unknown =>
+      findNodeById(root, "modelscout-pane")?.props?.width;
+    const shows = (id: string): boolean => visible(findNodeById(root, id));
+    // The preview shares the 110 content columns with the list (58) and a separator (3).
+    expect(width()).toBe(49);
+    expect(shows("modelscout-separator")).toBe(true);
+    h.press({ name: "i" });
+    expect(width()).toBe(110);
+    expect(shows("modelscout-list")).toBe(false);
+    expect(shows("modelscout-separator")).toBe(false);
+    h.resize(80, 24);
+    expect(width()).toBe(72);
+    expect(shows("modelscout-list")).toBe(false);
+    h.resize(120, 36);
+    expect(width()).toBe(110);
+    expect(shows("modelscout-list")).toBe(false);
+    expect(pane(root)).toContain("atlas/atlas-model");
+    h.press({ name: "backspace" });
+    expect(width()).toBe(49);
+    expect(shows("modelscout-list")).toBe(true);
+  });
+
+  it("scrolls the details screen with every move key without moving the list", async () => {
+    const h = harness(short);
+    h.setHostModels([hostModel("m-a", "Model A"), hostModel("m-b", "Model B")]);
+    const { root } = await h.ready();
+    h.press({ name: "i" });
+    const first = (): string | undefined => shownPane(root)[0];
+    const last = (): string | undefined => shownPane(root).at(-1);
+    expect(first()).not.toMatch(/^↑/);
+    /** Lines hidden above, from the top row's `↑ N more`. */
+    const above = (): number =>
+      Number(/^↑ (\d+) more$/.exec(first() ?? "")?.[1] ?? 0);
+    h.press({ name: "down" });
+    expect(first()).toBe("↑ 1 more");
+    h.press({ name: "home" });
+    expect(first()).not.toMatch(/^↑/);
+    h.press({ name: "pagedown" });
+    const paged = above();
+    expect(paged).toBeGreaterThan(1);
+    h.press({ name: "pageup" });
+    expect(above()).toBeLessThan(paged);
+    h.press({ name: "end" });
+    expect(last()).not.toMatch(/^↓/);
+    h.press({ name: "up" });
+    expect(last()).toMatch(/^↓ \d+ more$/);
+    h.press({ name: "backspace" });
+    expect(selectedRow(root)).toContain("Model A");
   });
 });
 
@@ -1198,10 +2029,28 @@ describe("key list", () => {
     expect(text).toMatch(/k +another key/);
   });
 
+  it.each([
+    ["wide", 120, 36],
+    ["narrow", 80, 24],
+  ] as const)(
+    "lists enter / m as one picker entry and i for details (%s)",
+    async (_label, columns, rows) => {
+      const h = harness({ terminalWidth: columns, terminalHeight: rows });
+      const { root } = await h.ready();
+      h.press({ name: "?", sequence: "?" });
+      const shown = lines(root, "modelscout-pane");
+      expect(shown.filter((text) => /^enter \/ m\s/.test(text))).toEqual([
+        expect.stringMatching(/select the model in OpenCode's model picker$/),
+      ]);
+      expect(shown.some((text) => /^(enter|m)\s{2,}/.test(text))).toBe(false);
+      expect(shown.some((text) => /^i\s{2,}details/.test(text))).toBe(true);
+    },
+  );
+
   it("titles the key list after the view below it", async () => {
     const h = harness({ terminalWidth: 80, terminalHeight: 24 });
     const { root } = await h.ready();
-    h.press({ name: "return" });
+    h.press({ name: "i" });
     h.press({ name: "?", sequence: "?" });
     expect(pane(root)).toMatch(/^Keys · Model Scout details/);
     h.press({ name: "?", sequence: "?" });
@@ -1354,7 +2203,7 @@ describe("caller extra actions", () => {
       },
     );
     // The list footer has no room left for it at 110 columns; details do.
-    h.press({ name: "return" });
+    h.press({ name: "i" });
     expect(footerRole(root, "another key")).toBe(
       "text.action.primary.disabled",
     );
@@ -1417,7 +2266,7 @@ describe("provider settings", () => {
     h.resize(80, 24);
     h.press({ name: "down" });
     capture();
-    h.press({ name: "return" });
+    h.press({ name: "i" });
     capture();
 
     const everything = screens.join("\n");

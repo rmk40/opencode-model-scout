@@ -165,6 +165,77 @@ const FULL_LIST = {
   },
 };
 
+/**
+ * What is wrong with OpenCode's model picker on screen, or "" when its
+ * search reads `query` and the first result below it is `model`, drawn on
+ * the highlight background (one the picker's title row does not use).
+ */
+function pickerProblem(session, query, model) {
+  const data = session.getTerminalData();
+  const lines = data.lines.slice(0, data.rows);
+  const text = (line) => line.spans.map((span) => span.text).join("");
+  const title = lines.findIndex((line) => text(line).includes("Select model"));
+  if (title < 0) return "the picker is not open";
+  const search = lines.findIndex(
+    (line, index) => index > title && text(line).trim() !== "",
+  );
+  if (!text(lines[search]).includes(query))
+    return `the search reads ${JSON.stringify(text(lines[search]).trim())}`;
+  const first = lines.findIndex(
+    (line, index) => index > search && text(line).trim() !== "",
+  );
+  if (first < 0 || !text(lines[first]).includes(model))
+    return `the first result is ${JSON.stringify(text(lines[first] ?? { spans: [] }).trim())}`;
+  const titleBg = new Set(lines[title].spans.map((span) => span.bg));
+  const named = lines[first].spans.find((span) =>
+    span.text.includes(model.split(" ")[0]),
+  );
+  if (!named || titleBg.has(named.bg))
+    return "the first result is not highlighted";
+  return "";
+}
+
+/** Wait until the picker searches `query` and highlights `model` first. */
+function pickerHighlights(query, model) {
+  return {
+    label: `the picker searches ${JSON.stringify(query)} and highlights ${model} first`,
+    run: async (ctx) => {
+      const deadline = Date.now() + WAIT_TIMEOUT_MS;
+      let problem = "";
+      while (Date.now() < deadline) {
+        problem = pickerProblem(ctx.session, query, model);
+        if (!problem) return;
+        await sleep(100);
+      }
+      throw new Error(problem);
+    },
+  };
+}
+
+/**
+ * `i` on Mock Qwen2.5 Coder 7B: its details replace the list at every
+ * width, and from 120 columns they take the whole content width, so the
+ * output-limit sentence that wraps in the 49-column preview fits one row.
+ */
+const FULL_DETAILS = {
+  label: "the details replace the list and use the full width",
+  run: async (ctx) => {
+    const text = await ctx.session.text();
+    if (!text.includes("mock-compat/mock-qwen2.5-coder-7b"))
+      throw new Error("the details are not on screen");
+    // The prompt line behind the dialog can name the other models.
+    for (const row of ["▾ Mock compat", "Mock Tiered Pro"])
+      if (text.includes(row)) throw new Error(`list row ${row} still shows`);
+    if (
+      ctx.size.cols >= 120 &&
+      !/Max output +Not reported; OpenCode fits output to the remaining context/.test(
+        text,
+      )
+    )
+      throw new Error("the details do not use the full width");
+  },
+};
+
 /** `/modelscout` fits the screen like `/actualyze`'s list view. */
 const MODELSCOUT_FITS = {
   label: "the /modelscout dialog fits within rows - 4, centered",
@@ -254,6 +325,93 @@ const SCENARIOS = [
           record.models.length > 0,
       );
     },
+  },
+  {
+    name: "modelscout-select",
+    description:
+      "enter on a model, and m in its details, open OpenCode's model picker with the model searched and highlighted, and enter there selects it; i shows the details in place of the list, full width, and backspace returns",
+    actualyze: "default",
+    steps: [
+      { command: "/modelscout" },
+      { wait: "Model Scout" },
+      { wait: "Mock Llama 3.1 8B" },
+      { press: "home" },
+      { press: "down" },
+      { wait: /select enter {2}details i {2}copy y/ },
+      { screenshot: "list" },
+      { press: "enter" },
+      { waitGone: "Search name, ID, family, provider" },
+      // No integration has a connection, so the picker has no provider
+      // categories and the search is the model's name alone.
+      pickerHighlights("Mock Llama 3.1 8B", "Mock Llama 3.1 8B"),
+      { screenshot: "picker-enter" },
+      { press: "enter" },
+      { waitGone: "Select model" },
+      {
+        wait: /Build · Mock Llama 3\.1 8B/,
+        label: "the prompt uses the selected model",
+      },
+      { command: "/modelscout" },
+      { wait: "Mock Qwen2.5 Coder 7B" },
+      { press: "home" },
+      { press: "down" },
+      { press: "down" },
+      { press: "i" },
+      { wait: /select enter {2}back backspace {2}copy y/ },
+      FULL_DETAILS,
+      { screenshot: "details" },
+      { resize: "across" },
+      {
+        wait: "mock-compat/mock-qwen2.5-coder-7b",
+        label: "the details stay open across 120 columns",
+      },
+      { expectNot: "Mock Tiered Pro", label: "the list stays hidden" },
+      { resize: "restore" },
+      FULL_DETAILS,
+      { press: "backspace" },
+      { wait: /select enter {2}details i/, label: "backspace returns" },
+      { expect: "Mock Tiered Pro", label: "the list rows are back" },
+      { press: "i" },
+      { wait: /select enter {2}back backspace/ },
+      { press: "m" },
+      pickerHighlights("Mock Qwen2.5 Coder 7B", "Mock Qwen2.5 Coder 7B"),
+      { screenshot: "picker-m" },
+      { press: "enter" },
+      { waitGone: "Select model" },
+      {
+        wait: /Build · Mock Qwen2\.5 Coder 7B/,
+        label: "the prompt uses the model selected through m",
+      },
+    ],
+  },
+  {
+    name: "actualyze-select",
+    description:
+      "with the mock's ok key connected, enter on a model in /actualyze opens the picker searching provider and model, and enter there selects it",
+    actualyze: "mock",
+    connect: "ok",
+    steps: [
+      { command: "/actualyze" },
+      { wait: "Catalog accessible", timeout: 30_000 },
+      { wait: "GPT OSS 120B" },
+      { press: "home" },
+      { press: "down" },
+      { press: "down" },
+      { press: "down" },
+      { wait: /select enter {2}details i {2}copy y {2}another key k/ },
+      { press: "enter" },
+      { waitGone: "ACTUALYZE" },
+      // A connected integration gives the picker provider categories, so the
+      // search names the provider too.
+      pickerHighlights("Actualyze GPT OSS 120B", "GPT OSS 120B"),
+      { screenshot: "picker" },
+      { press: "enter" },
+      { waitGone: "Select model" },
+      {
+        wait: /Build · GPT OSS 120B Actualyze/,
+        label: "the prompt uses the selected model",
+      },
+    ],
   },
   {
     name: "actualyze-no-key",

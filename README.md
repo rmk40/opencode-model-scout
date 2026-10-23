@@ -530,8 +530,8 @@ name, and models within each provider by name until you change the sort.
   such as `▲ key rejected`, `▲ rate limited`, or `▲ unreachable`. A failing
   provider keeps the models from its last good discovery.
 - **`●`** before a model name marks the model the prompt uses now. A colored
-  band marks the selected row; while focus is elsewhere, such as in the
-  details pane, a `▌` marks it instead.
+  band marks the selected row; while the search box has focus, a `▌` marks
+  it instead.
 - **Context** is the context window. `~200K`, dimmed, means no source
   reported one and OpenCode uses its default of 200,000 tokens.
 - **`T I R`** stand for tool calls, image input, and reasoning. An uppercase
@@ -546,12 +546,14 @@ The title line counts providers and models and says how many providers need
 attention. Embedding models are hidden by default, and the filter line says
 how many, for example `1 embedding hidden`.
 
-At 120 columns and wider, the details of the selected row sit in a pane
-beside the list. In a narrower terminal, a one-line summary of the selected
-model sits under the list (facts that do not fit are counted as `+N`), and
-`enter` opens the details on their own screen. Details and the key list that
-run longer than the dialog scroll (the key list by whole entries), with `↑ N more` and `↓ N more` at the
-edges. Resizing the terminal switches between the two layouts without
+At 120 columns and wider, a preview of the selected row's details sits
+beside the list. The preview does not scroll: when it is cut off, its last
+line reads `↓ N more · i`. In a narrower terminal, a one-line summary of the
+selected model sits under the list instead (facts that do not fit are
+counted as `+N`). At any width, `i` opens the details on their own screen,
+across the whole dialog. Details and the key list that run longer than the
+dialog scroll (the key list by whole entries), with `↑ N more` and
+`↓ N more` at the edges. Resizing the terminal switches between the two layouts without
 closing the dialog. The dialog takes at most `rows - 4` rows, so it leaves
 room above and below it.
 
@@ -562,29 +564,29 @@ TUI exits.
 
 ### Keys
 
-| Key                                | Action                                                                                        |
-| ---------------------------------- | --------------------------------------------------------------------------------------------- |
-| `↑` `↓` `pgup` `pgdn` `home` `end` | Move through the list, or scroll the details                                                  |
-| `enter`                            | Open the details of the selected model or provider; in the wide layout, focus moves into them |
-| `backspace`                        | Go back from details, Evidence, the filter screen, or the key list                            |
-| `←` / `→`                          | Collapse or expand the selected provider                                                      |
-| `/`                                | Search; `enter` or `↓` returns to the list                                                    |
-| `f`                                | Open the filter screen                                                                        |
-| `x`                                | Clear search and filters                                                                      |
-| `s`                                | Change the sort order                                                                         |
-| `d`                                | Open [Evidence](#evidence) for the selected model or provider                                 |
-| `m`                                | Open OpenCode's model picker (see [Choosing a model](#choosing-a-model))                      |
-| `y`                                | Copy `provider/model`; on a provider header, the provider ID                                  |
-| `Y` (`Shift`+`y`)                  | Copy the raw model ID                                                                         |
-| `r`                                | Refresh the selected provider's discovery                                                     |
-| `R` (`Shift`+`r`)                  | Refresh every provider                                                                        |
-| `a`                                | Open [`/actualyze`](#actualyze-command)                                                       |
-| `?`                                | List the keys of the current view; `backspace` or `?` returns                                 |
-| `esc`                              | Close the browser                                                                             |
+| Key                                | Action                                                                                                                                                       |
+| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `↑` `↓` `pgup` `pgdn` `home` `end` | Move through the list, or scroll the details                                                                                                                 |
+| `enter` / `m`                      | Open OpenCode's model picker with the selected model highlighted (see [Choosing a model](#choosing-a-model)); `enter` on a provider header opens its details |
+| `i`                                | Open the details of the selected model or provider across the whole dialog                                                                                   |
+| `backspace`                        | Go back from details, Evidence, the filter screen, or the key list                                                                                           |
+| `←` / `→`                          | Collapse or expand the selected provider                                                                                                                     |
+| `/`                                | Search; `enter` or `↓` returns to the list                                                                                                                   |
+| `f`                                | Open the filter screen                                                                                                                                       |
+| `x`                                | Clear search and filters                                                                                                                                     |
+| `s`                                | Change the sort order                                                                                                                                        |
+| `d`                                | Open [Evidence](#evidence) for the selected model or provider                                                                                                |
+| `y`                                | Copy `provider/model`; on a provider header, the provider ID                                                                                                 |
+| `Y` (`Shift`+`y`)                  | Copy the raw model ID                                                                                                                                        |
+| `r`                                | Refresh the selected provider's discovery                                                                                                                    |
+| `R` (`Shift`+`r`)                  | Refresh every provider                                                                                                                                       |
+| `a`                                | Open [`/actualyze`](#actualyze-command)                                                                                                                      |
+| `?`                                | List the keys of the current view; `backspace` or `?` returns                                                                                                |
+| `esc`                              | Close the browser                                                                                                                                            |
 
 `f`, `x`, `s`, `←`, and `→` work in the list. The other keys also work in the
-details. Evidence takes the movement keys, `y`, `Y`, `/`, `?`, and
-`backspace`.
+details, where `i` and `←` go back like `backspace`. Evidence takes the
+movement keys, `y`, `Y`, `/`, `?`, and `backspace`.
 While the search box has focus, every key you type goes into the search.
 Keys held with `ctrl`, `alt`, or `cmd` always go to OpenCode.
 
@@ -659,12 +661,36 @@ Endpoint origins never include credentials, paths, or query strings.
 
 ### Choosing a model
 
-`m` opens OpenCode's model picker in place of the browser, and you pick the
-model there. It is unavailable on a provider header, for embedding models,
-for a model OpenCode does not list yet, and for a model hidden from the
-picker; the details say which applies. There is no key that switches the
-model directly, because a model chosen in the prompt can override a plugin's
-switch on the next message.
+`enter` on a model, or `m`, opens OpenCode's model picker in place of the
+browser with its search filled in, so the model is the highlighted first
+result. Press `enter` again to select it; for a model with effort variants,
+OpenCode may then ask which one. The choice happens in the picker because
+plugins cannot set the prompt's model.
+
+The search is the provider's name and the model's name as the picker shows
+them, for example `Actualyze GPT OSS 120B`. The picker matches provider names
+only while at least one integration has a connection, so without one the
+search is the model's name alone. If the picker's search field
+does not appear within a second, or you press a key before scout fills it
+in, the picker stays open without a search, as it would from `/models`.
+
+`enter` and `m` are unavailable for embedding models, for a model OpenCode
+does not list yet, for a deprecated model, which the picker leaves out, and
+for a model hidden from the picker; the details say which applies. On a
+provider header, `enter` opens the provider's details.
+
+The picker orders its results, so check the highlighted row before you press
+`enter`:
+
+- A favorite, or a model whose input price is zero, that also matches every
+  word of the search is listed first.
+- Without a connected integration, a model with the same name from another
+  provider also matches and can come first.
+- A model whose name contains the provider's name and the model's name, such
+  as `vLLM Llama 3.1 8B` from another provider when you chose `Llama 3.1 8B`
+  from `vLLM`, can come first.
+- With OpenCode's experimental new designs and no connected integration, the
+  picker lists only free models, so the search finds nothing else.
 
 ### Copying
 
@@ -738,7 +764,7 @@ refused on every chat request.
 | `○ Checking the current connection…`                                | The key is saved and scout has no result for it yet. After 20 seconds the line reads "Still checking the current connection…".           | Wait. No inference request is sent.                                                                                                      |
 | `○ Checking the connection…`                                        | A key is connected and scout is still resolving it.                                                                                      | Wait.                                                                                                                                    |
 | `○ Loading models…`                                                 | The first model list for this key is on its way.                                                                                         | Wait.                                                                                                                                    |
-| `● Catalog accessible · key "Work" · 11 models · checked 2 min ago` | The model list answered. The count is chat models, as in `/modelscout`; the filter row reports hidden embeddings.                        | Browse them; `m` opens the model picker.                                                                                                 |
+| `● Catalog accessible · key "Work" · 11 models · checked 2 min ago` | The model list answered. The count is chat models, as in `/modelscout`; the filter row reports hidden embeddings.                        | Browse them; `enter` on a model opens the model picker with it highlighted.                                                              |
 | `▲ No models for this key`                                          | The catalog answered with an empty list: the key works, but its team has no model access yet.                                            | Ask a workspace admin. `y` copies the Catalog link.                                                                                      |
 | `▲ Key rejected (401)`                                              | Actualyze answers this way for a revoked or expired key, a key without the inference scope, or a key from another Actualyze environment. | `k` for another key, `y` to copy the API Keys link, `c` for connections.                                                                 |
 | `▲ Access denied (403)`                                             | Actualyze refused the model list request for this key.                                                                                   | Check the key's permissions and model access with your administrator, or use `k` for another key.                                        |

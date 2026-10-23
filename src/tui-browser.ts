@@ -871,7 +871,8 @@ const HOST_TOP_ROWS = 1;
  * Dialog width `min(116, cols - 2)` with side padding 3. Content height
  * `min(30, rows - 5)`: with the row the host adds above it, the dialog
  * takes at most `rows - 4` rows, so the centered panel leaves rows free
- * above and below. The detail pane sits beside the list from 120 columns.
+ * above and below. A preview of the selected row sits beside the list from
+ * 120 columns.
  */
 export function browserLayout(columns: number, rows: number): BrowserLayout {
   const cols = finitePositive(columns, 80);
@@ -932,6 +933,11 @@ interface TextPane {
     layout?: PaneLayout,
   ): void;
   setViewport(width: number, height: number): void;
+  /**
+   * A key the bottom `↓ N more` line names after a `·`, for a pane that
+   * cannot scroll itself; undefined for none. Shows from the next paint.
+   */
+  setMoreKey(key: string | undefined): void;
   scroll(move: ListMove): void;
   /** Whether lines are hidden above or below. */
   overflows(): boolean;
@@ -982,10 +988,11 @@ function createTextPane(
   let pinned = 0;
   /** Lines per block after the pinned lines. */
   let blocks: readonly number[] = [];
+  let moreKey: string | undefined;
   const shown = (): EntryWindow => entryWindow(blocks, height - pinned, offset);
-  const indicator = (arrow: string, count: number): Line => [
+  const indicator = (arrow: string, count: number, key?: string): Line => [
     {
-      text: count > 0 ? `${arrow} ${count} more` : `${arrow} more`,
+      text: `${arrow} ${count > 0 ? `${count} ` : ""}more${key ? ` · ${key}` : ""}`,
       role: "muted",
     },
   ];
@@ -1003,7 +1010,10 @@ function createTextPane(
       shownSlots.push({ line: lines[index], index });
     if (view.bottom) {
       while (shownSlots.length < height - 1) shownSlots.push({ index: -1 });
-      shownSlots.push({ line: indicator("↓", view.below), index: -1 });
+      shownSlots.push({
+        line: indicator("↓", view.below, moreKey),
+        index: -1,
+      });
     }
     return shownSlots;
   };
@@ -1067,6 +1077,9 @@ function createTextPane(
         for (const [slot, node] of slots.entries())
           renderer.set(node, "visible", slot < height);
       paint();
+    },
+    setMoreKey(key) {
+      moreKey = key;
     },
     scroll(move) {
       offset = scrollEntries(blocks, height - pinned, offset, move);
@@ -1363,10 +1376,16 @@ export interface BrowserFrame {
   route?(key: KeyEvent, view: FrameKeyView): (() => void) | undefined;
 }
 
+/** A model the browser hands to OpenCode's model picker. */
+export interface PickerModel {
+  readonly providerID: string;
+  readonly modelID: string;
+}
+
 /** Side effects the view asks its session for. */
 export interface BrowserActions {
-  /** Open OpenCode's model picker; replaces the dialog. */
-  picker(): void;
+  /** Open OpenCode's model picker with `model` highlighted; replaces the dialog. */
+  picker(model: PickerModel): void;
   /** Refresh one provider's discovery, or every provider. */
   refresh(providerID: string | undefined): void;
   /** Re-read the host lists after they failed. */
@@ -1426,13 +1445,21 @@ function cloneNav(nav: NavState): NavState {
   };
 }
 
+/** The renderable ID of the browser's search input. */
+export const SEARCH_INPUT_ID = "modelscout-search";
+
 function consume(key: KeyEvent): void {
   key.preventDefault();
   key.stopPropagation();
 }
 
-/** Actions that close the dialog or show another one: the key is consumed first. */
+/**
+ * Actions that close the dialog or show another one: the key is consumed
+ * first, so it never reaches the next focused input, such as the search of
+ * the picker that replaces the dialog.
+ */
 const HANDOFF_ACTIONS: ReadonlySet<BrowserAction["type"]> = new Set([
+  "select",
   "picker",
   "actualyze",
   "extra",
@@ -1495,7 +1522,7 @@ export function buildBrowserView(
     content: "",
   });
   const search = renderer.create("input", {
-    id: "modelscout-search",
+    id: SEARCH_INPUT_ID,
     width: Math.max(1, layout.width - 3),
     value: nav.query,
     placeholder:
@@ -1842,15 +1869,6 @@ export function buildBrowserView(
     renderer.set(root, "height", layout.height);
     renderer.set(root, "maxHeight", layout.height);
     renderer.set(search, "width", Math.max(1, layout.width - 3));
-    // The wide pane and the narrow detail screen show the same details.
-    if (layout.wide && screens.includes("detail")) {
-      screens = screens.filter((item) => item !== "detail");
-      focus = "pane";
-    } else if (!layout.wide && focus === "pane") {
-      focus = "list";
-      screens = ["list", "detail", ...screens.slice(1)];
-    }
-    list.setFocused(focus === "list");
     setRows();
     applyScreen(true);
   }
@@ -1896,13 +1914,13 @@ export function buildBrowserView(
       current !== "filters" && (current !== "list" || split || cardsShown());
     if (!visible) return;
     const width = split ? layout.paneWidth : layout.width;
-    // The wide pane beside the list and the narrow detail screen show the
-    // same details, so crossing the breakpoint keeps the scroll position.
-    const view = current === "list" && !cardsShown() ? "detail" : current;
-    const key = `${view}\u0000${replacing() ? "card" : (list.selected()?.row.key ?? "")}`;
+    const key = `${current}\u0000${replacing() ? "card" : (list.selected()?.row.key ?? "")}`;
     const highlight =
       current === "list" && replacing() ? card?.highlight : undefined;
     const keep = keepOffset || key === paneKey;
+    // The preview beside the list never scrolls; its last line says which
+    // key opens the whole details.
+    pane.setMoreKey(split ? "i" : undefined);
     if (current === "help") {
       // The key list scrolls by whole entries under its title.
       const help = helpLayout(helpTitle(), helpEntries(), width);
@@ -2182,6 +2200,8 @@ export function buildBrowserView(
       return "Embedding model; not in the chat picker";
     if (!data.hostListed.has(qualifiedID(row.group.id, model.id)))
       return "Not in OpenCode's model list yet";
+    if (model.hostStatus === "deprecated")
+      return "Deprecated; not in OpenCode's model picker";
     if (!model.enabled) return "Hidden from OpenCode's model picker";
     return undefined;
   }
@@ -2221,7 +2241,6 @@ export function buildBrowserView(
       case "list":
         break;
     }
-    if (focus === "pane") return detailHints(row, discovery);
     if (replacing()) {
       // The card's own keys come first: the card's action row lists the
       // ones the footer leaves out, computed without this hint. The scroll
@@ -2265,12 +2284,12 @@ export function buildBrowserView(
       ];
     }
     return [
-      { title: "details", key: "enter" },
       {
-        title: "picker",
-        key: "m",
+        title: "select",
+        key: "enter",
         enabled: row !== undefined && pickerBlocked(row) === undefined,
       },
+      { title: "details", key: "i" },
       { title: "copy", key: "y" },
       ...extraHints(true),
       { title: "refresh", key: "r", enabled: discovery },
@@ -2287,16 +2306,16 @@ export function buildBrowserView(
     discovery: boolean,
   ): FooterHint[] {
     return [
-      { title: "back", key: "backspace" },
       ...(row?.model
         ? [
             {
-              title: "picker",
-              key: "m",
+              title: "select",
+              key: "enter",
               enabled: pickerBlocked(row) === undefined,
             },
           ]
         : []),
+      { title: "back", key: "backspace" },
       { title: "copy", key: "y" },
       ...extraHints(true),
       { title: "evidence", key: "d" },
@@ -2360,12 +2379,12 @@ export function buildBrowserView(
         keys: "↑ ↓ pgup pgdn home end",
         action: below === "detail" ? "scroll" : "move",
       },
+      // One line each at 80 columns, so `/actualyze`'s keys stay in view.
       {
-        keys: "enter",
-        action: layout.wide
-          ? "details; in the pane, ↑ ↓ scroll"
-          : "details of a model or provider",
+        keys: "enter / m",
+        action: "select the model in OpenCode's model picker",
       },
+      { keys: "i", action: "details; enter on a provider header too" },
       // A caller's keys come early: the footer drops their hints first.
       ...extraActions.map((action) => ({
         keys: action.key,
@@ -2383,17 +2402,17 @@ export function buildBrowserView(
       { keys: "x", action: "clear search and filters" },
       { keys: "s", action: "sort: name, context, input price, output price" },
       { keys: "d", action: "evidence: where each value comes from" },
-      {
-        keys: "m",
-        action: "open OpenCode's model picker (replaces this dialog)",
-      },
       { keys: "y / Y", action: "copy provider/model / the raw model ID" },
       { keys: "r", action: "refresh the selected provider's discovery" },
       ...(scope.kind === "all"
         ? [{ keys: "R", action: "refresh every provider" }]
         : []),
       ...(actions.actualyze ? [{ keys: "a", action: "open /actualyze" }] : []),
-      { keys: "backspace", action: "back from details, evidence, or filters" },
+      {
+        keys: "backspace",
+        action:
+          "back from details, evidence, or filters; i and ← also leave details",
+      },
       ...common,
     ];
     return entries;
@@ -2436,19 +2455,17 @@ export function buildBrowserView(
       case "scroll":
         pane.scroll(action.move);
         return true;
+      case "select":
+        if (!row) return false;
+        return apply({ type: row.model ? "picker" : "open" });
       case "open":
         if (!row) return false;
-        if (layout.wide) setFocus("pane");
-        else pushScreen("detail");
+        pushScreen("detail");
         return true;
       case "back":
-        if (current === "list" && focus === "pane") {
-          setFocus("list");
-          return true;
-        }
         if (current === "list") return false;
         popScreen();
-        if (screen() === "list") setFocus(focus === "pane" ? "pane" : "list");
+        if (screen() === "list") setFocus("list");
         return true;
       case "collapse":
       case "expand": {
@@ -2506,7 +2523,9 @@ export function buildBrowserView(
           actions.notify({ text: blocked, role: "muted" });
           return true;
         }
-        actions.picker();
+        // `pickerBlocked` reports a provider header; this narrows the type.
+        if (!row.model) return false;
+        actions.picker({ providerID: row.group.id, modelID: row.model.id });
         return true;
       }
       case "refresh":

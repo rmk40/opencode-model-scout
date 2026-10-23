@@ -18,7 +18,6 @@ function shifted(letter: string): RoutedKey {
 
 const LIST: RouteContext = { screen: "list", focus: "list" };
 const SEARCH: RouteContext = { screen: "list", focus: "search" };
-const PANE: RouteContext = { screen: "list", focus: "pane" };
 const DETAIL: RouteContext = { screen: "detail", focus: "list" };
 const EVIDENCE: RouteContext = { screen: "evidence", focus: "list" };
 const HELP: RouteContext = { screen: "help", focus: "list" };
@@ -27,7 +26,6 @@ const FILTERS: RouteContext = { screen: "filters", focus: "list" };
 const EVERY_CONTEXT: readonly RouteContext[] = [
   LIST,
   SEARCH,
-  PANE,
   DETAIL,
   EVIDENCE,
   HELP,
@@ -37,6 +35,7 @@ const EVERY_CONTEXT: readonly RouteContext[] = [
 describe("routeKey while search has focus", () => {
   const printable = [
     key("m"),
+    key("i"),
     key("a"),
     key("x"),
     key("f"),
@@ -90,7 +89,7 @@ describe("routeKey with command modifiers", () => {
     "leaves %s chords to the host on every screen and focus",
     (modifier) => {
       for (const context of EVERY_CONTEXT)
-        for (const name of ["r", "y", "return", "down", "backspace", "?"])
+        for (const name of ["r", "y", "i", "return", "down", "backspace", "?"])
           expect(
             routeKey(
               { ...context, extraKeys: new Set(["r"]) },
@@ -107,6 +106,8 @@ describe("routeKey with command modifiers", () => {
 
 describe("routeKey on the list", () => {
   it.each([
+    ["i", { type: "open" }],
+    ["m", { type: "picker" }],
     ["x", { type: "clear" }],
     ["s", { type: "sort" }],
     ["d", { type: "evidence" }],
@@ -115,6 +116,12 @@ describe("routeKey on the list", () => {
     ["?", { type: "help" }],
   ] as const)("maps %s to its action", (name, action) => {
     expect(routeKey(LIST, key(name))).toEqual(action);
+  });
+
+  it("selects with enter under either key name, and collapses with left", () => {
+    expect(routeKey(LIST, key("return"))).toEqual({ type: "select" });
+    expect(routeKey(LIST, key("enter"))).toEqual({ type: "select" });
+    expect(routeKey(LIST, key("left"))).toEqual({ type: "collapse" });
   });
 
   it("reads ? and / from the sequence when the key name differs", () => {
@@ -126,14 +133,21 @@ describe("routeKey on the list", () => {
     });
   });
 
-  it("expands with right and moves with home and end", () => {
+  it("expands with right and moves the selection with every move key, never scrolling", () => {
     expect(routeKey(LIST, key("right"))).toEqual({ type: "expand" });
-    expect(routeKey(LIST, key("home"))).toEqual({ type: "move", move: "home" });
-    expect(routeKey(LIST, key("end"))).toEqual({ type: "move", move: "end" });
+    for (const move of [
+      "up",
+      "down",
+      "pageup",
+      "pagedown",
+      "home",
+      "end",
+    ] as const)
+      expect(routeKey(LIST, key(move))).toEqual({ type: "move", move });
   });
 
   it("ignores letters it has no action for", () => {
-    for (const name of ["k", "q", "z", "F", "X"])
+    for (const name of ["k", "q", "z", "F", "X", "I"])
       expect(routeKey(LIST, key(name))).toBeUndefined();
     expect(routeKey(LIST, key("space", { sequence: " " }))).toBeUndefined();
   });
@@ -145,10 +159,9 @@ describe("routeKey on the list", () => {
   });
 });
 
-describe("routeKey in details (narrow screen or wide pane)", () => {
+describe("routeKey on the details screen", () => {
   const detailViews: readonly [string, RouteContext][] = [
     ["detail screen", DETAIL],
-    ["wide pane", PANE],
   ];
 
   it.each(detailViews)("runs shared actions in the %s", (_label, context) => {
@@ -169,9 +182,27 @@ describe("routeKey in details (narrow screen or wide pane)", () => {
   });
 
   it.each(detailViews)(
-    "keeps list-only keys and collapse out of the %s",
+    "selects with enter under either key name in the %s",
     (_label, context) => {
-      for (const name of ["x", "s", "left", "right"])
+      expect(routeKey(context, key("return"))).toEqual({ type: "select" });
+      expect(routeKey(context, key("enter"))).toEqual({ type: "select" });
+      expect(routeKey(context, key("m"))).toEqual({ type: "picker" });
+    },
+  );
+
+  it.each(detailViews)(
+    "goes back with i, left, or backspace in the %s",
+    (_label, context) => {
+      for (const name of ["i", "left", "backspace"])
+        expect(routeKey(context, key(name))).toEqual({ type: "back" });
+      expect(routeKey(context, shifted("i"))).toBeUndefined();
+    },
+  );
+
+  it.each(detailViews)(
+    "keeps list-only keys and expand out of the %s",
+    (_label, context) => {
+      for (const name of ["x", "s", "right"])
         expect(routeKey(context, key(name))).toBeUndefined();
     },
   );
@@ -227,7 +258,18 @@ describe("routeKey on Evidence", () => {
   });
 
   it("runs no other action, including caller extras", () => {
-    for (const name of ["m", "r", "d", "a", "f", "x", "s", "return", "left"])
+    for (const name of [
+      "m",
+      "i",
+      "r",
+      "d",
+      "a",
+      "f",
+      "x",
+      "s",
+      "return",
+      "left",
+    ])
       expect(
         routeKey({ ...EVIDENCE, extraKeys: new Set(["k"]) }, key(name)),
       ).toBeUndefined();
@@ -248,7 +290,7 @@ describe("routeKey on the key list", () => {
   });
 
   it("runs no action from the key list", () => {
-    for (const name of ["m", "y", "/", "r", "return", "f"])
+    for (const name of ["m", "i", "y", "/", "r", "return", "left", "f"])
       expect(routeKey(HELP, key(name))).toBeUndefined();
   });
 });
@@ -274,7 +316,7 @@ describe("routeKey on the filter screen", () => {
   });
 
   it("runs no list or detail action", () => {
-    for (const name of ["/", "y", "r", "d", "s", "a"])
+    for (const name of ["/", "y", "r", "d", "s", "a", "i", "m"])
       expect(routeKey(FILTERS, key(name))).toBeUndefined();
   });
 });
@@ -286,7 +328,6 @@ describe("routeKey screen and focus coverage", () => {
       ["evidence", "list"],
       ["help", "list"],
       ["filters", "list"],
-      ["list", "pane"],
     ];
     for (const [screen, focus] of screens)
       expect(routeKey({ screen, focus }, key("backspace"))).toEqual({

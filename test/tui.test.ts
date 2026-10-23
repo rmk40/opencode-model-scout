@@ -671,17 +671,20 @@ describe("layout", () => {
     expect(listRows(root).every((row) => row.length <= 72)).toBe(true);
   });
 
-  it("turns the narrow detail screen into the focused pane when the terminal widens", async () => {
+  it("keeps the detail screen over the list when the terminal widens", async () => {
     const h = harness({ terminalWidth: 80, terminalHeight: 24 });
     const root = await h.ready();
     h.press({ name: "down" });
-    h.press({ name: "return" });
+    h.press({ name: "i" });
     expect(visible(findNodeById(root, "modelscout-list"))).toBe(false);
     expect(pane(root)).toContain("atlas/atlas-model");
 
     h.resize(120, 36);
-    expect(visible(findNodeById(root, "modelscout-list"))).toBe(true);
-    expect(line(root, "modelscout-footer")).toMatch(/^back backspace/);
+    expect(visible(findNodeById(root, "modelscout-list"))).toBe(false);
+    expect(pane(root)).toContain("atlas/atlas-model");
+    expect(line(root, "modelscout-footer")).toMatch(
+      /^select enter {2}back backspace/,
+    );
   });
 
   it("keeps a scrolled detail where it was when the terminal crosses 120 columns", async () => {
@@ -689,7 +692,7 @@ describe("layout", () => {
     const h = harness({ terminalWidth: 120, terminalHeight: 16 });
     const root = await h.ready();
     h.press({ name: "down" });
-    h.press({ name: "return" });
+    h.press({ name: "i" });
     for (let step = 0; step < 3; step += 1) h.press({ name: "down" });
     // The top row says how many lines are hidden above; the first shown line follows.
     expect(lines(root, "modelscout-pane")[0]).toBe("↑ 3 more");
@@ -701,7 +704,7 @@ describe("layout", () => {
     expect(first()).toMatch(/^Context/);
 
     h.resize(120, 16);
-    expect(visible(findNodeById(root, "modelscout-list"))).toBe(true);
+    expect(visible(findNodeById(root, "modelscout-list"))).toBe(false);
     expect(first()).toMatch(/^Context/);
   });
 
@@ -804,17 +807,20 @@ describe("keys", () => {
     expect(findNodeById(root, "modelscout-search")?.props?.value).toBe("");
   });
 
-  it("consumes m before opening the host model picker", async () => {
-    const h = harness();
-    await h.ready();
-    const order: string[] = [];
-    h.context.keymap.dispatch.mockImplementationOnce(() =>
-      order.push("dispatch"),
-    );
-    h.press({ name: "m", preventDefault: () => order.push("consumed") });
-    expect(order).toEqual(["consumed", "dispatch"]);
-    expect(h.context.keymap.dispatch).toHaveBeenCalledWith("model.list");
-  });
+  it.each(["m", "return"])(
+    "consumes %s before opening the host model picker",
+    async (name) => {
+      const h = harness();
+      await h.ready();
+      const order: string[] = [];
+      h.context.keymap.dispatch.mockImplementationOnce(() =>
+        order.push("dispatch"),
+      );
+      h.press({ name, preventDefault: () => order.push("consumed") });
+      expect(order).toEqual(["consumed", "dispatch"]);
+      expect(h.context.keymap.dispatch).toHaveBeenCalledWith("model.list");
+    },
+  );
 
   it("does not open the picker for an embedding model", async () => {
     const h = harness();
@@ -1140,6 +1146,20 @@ describe("dialog lifecycle", () => {
     await h.ready();
     h.cleanup();
     expect(h.dialog.clear).toHaveBeenCalledOnce();
+    expect(h.keyListeners.size).toBe(0);
+  });
+
+  it("ends a pending picker pre-fill on plugin cleanup, leaving no key listener", async () => {
+    const h = harness();
+    await h.ready();
+    // The picker replaces the dialog, as OpenCode's model.list does.
+    h.context.keymap.dispatch.mockImplementation(() =>
+      h.context.ui.dialog.show(() => "picker"),
+    );
+    h.press({ name: "return" });
+    expect(h.context.keymap.dispatch).toHaveBeenCalledWith("model.list");
+    expect(h.keyListeners.size).toBe(1);
+    h.cleanup();
     expect(h.keyListeners.size).toBe(0);
   });
 
